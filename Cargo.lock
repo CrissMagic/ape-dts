@@ -1360,6 +1360,7 @@ dependencies = [
  "anyhow",
  "apache-avro",
  "async-trait",
+ "base64 0.22.1",
  "byteorder",
  "bytes",
  "chrono",

@@ -262,6 +262,7 @@ impl SinkerUtil {
                 ack_timeout_secs,
                 required_acks,
                 with_field_defs,
+                message_format,
             } => {
                 let router = RdbRouter::from_config(
                     &task_config.router,
@@ -270,7 +271,20 @@ impl SinkerUtil {
                 )?;
                 // kafka sinker may need meta data from RDB extractor
                 let meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config).await?;
-                let avro_converter = AvroConverter::new(meta_manager, with_field_defs);
+                let avro_converter = AvroConverter::new(meta_manager.clone(), with_field_defs);
+                
+                // 创建JsonConverter
+                let json_converter = dt_common::meta::json::json_converter::JsonConverter::new(
+                    meta_manager, 
+                    with_field_defs
+                );
+                
+                // 解析消息格式配置
+                let msg_format = message_format
+                    .as_ref()
+                    .map(|s| s.parse())
+                    .transpose()?
+                    .unwrap_or_default();
 
                 let brokers = vec![url.to_string()];
                 let acks = match required_acks.as_str() {
@@ -294,6 +308,8 @@ impl SinkerUtil {
                         router: router.clone(),
                         producer,
                         avro_converter: avro_converter.clone(),
+                        json_converter: json_converter.clone(),
+                        message_format: msg_format.clone(),
                         monitor: monitor.clone(),
                     };
                     sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));

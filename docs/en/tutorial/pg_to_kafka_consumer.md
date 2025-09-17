@@ -7,6 +7,16 @@ Refer to [Send data to Kafka](/docs/en/consumer/kafka_consumer.md) for consumers
 
 - This article is for quick start, refer to [templates](/docs/templates/rdb_to_kafka.md) and [common configs](/docs/en/config.md) for more details.
 
+# Message Format Support
+
+APE DTS supports two message formats when sending data to Kafka:
+- **Avro format** (default): Binary format with schema registry support
+- **JSON format**: Human-readable JSON format
+
+You can configure the message format using the `message_format` parameter in the `[sinker]` section:
+- `message_format=avro` (default)
+- `message_format=json`
+
 # Prepare Postgres instance
 Refer to [pg to pg](./pg_to_pg.md)
 
@@ -36,6 +46,8 @@ db_type=kafka
 sink_type=write
 url=127.0.0.1:9093
 with_field_defs=true
+message_format=avro
+message_format=avro
 
 [filter]
 do_dbs=test_db

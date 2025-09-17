@@ -48,6 +48,7 @@ log4rs_file=./log4rs.yaml
 | :-------- | :-------- | :-------- | :-------- |
 | url | url of Kafka servers | 127.0.0.1:9093 | - |
 | with_field_defs | when sending data to Kafka in avro format, include the definitions of data fields or not | true | true |
+| message_format | message format for Kafka producer, supports "avro" and "json" | avro | avro |
 
 # MySQL CDC
 ```

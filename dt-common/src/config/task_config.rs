@@ -448,6 +448,7 @@ impl TaskConfig {
                 ack_timeout_secs: loader.get_with_default(SINKER, "ack_timeout_secs", 5),
                 required_acks: loader.get_with_default(SINKER, "required_acks", "one".to_string()),
                 with_field_defs: loader.get_with_default(SINKER, "with_field_defs", true),
+                message_format: loader.get_optional(SINKER, "message_format"),
             },
 
             DbType::Redis => match sink_type {
