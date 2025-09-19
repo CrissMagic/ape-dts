@@ -275,16 +275,11 @@ impl SinkerUtil {
                 
                 // 创建JsonConverter
                 let json_converter = dt_common::meta::json::json_converter::JsonConverter::new(
-                    meta_manager, 
-                    with_field_defs
+                    meta_manager
                 );
                 
-                // 解析消息格式配置
-                let msg_format = message_format
-                    .as_ref()
-                    .map(|s| s.parse())
-                    .transpose()?
-                    .unwrap_or_default();
+                // 现在message_format直接是MessageFormat类型，不需要解析
+                let msg_format = message_format;
 
                 let brokers = vec![url.to_string()];
                 let acks = match required_acks.as_str() {

@@ -35,8 +35,12 @@ impl Sinker for KafkaSinker {
         }
 
         match self.message_format {
-            MessageFormat::Avro => call_batch_fn!(self, data, Self::send_avro),
-            MessageFormat::Json => call_batch_fn!(self, data, Self::send_json),
+            MessageFormat::Avro => {
+                call_batch_fn!(self, data, Self::send_avro);
+            }
+            MessageFormat::Json => {
+                call_batch_fn!(self, data, Self::send_json);
+            }
         }
         Ok(())
     }
@@ -47,7 +51,7 @@ impl Sinker for KafkaSinker {
             let topic = self.router.get_topic(&ddl_data.default_schema, "");
             let payload = match self.message_format {
                 MessageFormat::Avro => self.avro_converter.ddl_data_to_avro_value(ddl_data).await?,
-                MessageFormat::Json => self.json_converter.ddl_data_to_json_value(ddl_data).await?,
+                MessageFormat::Json => self.json_converter.ddl_data_to_json_value(ddl_data).await?.into_bytes(),
             };
             messages.push(Record {
                 key: String::new(),
@@ -129,7 +133,8 @@ impl KafkaSinker {
             let payload = self
                 .json_converter
                 .row_data_to_json_value(row_data.clone())
-                .await?;
+                .await?
+                .into_bytes();
             messages.push(Record {
                 key,
                 value: payload,

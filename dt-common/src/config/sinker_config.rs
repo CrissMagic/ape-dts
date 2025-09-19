@@ -1,5 +1,6 @@
 use super::{
     config_enums::{ConflictPolicyEnum, DbType},
+    message_format::MessageFormat,
     s3_config::S3Config,
 };
 use crate::config::config_enums::SinkType;
@@ -63,7 +64,7 @@ pub enum SinkerConfig {
         ack_timeout_secs: u64,
         required_acks: String,
         with_field_defs: bool,
-        message_format: Option<String>,
+        message_format: MessageFormat,
     },
 
     Redis {
