@@ -1,5 +1,6 @@
 use super::{
     config_enums::{ConflictPolicyEnum, DbType},
+    json_template_type::JsonTemplateType,
     message_format::MessageFormat,
     s3_config::S3Config,
 };
@@ -65,6 +66,7 @@ pub enum SinkerConfig {
         required_acks: String,
         with_field_defs: bool,
         message_format: MessageFormat,
+        json_template: JsonTemplateType,
     },
 
     Redis {

@@ -4,24 +4,45 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::{
-    config::config_enums::DbType,
+    config::json_template_type::JsonTemplateType,
     meta::{
         col_value::ColValue,
-        ddl_meta::{ddl_data::DdlData, ddl_type::DdlType},
+        ddl_meta::ddl_data::DdlData,
         rdb_meta_manager::RdbMetaManager,
         row_data::RowData,
-        row_type::RowType,
     },
 };
+
+use super::cloudcanal_converter::CloudCanalConverter;
 
 #[derive(Clone)]
 pub struct JsonConverter {
     pub meta_manager: Option<RdbMetaManager>,
+    pub template_type: JsonTemplateType,
+    pub cloudcanal_converter: Option<CloudCanalConverter>,
 }
 
 impl JsonConverter {
     pub fn new(meta_manager: Option<RdbMetaManager>) -> Self {
-        JsonConverter { meta_manager }
+        JsonConverter {
+            meta_manager: meta_manager.clone(),
+            template_type: JsonTemplateType::Standard,
+            cloudcanal_converter: None,
+        }
+    }
+
+    /// 创建支持指定模板类型的 JsonConverter
+    pub fn new_with_template(meta_manager: Option<RdbMetaManager>, template_type: JsonTemplateType) -> Self {
+        let cloudcanal_converter = match template_type {
+            JsonTemplateType::CloudCanal => Some(CloudCanalConverter::new(meta_manager.clone())),
+            _ => None,
+        };
+
+        JsonConverter {
+            meta_manager,
+            template_type,
+            cloudcanal_converter,
+        }
     }
 
     pub fn refresh_meta(&mut self, data: &[DdlData]) {
@@ -30,26 +51,40 @@ impl JsonConverter {
                 meta_manager.invalidate_cache_by_ddl_data(ddl_data);
             }
         }
+
+        // 同时刷新 CloudCanal 转换器的元数据
+        if let Some(cloudcanal_converter) = &mut self.cloudcanal_converter {
+            cloudcanal_converter.refresh_meta(data);
+        }
     }
 
     pub async fn row_data_to_json_key(&mut self, row_data: &RowData) -> Result<String> {
-        if let Some(meta_manager) = &mut self.meta_manager {
-            if let Ok(tb_meta) = meta_manager.get_tb_meta(&row_data.schema, &row_data.tb).await {
-                if let Some(primary_key) = tb_meta.key_map.get("primary") {
-                    let mut key_values = Vec::new();
-                    for pk_col in primary_key {
-                        if let Some(col_value) = row_data.after.as_ref().and_then(|after| after.get(pk_col)) {
-                            key_values.push(col_value_to_json_value(col_value));
-                        }
-                    }
-                    return Ok(serde_json::to_string(&key_values)?);
+        match self.template_type {
+            JsonTemplateType::Standard => self.standard_row_data_to_json_key(row_data).await,
+            JsonTemplateType::CloudCanal => {
+                if let Some(cloudcanal_converter) = &mut self.cloudcanal_converter {
+                    cloudcanal_converter.row_data_to_json_key(row_data).await
+                } else {
+                    self.standard_row_data_to_json_key(row_data).await
                 }
             }
         }
-        Ok(format!("{}_{}", row_data.schema, row_data.tb))
     }
 
     pub async fn row_data_to_json_value(&mut self, row_data: RowData) -> Result<String> {
+        match self.template_type {
+            JsonTemplateType::Standard => self.standard_row_data_to_json_value(row_data).await,
+            JsonTemplateType::CloudCanal => {
+                if let Some(cloudcanal_converter) = &mut self.cloudcanal_converter {
+                    cloudcanal_converter.row_data_to_json_value(row_data).await
+                } else {
+                    self.standard_row_data_to_json_value(row_data).await
+                }
+            }
+        }
+    }
+
+    async fn standard_row_data_to_json_value(&mut self, row_data: RowData) -> Result<String> {
         let mut json_obj = json!({
             "operation": row_data.row_type.to_string(),
             "schema": row_data.schema,
@@ -68,6 +103,36 @@ impl JsonConverter {
     }
 
     pub async fn ddl_data_to_json_value(&mut self, ddl_data: DdlData) -> Result<String> {
+        match self.template_type {
+            JsonTemplateType::Standard => self.standard_ddl_data_to_json_value(ddl_data).await,
+            JsonTemplateType::CloudCanal => {
+                if let Some(cloudcanal_converter) = &mut self.cloudcanal_converter {
+                    cloudcanal_converter.ddl_data_to_json_value(ddl_data).await
+                } else {
+                    self.standard_ddl_data_to_json_value(ddl_data).await
+                }
+            }
+        }
+    }
+
+    async fn standard_row_data_to_json_key(&mut self, row_data: &RowData) -> Result<String> {
+        if let Some(meta_manager) = &mut self.meta_manager {
+            if let Ok(tb_meta) = meta_manager.get_tb_meta(&row_data.schema, &row_data.tb).await {
+                if let Some(primary_key) = tb_meta.key_map.get("primary") {
+                    let mut key_values = Vec::new();
+                    for pk_col in primary_key {
+                        if let Some(col_value) = row_data.after.as_ref().and_then(|after| after.get(pk_col)) {
+                            key_values.push(col_value_to_json_value(col_value));
+                        }
+                    }
+                    return Ok(serde_json::to_string(&key_values)?);
+                }
+            }
+        }
+        Ok(format!("{}_{}", row_data.schema, row_data.tb))
+    }
+
+    async fn standard_ddl_data_to_json_value(&mut self, ddl_data: DdlData) -> Result<String> {
         let json_obj = json!({
             "ddl": true,
             "db_type": ddl_data.db_type.to_string(),

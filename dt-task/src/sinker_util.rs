@@ -1,7 +1,9 @@
 use std::{str::FromStr, sync::Arc};
 
 use anyhow::Context;
-use kafka::producer::{Producer, RequiredAcks};
+use rdkafka::ClientConfig;
+use dt_connector::sinker::kafka::rdkafka_sinker::RdkafkaSinker;
+use dt_common::config::message_format::MessageFormat;
 use reqwest::{redirect::Policy, Url};
 use rusoto_s3::S3Client;
 use sqlx::types::chrono::Utc;
@@ -39,7 +41,7 @@ use dt_connector::{
             foxlake_sinker::FoxlakeSinker, foxlake_struct_sinker::FoxlakeStructSinker,
             orc_sequencer::OrcSequencer,
         },
-        kafka::kafka_sinker::KafkaSinker,
+
         mongo::{mongo_checker::MongoChecker, mongo_sinker::MongoSinker},
         mysql::{
             mysql_checker::MysqlChecker, mysql_sinker::MysqlSinker,
@@ -263,6 +265,7 @@ impl SinkerUtil {
                 required_acks,
                 with_field_defs,
                 message_format,
+                json_template,
             } => {
                 let router = RdbRouter::from_config(
                     &task_config.router,
@@ -272,40 +275,71 @@ impl SinkerUtil {
                 // kafka sinker may need meta data from RDB extractor
                 let meta_manager = ExtractorUtil::get_extractor_meta_manager(task_config).await?;
                 let avro_converter = AvroConverter::new(meta_manager.clone(), with_field_defs);
-                
-                // 创建JsonConverter
-                let json_converter = dt_common::meta::json::json_converter::JsonConverter::new(
-                    meta_manager
-                );
-                
+
                 // 现在message_format直接是MessageFormat类型，不需要解析
                 let msg_format = message_format;
 
-                let brokers = vec![url.to_string()];
-                let acks = match required_acks.as_str() {
-                    "all" => RequiredAcks::All,
-                    "none" => RequiredAcks::None,
-                    _ => RequiredAcks::One,
+                // rdkafka 的 acks 字符串
+                let rdkafka_acks = match required_acks.as_str() {
+                    "all" => "all",
+                    "none" => "0",
+                    _ => "1",
                 };
 
                 for _ in 0..parallel_size {
-                    // TODO, authentication, https://github.com/kafka-rust/kafka-rust/blob/master/examples/example-ssl.rs
-                    let producer = Producer::from_hosts(brokers.clone())
-                        .with_ack_timeout(std::time::Duration::from_secs(ack_timeout_secs))
-                        .with_required_acks(acks)
+                    let mut client_config = ClientConfig::new();
+                    client_config.set("bootstrap.servers", &url);
+                    client_config.set("acks", rdkafka_acks);
+                    client_config.set("message.timeout.ms", (ack_timeout_secs * 1000).to_string());
+                    let future_producer = client_config
                         .create()
-                        .with_context(|| {
-                            format!("failed to create kafka producer, url: [{}]", url)
-                        })?;
-                    // the sending performance of RdkafkaSinker is much worse than KafkaSinker
-                    let sinker = KafkaSinker {
-                        batch_size,
-                        router: router.clone(),
-                        producer,
-                        avro_converter: avro_converter.clone(),
-                        json_converter: json_converter.clone(),
-                        message_format: msg_format.clone(),
-                        monitor: monitor.clone(),
+                        .with_context(|| format!("failed to create rdkafka producer, url: [{}]", url))?;
+                    
+                    let sinker = match msg_format {
+                        MessageFormat::Avro => {
+                            RdkafkaSinker {
+                                batch_size,
+                                router: router.clone(),
+                                producer: future_producer,
+                                avro_converter: avro_converter.clone(),
+                                json_converter: dt_common::meta::json::json_converter::JsonConverter::new(
+                                    meta_manager.clone()
+                                ),
+                                message_format: msg_format.clone(),
+                                monitor: monitor.clone(),
+                                queue_timeout_secs: ack_timeout_secs,
+                            }
+                        }
+                        MessageFormat::Json => {
+                            RdkafkaSinker {
+                                batch_size,
+                                router: router.clone(),
+                                producer: future_producer,
+                                avro_converter: avro_converter.clone(),
+                                json_converter: dt_common::meta::json::json_converter::JsonConverter::new_with_template(
+                                    meta_manager.clone(),
+                                    json_template.clone()
+                                ),
+                                message_format: msg_format.clone(),
+                                monitor: monitor.clone(),
+                                queue_timeout_secs: ack_timeout_secs,
+                            }
+                        }
+                        MessageFormat::JsonTemplate(ref template_type) => {
+                            RdkafkaSinker {
+                                batch_size,
+                                router: router.clone(),
+                                producer: future_producer,
+                                avro_converter: avro_converter.clone(),
+                                json_converter: dt_common::meta::json::json_converter::JsonConverter::new_with_template(
+                                    meta_manager.clone(),
+                                    template_type.clone()
+                                ),
+                                message_format: msg_format.clone(),
+                                monitor: monitor.clone(),
+                                queue_timeout_secs: ack_timeout_secs,
+                            }
+                        }
                     };
                     sub_sinkers.push(Arc::new(async_mutex::Mutex::new(Box::new(sinker))));
                 }

@@ -449,6 +449,7 @@ impl TaskConfig {
                 required_acks: loader.get_with_default(SINKER, "required_acks", "one".to_string()),
                 with_field_defs: loader.get_with_default(SINKER, "with_field_defs", true),
                 message_format: loader.get_optional(SINKER, "message_format"),
+                json_template: loader.get_optional(SINKER, "json_template"),
             },
 
             DbType::Redis => match sink_type {

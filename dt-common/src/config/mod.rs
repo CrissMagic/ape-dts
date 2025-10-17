@@ -4,6 +4,7 @@ pub mod data_marker_config;
 pub mod extractor_config;
 pub mod filter_config;
 pub mod ini_loader;
+pub mod json_template_type;
 pub mod message_format;
 pub mod meta_center_config;
 pub mod monitor_config;

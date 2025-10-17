@@ -7,7 +7,12 @@ ARG RUST_IMG_ALT=-bullseye
 
 FROM --platform=${BUILDPLATFORM} rust:${RUST_VERSION}${RUST_IMG_ALT} as builder
 
-RUN apt-get update && apt-get -y upgrade && apt-get install -y cmake libclang-dev
+RUN --mount=type=cache,target=/var/cache/apt,rw \
+    sed -i 's|http://deb.debian.org/debian|http://mirrors.ustc.edu.cn/debian|g' /etc/apt/sources.list && \
+    sed -i 's|http://deb.debian.org/debian-security|http://mirrors.ustc.edu.cn/debian-security|g' /etc/apt/sources.list && \
+    apt-get update --allow-releaseinfo-change || apt-get update && \
+    apt-get -y upgrade && \
+    apt-get install -y cmake libclang-dev pkg-config libssl-dev
 
 ARG TARGETOS
 ARG TARGETARCH
