@@ -286,6 +286,29 @@ impl SinkerUtil {
                     _ => "1",
                 };
 
+                // 解析 extractor 配置中的数据库名（若存在）
+                let database_name = match extractor_config.to_owned() {
+                    ExtractorConfig::MysqlStruct { db, .. } => Some(db),
+                    ExtractorConfig::MysqlSnapshot { db, .. } => Some(db),
+                    ExtractorConfig::MongoSnapshot { db, .. } => Some(db),
+                    ExtractorConfig::PgSnapshot { url, .. }
+                    | ExtractorConfig::PgCdc { url, .. }
+                    | ExtractorConfig::PgStruct { url, .. }
+                    | ExtractorConfig::MysqlCdc { url, .. }
+                    | ExtractorConfig::MysqlCheck { url, .. } => {
+                        if let Ok(u) = Url::parse(&url) {
+                            let path = u.path().trim_start_matches('/')
+                                .split('/')
+                                .next()
+                                .unwrap_or("");
+                            if path.is_empty() { None } else { Some(path.to_string()) }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+
                 for _ in 0..parallel_size {
                     let mut client_config = ClientConfig::new();
                     client_config.set("bootstrap.servers", &url);
@@ -318,7 +341,8 @@ impl SinkerUtil {
                                 avro_converter: avro_converter.clone(),
                                 json_converter: dt_common::meta::json::json_converter::JsonConverter::new_with_template(
                                     meta_manager.clone(),
-                                    json_template.clone()
+                                    json_template.clone(),
+                                    database_name.clone()
                                 ),
                                 message_format: msg_format.clone(),
                                 monitor: monitor.clone(),
@@ -333,7 +357,8 @@ impl SinkerUtil {
                                 avro_converter: avro_converter.clone(),
                                 json_converter: dt_common::meta::json::json_converter::JsonConverter::new_with_template(
                                     meta_manager.clone(),
-                                    template_type.clone()
+                                    template_type.clone(),
+                                    database_name.clone()
                                 ),
                                 message_format: msg_format.clone(),
                                 monitor: monitor.clone(),

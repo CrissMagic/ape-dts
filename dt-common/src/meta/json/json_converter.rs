@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 
 use crate::{
-    config::json_template_type::JsonTemplateType,
+    config::{json_template_type::JsonTemplateType},
     meta::{
         col_value::ColValue,
         ddl_meta::ddl_data::DdlData,
         rdb_meta_manager::RdbMetaManager,
         row_data::RowData,
+        row_type::RowType,
     },
 };
 
@@ -32,9 +34,13 @@ impl JsonConverter {
     }
 
     /// 创建支持指定模板类型的 JsonConverter
-    pub fn new_with_template(meta_manager: Option<RdbMetaManager>, template_type: JsonTemplateType) -> Self {
+    pub fn new_with_template(
+        meta_manager: Option<RdbMetaManager>,
+        template_type: JsonTemplateType,
+        database_name: Option<String>,
+    ) -> Self {
         let cloudcanal_converter = match template_type {
-            JsonTemplateType::CloudCanal => Some(CloudCanalConverter::new(meta_manager.clone())),
+            JsonTemplateType::CloudCanal => Some(CloudCanalConverter::new(meta_manager.clone(), database_name)),
             _ => None,
         };
 
@@ -84,24 +90,6 @@ impl JsonConverter {
         }
     }
 
-    async fn standard_row_data_to_json_value(&mut self, row_data: RowData) -> Result<String> {
-        let mut json_obj = json!({
-            "operation": row_data.row_type.to_string(),
-            "schema": row_data.schema,
-            "tb": row_data.tb,
-        });
-
-        if let Some(before) = &row_data.before {
-            json_obj["before"] = col_values_to_json_value(before);
-        }
-
-        if let Some(after) = &row_data.after {
-            json_obj["after"] = col_values_to_json_value(after);
-        }
-
-        Ok(serde_json::to_string(&json_obj)?)
-    }
-
     pub async fn ddl_data_to_json_value(&mut self, ddl_data: DdlData) -> Result<String> {
         match self.template_type {
             JsonTemplateType::Standard => self.standard_ddl_data_to_json_value(ddl_data).await,
@@ -130,6 +118,29 @@ impl JsonConverter {
             }
         }
         Ok(format!("{}_{}", row_data.schema, row_data.tb))
+    }
+
+    async fn standard_row_data_to_json_value(&mut self, row_data: RowData) -> Result<String> {
+        let mut json_obj = json!({
+            "operation": match row_data.row_type {
+                RowType::Insert => "insert",
+                RowType::Update => "update",
+                RowType::Delete => "delete",
+            },
+            "schema": row_data.schema,
+            "tb": row_data.tb,
+            "before": serde_json::Value::Null,
+            "after": serde_json::Value::Null,
+        });
+
+        if let Some(before) = &row_data.before {
+            json_obj["before"] = col_values_to_json_value(before);
+        }
+        if let Some(after) = &row_data.after {
+            json_obj["after"] = col_values_to_json_value(after);
+        }
+
+        Ok(serde_json::to_string(&json_obj)?)
     }
 
     async fn standard_ddl_data_to_json_value(&mut self, ddl_data: DdlData) -> Result<String> {
@@ -186,37 +197,17 @@ fn col_value_to_json_value(value: &ColValue) -> Value {
         ColValue::Timestamp(v) => Value::String(v.clone()),
         ColValue::Year(v) => Value::Number((*v).into()),
         ColValue::String(v) => Value::String(v.clone()),
-        ColValue::RawString(v) => {
-            // Convert bytes to base64 string for JSON compatibility
-            Value::String(base64::encode(v))
-        }
-        ColValue::Blob(v) => {
-            // Convert bytes to base64 string for JSON compatibility
-            Value::String(base64::encode(v))
-        }
-        ColValue::Bit(v) => Value::Number((*v).into()),
-        ColValue::Set(v) => Value::Number((*v).into()),
+        ColValue::Json(v) => Value::String(String::from_utf8(v.clone()).unwrap_or_default()),
+        ColValue::Json2(v) => Value::String(v.to_string()),
+        ColValue::Json3(v) => Value::String(v.to_string()),
+        ColValue::Blob(v) => Value::String(general_purpose::STANDARD.encode(v)),
+        ColValue::MongoDoc(v) => Value::String(v.to_string()),
+        ColValue::RawString(v) => Value::String(String::from_utf8_lossy(v).to_string()),
+        ColValue::Bit(v) => Value::String(v.to_string()),
+        ColValue::Set(v) => Value::String(v.to_string()),
+        ColValue::Enum(v) => Value::String(v.to_string()),
         ColValue::Set2(v) => Value::String(v.clone()),
-        ColValue::Enum(v) => Value::Number((*v).into()),
         ColValue::Enum2(v) => Value::String(v.clone()),
-        ColValue::Json(v) => {
-            // Try to parse as JSON, fallback to base64 string
-            if let Ok(json_val) = serde_json::from_slice::<Value>(v) {
-                json_val
-            } else {
-                Value::String(base64::encode(v))
-            }
-        }
-        ColValue::Json2(v) => {
-            // Try to parse as JSON, fallback to string
-            if let Ok(json_val) = serde_json::from_str::<Value>(v) {
-                json_val
-            } else {
-                Value::String(v.clone())
-            }
-        }
-        ColValue::Json3(v) => v.clone(),
-        ColValue::MongoDoc(_) => Value::Null, // MongoDB documents not supported in JSON format
     }
 }
 

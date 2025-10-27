@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 
 use crate::{
@@ -18,11 +19,12 @@ use crate::{
 #[derive(Clone)]
 pub struct CloudCanalConverter {
     pub meta_manager: Option<RdbMetaManager>,
+    pub database_name: Option<String>,
 }
 
 impl CloudCanalConverter {
-    pub fn new(meta_manager: Option<RdbMetaManager>) -> Self {
-        CloudCanalConverter { meta_manager }
+    pub fn new(meta_manager: Option<RdbMetaManager>, database_name: Option<String>) -> Self {
+        CloudCanalConverter { meta_manager, database_name }
     }
 
     pub fn refresh_meta(&mut self, data: &[DdlData]) {
@@ -54,15 +56,15 @@ impl CloudCanalConverter {
         // 获取操作类型，映射到 CloudCanal 的 action 字段
         let action = match row_data.row_type {
             RowType::Insert => "INSERT",
-            RowType::Update => "UPDATE", 
+            RowType::Update => "UPDATE",
             RowType::Delete => "DELETE",
         };
 
-        let database_name = if let Some(meta_manager) = &self.meta_manager {
+        // 优先使用配置中的数据库名；若未提供则回退按现有逻辑
+        let database_name = if let Some(db) = &self.database_name {
+            db.clone()
+        } else if let Some(meta_manager) = &self.meta_manager {
             if meta_manager.mysql_meta_manager.is_some() {
-                row_data.schema.clone()
-            } else if meta_manager.pg_meta_manager.is_some() {
-                // TODO: 从 PostgreSQL 连接配置中获取真实的数据库名称
                 row_data.schema.clone()
             } else {
                 row_data.schema.clone()
@@ -151,10 +153,11 @@ impl CloudCanalConverter {
     }
 
     pub async fn ddl_data_to_json_value(&mut self, ddl_data: DdlData) -> Result<String> {
+        let db = self.database_name.clone().unwrap_or_else(|| ddl_data.default_schema.clone());
         let json_obj = json!({
             "action": "DDL",
             "bid": 0,
-            "db": ddl_data.default_schema,
+            "db": db,
             "schema": ddl_data.default_schema,
             "table": "",
             "ddl": true,
@@ -197,7 +200,7 @@ fn col_value_to_json_value(value: &ColValue) -> Value {
         ColValue::Double(v) => Value::Number(serde_json::Number::from_f64(*v).unwrap_or_else(|| serde_json::Number::from(0))),
         ColValue::Decimal(v) => Value::String(v.clone()),
         ColValue::String(v) => Value::String(v.clone()),
-        ColValue::Blob(v) => Value::String(base64::encode(v)),
+        ColValue::Blob(v) => Value::String(general_purpose::STANDARD.encode(v)),
         ColValue::Date(v) => Value::String(v.clone()),
         ColValue::Time(v) => Value::String(v.clone()),
         ColValue::DateTime(v) => Value::String(v.clone()),
