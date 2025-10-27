@@ -50,6 +50,8 @@ pub struct TaskConfig {
     pub metrics: MetricsConfig,
 }
 
+pub const DEFAULT_DB_BATCH_SIZE: usize = 100;
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 // sections
 const EXTRACTOR: &str = "extractor";
 const SINKER: &str = "sinker";
@@ -67,6 +69,7 @@ const CHECK_LOG_DIR: &str = "check_log_dir";
 const DB_TYPE: &str = "db_type";
 const URL: &str = "url";
 const BATCH_SIZE: &str = "batch_size";
+const MAX_CONNECTIONS: &str = "max_connections";
 const SAMPLE_INTERVAL: &str = "sample_interval";
 const HEARTBEAT_INTERVAL_SECS: &str = "heartbeat_interval_secs";
 const KEEPALIVE_INTERVAL_SECS: &str = "keepalive_interval_secs";
@@ -123,11 +126,14 @@ impl TaskConfig {
             loader.get_with_default(EXTRACTOR, KEEPALIVE_INTERVAL_SECS, 10);
         let heartbeat_tb = loader.get_optional(EXTRACTOR, HEARTBEAT_TB);
         let batch_size = loader.get_with_default(EXTRACTOR, BATCH_SIZE, pipeline.buffer_size);
+        let max_connections =
+            loader.get_with_default(EXTRACTOR, MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS);
 
         let basic = BasicExtractorConfig {
             db_type: db_type.clone(),
             extract_type: extract_type.clone(),
             url: url.clone(),
+            max_connections,
         };
 
         let not_supported_err =
@@ -176,6 +182,12 @@ impl TaskConfig {
                 ExtractType::Struct => ExtractorConfig::MysqlStruct {
                     url,
                     db: String::new(),
+                    dbs: Vec::new(),
+                    db_batch_size: loader.get_with_default(
+                        EXTRACTOR,
+                        "db_batch_size",
+                        DEFAULT_DB_BATCH_SIZE,
+                    ),
                 },
 
                 ExtractType::FoxlakeS3 => {
@@ -233,7 +245,13 @@ impl TaskConfig {
                 ExtractType::Struct => ExtractorConfig::PgStruct {
                     url,
                     schema: String::new(),
+                    schemas: Vec::new(),
                     do_global_structs: false,
+                    db_batch_size: loader.get_with_default(
+                        EXTRACTOR,
+                        "db_batch_size",
+                        DEFAULT_DB_BATCH_SIZE,
+                    ),
                 },
 
                 _ => bail! { not_supported_err },
@@ -346,12 +364,15 @@ impl TaskConfig {
         let db_type: DbType = loader.get_required(SINKER, DB_TYPE);
         let url: String = loader.get_optional(SINKER, URL);
         let batch_size: usize = loader.get_with_default(SINKER, BATCH_SIZE, 200);
+        let max_connections =
+            loader.get_with_default(SINKER, MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS);
 
         let basic = BasicSinkerConfig {
             sink_type: sink_type.clone(),
             db_type: db_type.clone(),
             url: url.clone(),
             batch_size,
+            max_connections,
         };
 
         let conflict_policy: ConflictPolicyEnum =

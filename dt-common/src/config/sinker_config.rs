@@ -155,4 +155,5 @@ pub struct BasicSinkerConfig {
     pub db_type: DbType,
     pub url: String,
     pub batch_size: usize,
+    pub max_connections: u32,
 }
