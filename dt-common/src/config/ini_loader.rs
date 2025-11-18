@@ -16,11 +16,15 @@ impl IniLoader {
             .expect("failed to open ini file")
             .read_to_string(&mut config_str)
             .expect("failed to read ini content");
+        Self::new_from_str(&config_str)
+    }
+
+    pub fn new_from_str(config_str: &str) -> Self {
         let mut ini = Ini::new();
         // allow using comment symbols(; and #) in value
         // E.g. do_dbs=`a;`,`bcd`
         ini.set_inline_comment_symbols(Some(&Vec::new()));
-        ini.read(config_str).expect("failed to read content as ini");
+        ini.read(config_str.to_string()).expect("failed to read content as ini");
         Self { ini }
     }
 

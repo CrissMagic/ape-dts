@@ -14,3 +14,7 @@ dt-task = {path = "../dt-task", version = "0.1.0"}
 dt-precheck = {path = "../dt-precheck", version = "0.1.0"}
 
 tokio = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+configparser = { workspace = true }
+percent-encoding = { workspace = true }

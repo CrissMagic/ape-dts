@@ -125,6 +125,38 @@ impl TaskRunner {
         })
     }
 
+    pub fn new_from_str(config_str: &str) -> anyhow::Result<Self> {
+        let config = TaskConfig::new_from_str(config_str)?;
+        let task_type = build_task_type(
+            &config.extractor_basic.extract_type,
+            &config.sinker_basic.sink_type,
+        );
+        #[cfg(not(feature = "metrics"))]
+        let task_monitor = Arc::new(TaskMonitor::new(task_type.clone()));
+
+        #[cfg(feature = "metrics")]
+        let prometheus_metrics = Arc::new(PrometheusMetrics::new(
+            task_type.clone(),
+            config.metrics.clone(),
+        ));
+
+        #[cfg(feature = "metrics")]
+        let task_monitor = Arc::new(TaskMonitor::new(
+            task_type.clone(),
+            prometheus_metrics.clone(),
+        ));
+
+        Ok(Self {
+            config,
+            extractor_monitor: Arc::new(GroupMonitor::new("extractor", "global")),
+            pipeline_monitor: Arc::new(GroupMonitor::new("pipeline", "global")),
+            sinker_monitor: Arc::new(GroupMonitor::new("sinker", "global")),
+            task_monitor,
+            #[cfg(feature = "metrics")]
+            prometheus_metrics,
+        })
+    }
+
     pub async fn start_task(&self, enable_log4rs: bool) -> anyhow::Result<()> {
         if enable_log4rs {
             self.init_log4rs().await?;

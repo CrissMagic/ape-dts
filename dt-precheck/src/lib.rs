@@ -23,3 +23,17 @@ pub async fn do_precheck(config: &str) {
 
     println!("precheck passed.");
 }
+
+pub async fn do_precheck_with_config_str(config_str: &str) {
+    let task_config = TaskConfig::new_from_str(config_str).unwrap();
+    let precheck_config = PrecheckTaskConfig::new_from_str(config_str).unwrap();
+
+    let checker_connector = PrecheckerBuilder::build(precheck_config.precheck, task_config);
+    let result = checker_connector.verify_check_result().await;
+    if let Err(e) = result {
+        println!("precheck not passed.");
+        panic!("precheck meet error: {}", e);
+    }
+
+    println!("precheck passed.");
+}

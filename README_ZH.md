@@ -51,6 +51,93 @@ dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启�
 
 - TBD
 
+## 配置来源与启动参数
+
+支持从本地 INI 文件或 Nacos 动态拉取配置，两种来源最终解析为相同的配置结构，兼容现有任务类型与预检流程。
+
+参数说明：
+
+- `--config-source`：配置来源，`local|nacos`，默认 `local`
+- `--config-path`：当来源为 `local` 时必需，指定本地 INI 文件路径；兼容旧用法（传单个位置参数路径）
+- `--nacos-address`：当来源为 `nacos` 时必需，例如 `http://nacos-host:8848`
+- `--nacos-dataid`：当来源为 `nacos` 时必需，配置项的 `dataId`
+- `--nacos-group`：当来源为 `nacos` 时可选，默认 `DEFAULT_GROUP`
+
+Nacos 配置过滤与缓存：
+
+- 仅加载必要段以提升性能和健壮性：`extractor`, `sinker`, `pipeline`, `parallelizer`, `runtime`, `filter`, `router`, `resumer`, `data_marker`, `processor`, `meta_center`, `metrics`, `precheck`
+- 本地缓存与降级：
+  - 默认缓存目录：`.nacos_cache`（可通过环境变量 `NACOS_CACHE_DIR` 覆盖）
+  - 默认缓存 TTL：`300` 秒（可通过环境变量 `NACOS_CACHE_TTL_SECS` 覆盖）
+  - 拉取失败时自动降级使用缓存（即使过期），并输出警示信息
+
+注意事项：
+
+- 若启用 `[metrics]` 功能，请确保多个任务的 `http_port` 不冲突或使用不同端口映射
+- `pipeline_type=basic` 不占用应用端口；仅在启用 `[metrics]` 时会启动 HTTP 服务端口
+- 容器内连接外部服务不要使用 `127.0.0.1`（指向容器自身），请使用 `host.docker.internal` 或 Compose 内的服务名
+
+使用示例：
+
+- 本地文件（兼容旧用法）
+
+  仅路径位置参数：
+
+  ```
+  /ape-dts ./configs/task_mysql.ini
+  ```
+
+  显式指定来源与路径：
+
+  ```
+  /ape-dts --config-source local --config-path ./configs/task_mysql.ini
+  ```
+
+- 从 Nacos 拉取：
+
+  ```
+  /ape-dts --config-source nacos --nacos-address http://nacos-host:8848 --nacos-dataid task_pg.ini --nacos-group DEFAULT_GROUP
+  ```
+
+Docker 使用：
+
+- 本地 INI 文件：
+
+  ```
+  docker run --rm -v %CD%\configs:/configs dts:latest \
+    /ape-dts --config-source local --config-path /configs/task_mysql.ini
+  ```
+
+- 从 Nacos 拉取（Windows 主机示例）：
+
+  ```
+  docker run --rm dts:latest \
+    /ape-dts --config-source nacos \
+    --nacos-address http://host.docker.internal:8848 \
+    --nacos-dataid task_pg.ini \
+    --nacos-group DEFAULT_GROUP
+  ```
+
+Compose 示例（两个任务并行）：
+
+```yaml
+services:
+  dts-mysql:
+    image: dts:latest
+    volumes:
+      - ./configs:/configs:ro
+    command: ["/ape-dts", "--config-source", "local", "--config-path", "/configs/task_mysql.ini"]
+    # 若启用 metrics，映射不同端口避免冲突
+    # ports:
+    #   - "9091:9090"
+
+  dts-pg:
+    image: dts:latest
+    command: ["/ape-dts", "--config-source", "nacos", "--nacos-address", "http://nacos:8848", "--nacos-dataid", "task_pg.ini", "--nacos-group", "DEFAULT_GROUP"]
+    # ports:
+    #   - "9092:9090"
+```
+
 # 快速上手
 
 ## 教程

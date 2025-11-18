@@ -113,6 +113,33 @@ impl TaskConfig {
         })
     }
 
+    pub fn new_from_str(config_str: &str) -> anyhow::Result<Self> {
+        let loader = IniLoader::new_from_str(config_str);
+
+        let pipeline = Self::load_pipeline_config(&loader);
+        let runtime = Self::load_runtime_config(&loader)?;
+        let resumer = Self::load_resumer_config(&loader, &runtime)?;
+        let (extractor_basic, extractor) = Self::load_extractor_config(&loader, &pipeline)?;
+        let (sinker_basic, sinker) = Self::load_sinker_config(&loader)?;
+        Ok(Self {
+            extractor_basic,
+            extractor,
+            parallelizer: Self::load_parallelizer_config(&loader)?,
+            pipeline,
+            sinker_basic,
+            sinker,
+            runtime,
+            filter: Self::load_filter_config(&loader)?,
+            router: Self::load_router_config(&loader)?,
+            resumer,
+            data_marker: Self::load_data_marker_config(&loader)?,
+            processor: Self::load_processor_config(&loader)?,
+            meta_center: Self::load_meta_center_config(&loader)?,
+            #[cfg(feature = "metrics")]
+            metrics: Self::load_metrics_config(&loader)?,
+        })
+    }
+
     fn load_extractor_config(
         loader: &IniLoader,
         pipeline: &PipelineConfig,

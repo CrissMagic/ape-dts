@@ -1,7 +1,8 @@
 use std::env;
 
-use dt_precheck::{config::task_config::PrecheckTaskConfig, do_precheck};
+use dt_precheck::{config::task_config::PrecheckTaskConfig, do_precheck, do_precheck_with_config_str};
 use dt_task::task_runner::TaskRunner;
+use crate::config_source::{CliArgs, ConfigSourceKind, load_config_string};
 
 const ENV_SHUTDOWN_TIMEOUT_SECS: &str = "SHUTDOWN_TIMEOUT_SECS";
 
@@ -21,11 +22,27 @@ async fn main() {
         std::process::exit(0);
     });
 
-    let task_config = env::args().nth(1).expect("no task_config provided in args");
-    if PrecheckTaskConfig::new(&task_config).is_ok() {
-        do_precheck(&task_config).await;
-    } else {
-        let runner = TaskRunner::new(&task_config).unwrap();
-        runner.start_task(true).await.unwrap()
+    let args = CliArgs::parse().expect("invalid startup arguments");
+    match args.source {
+        ConfigSourceKind::Local => {
+            let task_config = args.config_path.clone().expect("--config-path required for local");
+            if PrecheckTaskConfig::new(&task_config).is_ok() {
+                do_precheck(&task_config).await;
+            } else {
+                let runner = TaskRunner::new(&task_config).unwrap();
+                runner.start_task(true).await.unwrap()
+            }
+        }
+        ConfigSourceKind::Nacos => {
+            let config_str = load_config_string(&args).await.expect("failed to load nacos config");
+            if PrecheckTaskConfig::new_from_str(&config_str).is_ok() {
+                do_precheck_with_config_str(&config_str).await;
+            } else {
+                let runner = TaskRunner::new_from_str(&config_str).unwrap();
+                runner.start_task(true).await.unwrap()
+            }
+        }
     }
 }
+
+mod config_source;
