@@ -483,11 +483,10 @@ impl PgCdcExtractor {
                     col_values.insert(col.to_string(), col_value);
                 }
 
-                TupleData::UnchangedToast => {
-                    bail! {Error::ExtractorError(
-                        "unexpected UnchangedToast value received".into(),
-                    )}
-                }
+                // 当 WAL 标记列为 UnchangedToast，表示该列为 TOAST 类型且本次事件未发生变化。
+                // 为了遵循 KISS 原则并避免不必要的更新，我们在 after/before 映射中跳过该列，
+                // 让后续的 UPDATE 仅包含实际变更的列。这样也避免了 unwrap 导致的 panic。
+                TupleData::UnchangedToast => {}
             }
         }
         Ok(col_values)
