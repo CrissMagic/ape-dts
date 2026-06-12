@@ -12,20 +12,28 @@ use serde_json::json;
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
-    extractor::{base_extractor::BaseExtractor, resumer::cdc_resumer::CdcResumer},
+    extractor::{
+        base_extractor::{BaseExtractor, ExtractState},
+        resumer::recovery::Recovery,
+    },
     Extractor,
 };
 use dt_common::{
     config::config_enums::DbType,
-    log_error, log_info,
-    meta::col_value::ColValue,
-    meta::dt_data::DtData,
-    meta::mongo::{mongo_cdc_source::MongoCdcSource, mongo_constant::MongoConstants},
-    meta::position::Position,
-    meta::row_data::RowData,
-    meta::row_type::RowType,
-    meta::syncer::Syncer,
+    log_error, log_info, log_warn,
+    meta::{
+        col_value::ColValue,
+        dt_data::DtData,
+        mongo::{
+            mongo_cdc_source::MongoCdcSource, mongo_constant::MongoConstants, mongo_key::MongoKey,
+        },
+        position::Position,
+        row_data::RowData,
+        row_type::RowType,
+        syncer::Syncer,
+    },
     rdb_filter::RdbFilter,
+    system_dbs::SystemDb,
     utils::time_util::TimeUtil,
 };
 use mongodb::{
@@ -35,10 +43,9 @@ use mongodb::{
     Client,
 };
 
-const SYSTEM_DBS: [&str; 3] = ["admin", "config", "local"];
-
 pub struct MongoCdcExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub filter: RdbFilter,
     pub resume_token: String,
     pub start_timestamp: u32,
@@ -48,28 +55,48 @@ pub struct MongoCdcExtractor {
     pub heartbeat_interval_secs: u64,
     pub heartbeat_tb: String,
     pub syncer: Arc<Mutex<Syncer>>,
-    pub resumer: CdcResumer,
+    pub recovery: Option<Arc<dyn Recovery + Send + Sync>>,
+}
+
+impl MongoCdcExtractor {
+    fn insert_id_from_doc(target: &mut HashMap<String, ColValue>, doc: &Document) {
+        if let Some(key) = MongoKey::from_doc(doc) {
+            target.insert(
+                MongoConstants::ID.to_string(),
+                ColValue::String(key.to_string()),
+            );
+        }
+    }
 }
 
 #[async_trait]
 impl Extractor for MongoCdcExtractor {
     async fn extract(&mut self) -> anyhow::Result<()> {
-        if let Position::MongoCdc {
-            resume_token,
-            operation_time,
-            ..
-        } = &self.resumer.current_position
-        {
-            self.resume_token = resume_token.to_owned();
-            self.start_timestamp = operation_time.to_owned();
-            log_info!("resume from: {}", self.resumer.current_position);
-            self.base_extractor
-                .push_dt_data(
-                    DtData::Heartbeat {},
-                    self.resumer.checkpoint_position.clone(),
-                )
-                .await?;
-        };
+        if let Some(recovery) = &self.recovery {
+            if let Some(position) = recovery.get_cdc_resume_position().await {
+                match &position {
+                    Position::MongoCdc {
+                        resume_token,
+                        operation_time,
+                        ..
+                    } => {
+                        self.resume_token = resume_token.to_owned();
+                        self.start_timestamp = operation_time.to_owned();
+                        log_info!(
+                            "cdc recovery from resume_token:[{}], operation_time:[{}]",
+                            resume_token,
+                            operation_time
+                        );
+                        self.base_extractor
+                            .push_dt_data(&mut self.extract_state, DtData::Heartbeat {}, position)
+                            .await?;
+                    }
+                    _ => {
+                        log_warn!("position:{} is not a valid mongo cdc position", position);
+                    }
+                }
+            }
+        }
 
         log_info!(
             "MongoCdcExtractor starts, resume_token: {}, start_timestamp: {}, source: {:?} ",
@@ -85,7 +112,9 @@ impl Extractor for MongoCdcExtractor {
             MongoCdcSource::OpLog => self.extract_oplog().await?,
             MongoCdcSource::ChangeStream => self.extract_change_stream().await?,
         }
-        self.base_extractor.wait_task_finish().await
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
@@ -133,15 +162,17 @@ impl MongoCdcExtractor {
 
             match op.as_str() {
                 "i" => {
-                    after.insert(
-                        MongoConstants::DOC.to_string(),
-                        ColValue::MongoDoc(o.unwrap().as_document().unwrap().clone()),
-                    );
+                    let doc = o.unwrap().as_document().unwrap().clone();
+                    Self::insert_id_from_doc(&mut after, &doc);
+                    after.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
                 }
                 "u" => {
                     row_type = RowType::Update;
                     // for update op log, doc.o contains only diff instead of full doc
                     let after_doc = o.unwrap().as_document().unwrap();
+                    if let Some(id_doc) = o2.and_then(|doc| doc.as_document()) {
+                        Self::insert_id_from_doc(&mut after, id_doc);
+                    }
                     // refer: https://www.mongodb.com/community/forums/t/oplog-update-entry-without-set-and-unset/171771
                     // https://www.mongodb.com/docs/manual/reference/operator/update/#update-operators-1
                     // in MongoDB 4.4 and earlier, after_doc contains $set with all new document fields,
@@ -185,10 +216,9 @@ impl MongoCdcExtractor {
                 }
                 "d" => {
                     row_type = RowType::Delete;
-                    before.insert(
-                        MongoConstants::DOC.to_string(),
-                        ColValue::MongoDoc(o.unwrap().as_document().unwrap().clone()),
-                    );
+                    let doc = o.unwrap().as_document().unwrap().clone();
+                    Self::insert_id_from_doc(&mut before, &doc);
+                    before.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
                 }
                 // TODO, DDL
                 "c" | "xi" | "xd" => {
@@ -283,17 +313,17 @@ impl MongoCdcExtractor {
 
             let o = item.get("o");
             let mut before = HashMap::new();
-            before.insert(
-                MongoConstants::DOC.to_string(),
-                ColValue::MongoDoc(o.unwrap().as_document().unwrap().clone()),
-            );
+            let doc = o.unwrap().as_document().unwrap().clone();
+            let after = HashMap::new();
+            Self::insert_id_from_doc(&mut before, &doc);
+            before.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
 
             data.push(Self::build_oplog_row_data(
                 &ns,
                 &ts,
                 RowType::Delete,
                 before,
-                HashMap::new(),
+                after,
             ));
         }
         data
@@ -326,7 +356,7 @@ impl MongoCdcExtractor {
             operation_time: ts.time,
             timestamp: Position::format_timestamp_millis(ts.time as i64 * 1000),
         };
-        let row_data = RowData::new(db, tb, row_type, before, after);
+        let row_data = RowData::new(db, tb, 0, row_type, before, after);
         (row_data, position)
     }
 
@@ -383,6 +413,7 @@ impl MongoCdcExtractor {
 
                 match doc.operation_type {
                     OperationType::Insert => {
+                        Self::insert_id_from_doc(&mut after, doc.full_document.as_ref().unwrap());
                         after.insert(
                             MongoConstants::DOC.to_string(),
                             ColValue::MongoDoc(doc.full_document.unwrap()),
@@ -391,15 +422,18 @@ impl MongoCdcExtractor {
 
                     OperationType::Delete => {
                         row_type = RowType::Delete;
-                        before.insert(
-                            MongoConstants::DOC.to_string(),
-                            ColValue::MongoDoc(doc.document_key.unwrap()),
-                        );
+                        let doc = doc.document_key.unwrap();
+                        Self::insert_id_from_doc(&mut before, &doc);
+                        before.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
                     }
 
                     OperationType::Update | OperationType::Replace => {
                         row_type = RowType::Update;
                         if let Some(document) = doc.full_document {
+                            if let Some(id_doc) = doc.document_key.as_ref() {
+                                Self::insert_id_from_doc(&mut after, id_doc);
+                            }
+                            Self::insert_id_from_doc(&mut after, &document);
                             before.insert(
                                 MongoConstants::DOC.to_string(),
                                 ColValue::MongoDoc(doc.document_key.unwrap()),
@@ -417,7 +451,7 @@ impl MongoCdcExtractor {
                     }
                 }
 
-                let row_data = RowData::new(db, tb, row_type, Some(before), Some(after));
+                let row_data = RowData::new(db, tb, 0, row_type, Some(before), Some(after));
                 self.push_row_to_buf(row_data, position).await?;
             }
         }
@@ -428,19 +462,23 @@ impl MongoCdcExtractor {
         row_data: RowData,
         position: Position,
     ) -> anyhow::Result<()> {
-        if SYSTEM_DBS.contains(&row_data.schema.as_str()) {
+        if SystemDb::is_system_db(&row_data.schema, &DbType::Mongo) {
             return Ok(());
         }
+
         if self
             .filter
             .filter_event(&row_data.schema, &row_data.tb, &row_data.row_type)
         {
-            self.base_extractor
-                .push_dt_data(DtData::Heartbeat {}, position)
-                .await
-        } else {
-            self.base_extractor.push_row(row_data, position).await
+            self.extract_state.record_extracted_metrics_row(&row_data);
+            return self
+                .base_extractor
+                .push_dt_data(&mut self.extract_state, DtData::Heartbeat {}, position)
+                .await;
         }
+        self.base_extractor
+            .push_row(&mut self.extract_state, row_data, position)
+            .await
     }
 
     fn parse_start_timestamp(&mut self) -> Timestamp {

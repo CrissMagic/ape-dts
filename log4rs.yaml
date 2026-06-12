@@ -2,6 +2,17 @@ appenders:
   stdout:
     kind: console
 
+  silent_stdout_appender:
+    kind: console
+    filters:
+      - kind: threshold
+        level: off
+
+  check_stdout_appender:
+    kind: console
+    encoder:
+      pattern: "{t} - {m}{n}"
+
   default_appender:
     kind: rolling_file
     append: true
@@ -16,7 +27,7 @@ appenders:
       roller:
         kind: fixed_window
         base: 1
-        count: 10
+        count: 1
         pattern: "LOG_DIR_PLACEHOLDER/default{}.log"
 
   commit_appender:
@@ -33,7 +44,7 @@ appenders:
       roller:
         kind: fixed_window
         base: 1
-        count: 10
+        count: 1
         pattern: "LOG_DIR_PLACEHOLDER/commit{}.log"
 
   position_appender:
@@ -67,59 +78,48 @@ appenders:
       roller:
         kind: fixed_window
         base: 1
-        count: 10
+        count: 1
         pattern: "LOG_DIR_PLACEHOLDER/monitor{}.log"
 
   miss_appender:
-    kind: rolling_file
+    kind: file
     append: true
     path: "CHECK_LOG_DIR_PLACEHOLDER/miss.log"
+    filters:
+      - kind: size_limit
+        path: "CHECK_LOG_DIR_PLACEHOLDER/miss.log"
+        limit: CHECK_LOG_FILE_SIZE_PLACEHOLDER
     encoder:
       pattern: "{m}{n}"
-    policy:
-      kind: compound
-      trigger:
-        kind: size
-        limit: 100mb
-      roller:
-        kind: fixed_window
-        base: 1
-        count: 10
-        pattern: "CHECK_LOG_DIR_PLACEHOLDER/miss{}.log"
 
   diff_appender:
-    kind: rolling_file
+    kind: file
     append: true
     path: "CHECK_LOG_DIR_PLACEHOLDER/diff.log"
+    filters:
+      - kind: size_limit
+        path: "CHECK_LOG_DIR_PLACEHOLDER/diff.log"
+        limit: CHECK_LOG_FILE_SIZE_PLACEHOLDER
     encoder:
       pattern: "{m}{n}"
-    policy:
-      kind: compound
-      trigger:
-        kind: size
-        limit: 100mb
-      roller:
-        kind: fixed_window
-        base: 1
-        count: 10
-        pattern: "CHECK_LOG_DIR_PLACEHOLDER/diff{}.log"
 
-  extra_appender:
-    kind: rolling_file
+  sql_appender:
+    kind: file
     append: true
-    path: "CHECK_LOG_DIR_PLACEHOLDER/extra.log"
+    path: "CHECK_LOG_DIR_PLACEHOLDER/sql.log"
+    filters:
+      - kind: size_limit
+        path: "CHECK_LOG_DIR_PLACEHOLDER/sql.log"
+        limit: CHECK_LOG_FILE_SIZE_PLACEHOLDER
     encoder:
       pattern: "{m}{n}"
-    policy:
-      kind: compound
-      trigger:
-        kind: size
-        limit: 100mb
-      roller:
-        kind: fixed_window
-        base: 1
-        count: 10
-        pattern: "CHECK_LOG_DIR_PLACEHOLDER/extra{}.log"
+
+  summary_appender:
+    kind: file
+    append: true
+    path: "CHECK_LOG_DIR_PLACEHOLDER/summary.log"
+    encoder:
+      pattern: "{m}{n}"
 
   statistic_appender:
     kind: rolling_file
@@ -152,39 +152,22 @@ appenders:
       roller:
         kind: fixed_window
         base: 1
-        count: 10
+        count: 1
         pattern: "LOG_DIR_PLACEHOLDER/finished{}.log"
-  
-  sql_appender:
-    kind: rolling_file
-    append: true
-    path: "LOG_DIR_PLACEHOLDER/sql.log"
-    encoder:
-      pattern: "{m}{n}"
-    policy:
-      kind: compound
-      trigger:
-        kind: size
-        limit: 100mb
-      roller:
-        kind: fixed_window
-        base: 1
-        count: 10
-        pattern: "LOG_DIR_PLACEHOLDER/sql{}.log"
 
   task_appender:
     kind: rolling_file
     append: true
     path: "LOG_DIR_PLACEHOLDER/task.log"
     encoder:
-      pattern: "{m}{n}"   
+      pattern: "{m}{n}"
     policy:
       kind: compound
       trigger:
         kind: size
         limit: 100kb
       roller:
-        kind: delete    
+        kind: delete
 
   http_appender:
     kind: rolling_file
@@ -200,75 +183,79 @@ appenders:
       roller:
         kind: fixed_window
         base: 1
-        count: 10
+        count: 1
         pattern: "LOG_DIR_PLACEHOLDER/http{}.log"
 
 loggers:
-  mysql_binlog_connector_rust:  # crate: mysql-binlog-connector-rust
+  mysql_binlog_connector_rust: # crate: mysql-binlog-connector-rust
     level: LOG_LEVEL_PLACEHOLDER
     appenders:
       - default_appender
 
-  sqlx:  # crate: sqlx
+  sqlx: # crate: sqlx
     level: LOG_LEVEL_PLACEHOLDER
     appenders:
       - default_appender
 
   default_logger:
     level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+    appenders:
       - default_appender
 
   commit_logger:
     level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+    appenders:
       - commit_appender
 
   position_logger:
     level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+    appenders:
       - position_appender
 
   monitor_logger:
     level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+    appenders:
       - monitor_appender
 
-  miss_logger: 
-    level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+  miss_logger:
+    level: info
+    appenders:
       - miss_appender
+      - CHECK_RESULT_STDOUT_APPENDER_PLACEHOLDER
 
-  diff_logger: 
-    level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+  diff_logger:
+    level: info
+    appenders:
       - diff_appender
+      - CHECK_RESULT_STDOUT_APPENDER_PLACEHOLDER
 
-  extra_logger: 
-    level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
-      - extra_appender
+  summary_logger:
+    level: info
+    appenders:
+      - summary_appender
+      - CHECK_RESULT_STDOUT_APPENDER_PLACEHOLDER
 
-  statistic_logger: 
+  statistic_logger:
     level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+    appenders:
       - statistic_appender
 
-  finished_logger: 
+  finished_logger:
     level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+    appenders:
       - finished_appender
 
-  sql_logger: 
-    level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+  sql_logger:
+    level: info
+    appenders:
       - sql_appender
+      - CHECK_RESULT_STDOUT_APPENDER_PLACEHOLDER
 
-  task_logger: 
+  task_logger:
     level: LOG_LEVEL_PLACEHOLDER
-    appenders: 
+    appenders:
       - task_appender
-    additive: false  
+    additive: false
 
   http_logger:
     level: info
@@ -280,17 +267,17 @@ loggers:
     level: info
     appenders:
       - http_appender
-      - stdout
+      - RUNTIME_STDOUT_APPENDER_PLACEHOLDER
     additive: false
-      
+
   actix_server:
-    level: info  
+    level: info
     appenders:
       - http_appender
-      - stdout
-    additive: false  
+      - RUNTIME_STDOUT_APPENDER_PLACEHOLDER
+    additive: false
 
 root:
   level: LOG_LEVEL_PLACEHOLDER
   appenders:
-    - stdout
+    - RUNTIME_STDOUT_APPENDER_PLACEHOLDER

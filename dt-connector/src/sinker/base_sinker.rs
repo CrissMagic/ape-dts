@@ -1,43 +1,131 @@
-use std::sync::Arc;
-
 use dt_common::{
-    monitor::{counter_type::CounterType, monitor::Monitor},
+    meta::row_data::RowData,
+    monitor::{counter_type::CounterType, task_monitor_handle::TaskMonitorHandle},
     utils::limit_queue::LimitedQueue,
 };
 
-pub struct BaseSinker {}
+use crate::rdb_router::RdbRouter;
+
+#[derive(Clone, Default)]
+pub struct BaseSinker {
+    pub monitor: TaskMonitorHandle,
+    pub monitor_interval: u64,
+}
 
 impl BaseSinker {
+    pub fn new(monitor: TaskMonitorHandle, monitor_interval: u64) -> Self {
+        Self {
+            monitor,
+            monitor_interval,
+        }
+    }
+
+    pub fn monitor_interval_secs(&self) -> u64 {
+        if self.monitor_interval > 0 {
+            self.monitor_interval
+        } else {
+            10
+        }
+    }
+
+    pub fn task_id_for_schema_tb(&self, schema: &str, tb: &str) -> String {
+        self.monitor.task_id_for_schema_tb(schema, tb)
+    }
+
+    pub fn task_id_for_rows(&self, rows: &[RowData]) -> String {
+        self.monitor.task_id_for_rows(rows)
+    }
+
+    pub fn source_task_id_for_rows(&self, rows: &[RowData], router: &Option<RdbRouter>) -> String {
+        if !self.monitor.is_snapshot_task() {
+            return self.monitor.default_task_id().to_string();
+        }
+
+        let Some(first) = rows.first() else {
+            return self.monitor.default_task_id().to_string();
+        };
+
+        let (schema, tb) = match router {
+            Some(router) => router.reverse_get_tb_map(&first.schema, &first.tb),
+            None => (first.schema.as_str(), first.tb.as_str()),
+        };
+        self.task_id_for_schema_tb(schema, tb)
+    }
+
+    pub fn ensure_monitor_for(&self, task_id: &str) {
+        self.monitor.ensure_snapshot_monitor(task_id);
+    }
+
     pub async fn update_batch_monitor(
-        monitor: &Arc<Monitor>,
+        &self,
         batch_size: u64,
         data_size: u64,
     ) -> anyhow::Result<()> {
-        monitor
-            .add_counter(CounterType::RecordsPerQuery, batch_size)
-            .add_counter(CounterType::RecordCount, batch_size)
-            .add_counter(CounterType::DataBytes, data_size);
+        self.update_batch_monitor_for(self.monitor.default_task_id(), batch_size, data_size)
+            .await
+    }
+
+    pub async fn update_batch_monitor_for(
+        &self,
+        task_id: &str,
+        batch_size: u64,
+        data_size: u64,
+    ) -> anyhow::Result<()> {
+        self.monitor
+            .add_counter(task_id, CounterType::RecordsPerQuery, batch_size)
+            .await
+            .add_counter(task_id, CounterType::RecordCount, batch_size)
+            .await
+            .add_counter(task_id, CounterType::DataBytes, data_size)
+            .await;
         Ok(())
     }
 
     pub async fn update_serial_monitor(
-        monitor: &Arc<Monitor>,
+        &self,
         record_count: u64,
         data_size: u64,
     ) -> anyhow::Result<()> {
-        monitor
-            .add_batch_counter(CounterType::RecordsPerQuery, record_count, record_count)
-            .add_counter(CounterType::RecordCount, record_count)
-            .add_counter(CounterType::SerialWrites, record_count)
-            .add_batch_counter(CounterType::DataBytes, data_size, record_count);
+        self.update_serial_monitor_for(self.monitor.default_task_id(), record_count, data_size)
+            .await
+    }
+
+    pub async fn update_serial_monitor_for(
+        &self,
+        task_id: &str,
+        record_count: u64,
+        data_size: u64,
+    ) -> anyhow::Result<()> {
+        self.monitor
+            .add_batch_counter(
+                task_id,
+                CounterType::RecordsPerQuery,
+                record_count,
+                record_count,
+            )
+            .await
+            .add_counter(task_id, CounterType::RecordCount, record_count)
+            .await
+            .add_counter(task_id, CounterType::SerialWrites, record_count)
+            .await
+            .add_batch_counter(task_id, CounterType::DataBytes, data_size, record_count)
+            .await;
         Ok(())
     }
 
-    pub async fn update_monitor_rt(
-        monitor: &Arc<Monitor>,
+    pub async fn update_monitor_rt(&self, rts: &LimitedQueue<(u64, u64)>) -> anyhow::Result<()> {
+        self.update_monitor_rt_for(self.monitor.default_task_id(), rts)
+            .await
+    }
+
+    pub async fn update_monitor_rt_for(
+        &self,
+        task_id: &str,
         rts: &LimitedQueue<(u64, u64)>,
     ) -> anyhow::Result<()> {
-        monitor.add_multi_counter(CounterType::RtPerQuery, rts);
+        self.monitor
+            .add_multi_counter(task_id, CounterType::RtPerQuery, rts)
+            .await;
         Ok(())
     }
 }
@@ -58,7 +146,7 @@ macro_rules! call_batch_fn {
                 break;
             }
 
-            $batch_fn($self, &mut $data, sinked_count, batch_size).await?;
+            $batch_fn($self, &mut $data[..], sinked_count, batch_size).await?;
             sinked_count += batch_size;
         }
     };
@@ -80,7 +168,7 @@ macro_rules! sync_call_batch_fn {
                 break;
             }
 
-            $batch_fn($self, &mut $data, sinked_count, batch_size)?;
+            $batch_fn($self, &mut $data[..], sinked_count, batch_size)?;
             sinked_count += batch_size;
         }
     };

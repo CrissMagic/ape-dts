@@ -1,20 +1,19 @@
-use std::{cmp, collections::HashMap, sync::Arc};
+use std::{cmp, collections::HashMap};
 
 use anyhow::bail;
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::{Client, Method, Response, StatusCode};
-use serde_json::json;
 use tokio::time::Instant;
 
-use crate::{call_batch_fn, sinker::base_sinker::BaseSinker, Sinker};
 use dt_common::{
     config::config_enums::DbType,
     error::Error,
     meta::{col_value::ColValue, row_data::RowData, row_type::RowType},
-    monitor::monitor::Monitor,
     utils::{limit_queue::LimitedQueue, sql_util::SqlUtil},
 };
+
+use crate::{call_batch_fn, sinker::base_sinker::BaseSinker, Sinker};
 
 const SIGN_COL_NAME: &str = "_ape_dts_is_deleted";
 const TIMESTAMP_COL_NAME: &str = "_ape_dts_timestamp";
@@ -27,7 +26,7 @@ pub struct ClickhouseSinker {
     pub port: String,
     pub username: String,
     pub password: String,
-    pub monitor: Arc<Monitor>,
+    pub base_sinker: BaseSinker,
     pub sync_timestamp: i64,
 }
 
@@ -50,8 +49,14 @@ impl ClickhouseSinker {
         start_index: usize,
         batch_size: usize,
     ) -> anyhow::Result<()> {
+        let task_id = self
+            .base_sinker
+            .task_id_for_rows(&data[start_index..start_index + batch_size]);
+        self.base_sinker.ensure_monitor_for(&task_id);
         let data_size = self.send_data(data, start_index, batch_size).await?;
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, data_size as u64).await
+        self.base_sinker
+            .update_batch_monitor_for(&task_id, batch_size as u64, data_size as u64)
+            .await
     }
 
     async fn send_data(
@@ -66,21 +71,17 @@ impl ClickhouseSinker {
 
         let mut data_size = 0;
         // build stream load data
-        let mut load_data = Vec::new();
+        let mut load_data = Vec::with_capacity(batch_size);
         for row_data in data.iter_mut().skip(start_index).take(batch_size) {
-            data_size += row_data.data_size;
-
+            data_size += row_data.get_data_size() as usize;
+            let is_delete = row_data.row_type == RowType::Delete;
             Self::convert_row_data(row_data)?;
+            let col_values = Self::active_col_values_mut(row_data)?;
 
-            let col_values = if row_data.row_type == RowType::Delete {
-                let before = row_data.before.as_mut().unwrap();
+            if is_delete {
                 // SIGN_COL value
-                before.insert(SIGN_COL_NAME.into(), ColValue::Long(1));
-                before
-            } else {
-                row_data.after.as_mut().unwrap()
-            };
-
+                col_values.insert(SIGN_COL_NAME.into(), ColValue::Long(1));
+            }
             col_values.insert(
                 TIMESTAMP_COL_NAME.into(),
                 ColValue::LongLong(self.sync_timestamp),
@@ -89,32 +90,27 @@ impl ClickhouseSinker {
         }
 
         // curl -X POST -d @data.json 'http://localhost:8123/?query=INSERT%20INTO%test_db.tb_1%20FORMAT%20JSON' --user admin:123456
-        let body = json!(load_data).to_string();
+        let body = serde_json::to_string(&load_data)?;
         let url = format!(
             "http://{}:{}/?query=INSERT INTO {}.{} FORMAT JSON",
             self.host, self.port, db, tb
         );
-        let request = self.build_request(&url, &body)?;
+        let request = self.build_request(&url, body)?;
 
         let start_time = Instant::now();
         let mut rts = LimitedQueue::new(1);
         let response = self.http_client.execute(request).await?;
         rts.push((start_time.elapsed().as_millis() as u64, 1));
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await?;
+        let task_id = self
+            .base_sinker
+            .task_id_for_rows(&data[start_index..start_index + batch_size]);
+        self.base_sinker
+            .update_monitor_rt_for(&task_id, &rts)
+            .await?;
 
         Self::check_response(response).await?;
 
         Ok(data_size)
-    }
-
-    fn convert_row_data(row_data: &mut RowData) -> anyhow::Result<()> {
-        if let Some(before) = &mut row_data.before {
-            Self::convert_col_values(before)?;
-        }
-        if let Some(after) = &mut row_data.after {
-            Self::convert_col_values(after)?;
-        }
-        Ok(())
     }
 
     fn convert_col_values(col_values: &mut HashMap<String, ColValue>) -> anyhow::Result<()> {
@@ -155,7 +151,26 @@ impl ClickhouseSinker {
         Ok(())
     }
 
-    fn build_request(&self, url: &str, body: &str) -> anyhow::Result<reqwest::Request> {
+    fn convert_row_data(row_data: &mut RowData) -> anyhow::Result<()> {
+        if let Some(before) = &mut row_data.before {
+            Self::convert_col_values(before)?;
+        }
+        if let Some(after) = &mut row_data.after {
+            Self::convert_col_values(after)?;
+        }
+        Ok(())
+    }
+
+    fn active_col_values_mut(
+        row_data: &mut RowData,
+    ) -> anyhow::Result<&mut HashMap<String, ColValue>> {
+        match row_data.row_type {
+            RowType::Delete => row_data.require_before_mut(),
+            _ => row_data.require_after_mut(),
+        }
+    }
+
+    fn build_request(&self, url: &str, body: String) -> anyhow::Result<reqwest::Request> {
         let password = if self.password.is_empty() {
             None
         } else {
@@ -166,7 +181,7 @@ impl ClickhouseSinker {
             .http_client
             .request(Method::POST, url)
             .basic_auth(&self.username, password)
-            .body(body.to_string());
+            .body(body);
         Ok(post.build()?)
     }
 

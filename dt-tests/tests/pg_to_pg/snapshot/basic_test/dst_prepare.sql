@@ -66,7 +66,6 @@ CREATE TABLE test_db_1.col_has_special_character_table ("p:k" SERIAL, "col`1" te
 
 CREATE TABLE test_db_1.ignore_cols_1 ( f_0 smallint, f_1 smallint DEFAULT NULL, f_2 smallint DEFAULT NULL, f_3 smallint DEFAULT NULL, PRIMARY KEY (f_0) );
 
-```
 CREATE TABLE "Upper_Case_DB"."Upper_Case_TB" (
     "Id" INT, 
     "FIELD_1" INT,
@@ -76,9 +75,7 @@ CREATE TABLE "Upper_Case_DB"."Upper_Case_TB" (
     PRIMARY KEY("Id"),
     UNIQUE("FIELD_1", field_2, Field_3)
 );
-```
 
-```
 CREATE TABLE Upper_Case_DB.Upper_Case_TB (
     "Id" INT, 
     "FIELD_1" INT,
@@ -88,8 +85,73 @@ CREATE TABLE Upper_Case_DB.Upper_Case_TB (
     PRIMARY KEY("Id"),
     UNIQUE("FIELD_1", field_2, Field_3)
 );
-```
 
 CREATE TABLE test_db_1.where_condition_1 ( f_0 int, f_1 int ); 
 CREATE TABLE test_db_1.where_condition_2 ( f_0 int, f_1 int, PRIMARY KEY (f_0) ); 
-CREATE TABLE test_db_1.where_condition_3 ( f_0 int, f_1 int ); 
+CREATE TABLE test_db_1.where_condition_3 ( f_0 int, f_1 int );
+
+-- test composite primary key
+CREATE TABLE test_db_1.composite_pk_table (pk1 int, pk2 varchar(10), val int, PRIMARY KEY(pk1, pk2));
+
+-- test non-nullable composite unique key
+CREATE TABLE test_db_1.composite_unique_key_table (uk1 int not null, uk2 varchar(10) not null, val int, UNIQUE(uk1, uk2));
+
+--test nullable composite unique key
+CREATE TABLE test_db_1.composite_unique_key_table_2 (val int, uk2 varchar(10), uk1 int, UNIQUE(uk1, uk2));
+
+--test multi primary and single unique key
+CREATE TABLE test_db_1.multi_primary_and_single_unique_table (pk1 int, pk2 varchar(10), uk1 int not null, uk2 varchar(10), val int, PRIMARY KEY(pk1, pk2), UNIQUE(uk1), UNIQUE(uk2));
+
+CREATE TABLE test_db_1.all_pks (pk1 INT, pk2 INT, pk3 INT, PRIMARY KEY(pk1, pk2, pk3));
+INSERT INTO test_db_1.all_pks VALUES(1, 2, 3),(4, 5, 6),(7, 8, 9);
+
+-- PK and Unique Col by index
+```
+CREATE TABLE test_db_1.tbl_1 (
+    id          bigint PRIMARY KEY,
+    code        varchar(50) NOT NULL,
+    name        varchar(100)
+);
+```
+CREATE UNIQUE INDEX tbl_1_code_uidx ON test_db_1.tbl_1 (code);
+
+-- No PK, only Unique Col by index
+```
+CREATE TABLE test_db_1.tbl_2 (
+    code  varchar(21),
+    name  varchar(30) NOT NULL
+);
+```
+CREATE UNIQUE INDEX tbl_2_code_uidx ON test_db_1.tbl_2 (name);
+
+-- PK and Unique Col by constraint
+```
+CREATE TABLE test_db_1.tbl_3 (
+    id      serial PRIMARY KEY,
+    code    varchar(21) NOT NULL,
+    name    varchar(30),
+    CONSTRAINT tbl_3_code_uk UNIQUE (code)
+);
+```
+
+-- No PK, no Unique Col by constraint
+```
+CREATE TABLE test_db_1.tbl_4 (
+    code    varchar(21) NOT NULL,
+    name    varchar(30) NOT NULL,
+    CONSTRAINT tbl_4_code_name_uk UNIQUE (code, name)
+);
+```
+
+-- No PK, no Unique Col by index
+```
+CREATE TABLE test_db_1.tbl_5 (
+    code    varchar(21),
+    name    varchar(30)
+); 
+```
+
+INSERT INTO test_db_1.tbl_1 VALUES(1, 'code1', 'name1'),(2, 'code2', 'name2'),(3, 'code3', 'name3');
+INSERT INTO test_db_1.tbl_2 VALUES('code1', 'name1'),('code1', 'name2'),('code3', 'name3');
+INSERT INTO test_db_1.tbl_3 VALUES(1, 'code1', 'name1'),(2, 'code2', 'name2'),(3, 'code3', 'name3');
+INSERT INTO test_db_1.tbl_4 VALUES('code1', 'name1'),('code2', 'name2'),('code3', 'name3');

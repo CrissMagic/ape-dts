@@ -1,8 +1,6 @@
-use std::sync::Arc;
-
 use anyhow::Context;
 use async_trait::async_trait;
-use rusoto_s3::S3Client;
+use opendal::Operator;
 use sqlx::{MySql, Pool};
 use tokio::time::Instant;
 
@@ -11,14 +9,13 @@ use dt_common::{
     config::{config_enums::ExtractType, s3_config::S3Config},
     log_debug, log_info,
     meta::dt_data::{DtData, DtItem},
-    monitor::monitor::Monitor,
     utils::limit_queue::LimitedQueue,
 };
 
 pub struct FoxlakeMerger {
     pub batch_size: usize,
-    pub monitor: Arc<Monitor>,
-    pub s3_client: S3Client,
+    pub base_sinker: BaseSinker,
+    pub s3_client: Operator,
     pub s3_config: S3Config,
     pub conn_pool: Pool<MySql>,
     pub extract_type: ExtractType,
@@ -42,7 +39,8 @@ impl Sinker for FoxlakeMerger {
 impl FoxlakeMerger {
     async fn batch_sink(&mut self, data: Vec<DtItem>) -> anyhow::Result<()> {
         let (all_data_size, all_row_count) = self.batch_merge(data).await?;
-        BaseSinker::update_batch_monitor(&self.monitor, all_row_count as u64, all_data_size as u64)
+        self.base_sinker
+            .update_batch_monitor(all_row_count as u64, all_data_size as u64)
             .await
     }
 
@@ -111,7 +109,7 @@ impl FoxlakeMerger {
             .execute(&self.conn_pool)
             .await
             .with_context(|| format!("merge to foxlake failed: {}", sql))?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await?;
+        self.base_sinker.update_monitor_rt(&rts).await?;
 
         log_info!("merge succeeded");
         Ok((all_data_size, all_row_count))

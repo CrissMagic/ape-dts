@@ -35,7 +35,7 @@ pub struct StarrocksStructSinker {
     pub conn_pool: Pool<MySql>,
     pub conflict_policy: ConflictPolicyEnum,
     pub filter: RdbFilter,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub extractor_meta_manager: RdbMetaManager,
     pub backend_count: i32,
 }
@@ -47,7 +47,6 @@ impl Sinker for StarrocksStructSinker {
             self.backend_count = self.get_backend_count().await?;
         }
 
-        let reverse_router = self.router.reverse();
         for i in data {
             match i.statement {
                 StructStatement::MysqlCreateDatabase(statement) => {
@@ -59,8 +58,17 @@ impl Sinker for StarrocksStructSinker {
                 }
 
                 StructStatement::MysqlCreateTable(statement) => {
-                    let (schema, tb) = reverse_router
-                        .get_tb_map(&statement.table.database_name, &statement.table.table_name);
+                    let (schema, tb) = if let Some(router) = &self.router {
+                        router.reverse_get_tb_map(
+                            &statement.table.database_name,
+                            &statement.table.table_name,
+                        )
+                    } else {
+                        (
+                            statement.table.database_name.as_str(),
+                            statement.table.table_name.as_str(),
+                        )
+                    };
                     if let Some(meta_manager) =
                         self.extractor_meta_manager.mysql_meta_manager.as_mut()
                     {
@@ -77,8 +85,17 @@ impl Sinker for StarrocksStructSinker {
                 }
 
                 StructStatement::PgCreateTable(statement) => {
-                    let (schema, tb) = reverse_router
-                        .get_tb_map(&statement.table.schema_name, &statement.table.table_name);
+                    let (schema, tb) = if let Some(router) = &self.router {
+                        router.reverse_get_tb_map(
+                            &statement.table.schema_name,
+                            &statement.table.table_name,
+                        )
+                    } else {
+                        (
+                            statement.table.schema_name.as_str(),
+                            statement.table.table_name.as_str(),
+                        )
+                    };
                     if let Some(meta_manager) = self.extractor_meta_manager.pg_meta_manager.as_mut()
                     {
                         let tb_meta = meta_manager.get_tb_meta(schema, tb).await?.to_owned();
@@ -343,7 +360,7 @@ impl StarrocksStructSinker {
     async fn get_backend_count(&self) -> anyhow::Result<i32> {
         let sql = "SHOW BACKENDS";
         let mut count = 0;
-        let mut rows = sqlx::query(sql).disable_arguments().fetch(&self.conn_pool);
+        let mut rows = sqlx::raw_sql(sql).fetch(&self.conn_pool);
         while (rows.try_next().await?).is_some() {
             count += 1;
         }
@@ -352,7 +369,7 @@ impl StarrocksStructSinker {
 
     async fn execute_sql(&self, sql: &str) -> anyhow::Result<()> {
         log_info!("ddl begin: {}", sql);
-        let query = sqlx::query(sql).disable_arguments();
+        let query = sqlx::raw_sql(sql);
         match query.execute(&self.conn_pool).await {
             Ok(_) => {
                 log_info!("ddl succeed");

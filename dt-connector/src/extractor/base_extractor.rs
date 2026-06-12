@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use anyhow::bail;
+use tokio::task::yield_now;
 
 use dt_common::{
     config::{
@@ -18,8 +19,7 @@ use dt_common::{
         dt_queue::DtQueue,
         struct_meta::struct_data::StructData,
     },
-    rdb_filter::RdbFilter,
-    utils::{sql_util::SqlUtil, time_util::TimeUtil},
+    utils::sql_util::SqlUtil,
 };
 use dt_common::{
     meta::{
@@ -35,16 +35,25 @@ use crate::{data_marker::DataMarker, rdb_router::RdbRouter};
 
 use super::extractor_monitor::ExtractorMonitor;
 
-pub struct BaseExtractor {
-    pub buffer: Arc<DtQueue>,
-    pub router: RdbRouter,
-    pub shut_down: Arc<AtomicBool>,
+pub struct ExtractState {
     pub monitor: ExtractorMonitor,
     pub data_marker: Option<DataMarker>,
     pub time_filter: TimeFilter,
 }
 
-impl BaseExtractor {
+impl ExtractState {
+    pub fn derive_for_table(
+        &self,
+        monitor: ExtractorMonitor,
+        data_marker: Option<DataMarker>,
+    ) -> Self {
+        Self {
+            monitor,
+            data_marker,
+            time_filter: self.time_filter.clone(),
+        }
+    }
+
     pub fn is_data_marker_info(&self, schema: &str, tb: &str) -> bool {
         if let Some(data_marker) = &self.data_marker {
             return data_marker.is_rdb_marker_info(schema, tb);
@@ -54,34 +63,38 @@ impl BaseExtractor {
 
     pub async fn push_dt_data(
         &mut self,
+        base_extractor: &BaseExtractor,
         dt_data: DtData,
         position: Position,
     ) -> anyhow::Result<()> {
+        self.record_extracted_metrics(dt_data.get_data_count() as u64, dt_data.get_data_size());
+        let Some(data_origin_node) = self.preprocess_dt_data(&dt_data).await? else {
+            return Ok(());
+        };
+        base_extractor
+            .emit_dt_data(self, dt_data, position, data_origin_node)
+            .await
+    }
+
+    pub async fn preprocess_dt_data(&mut self, dt_data: &DtData) -> anyhow::Result<Option<String>> {
         if !self.time_filter.started {
-            return Ok(());
+            self.monitor.try_flush(false).await;
+            return Ok(None);
         }
 
-        if self.refresh_and_check_data_marker(&dt_data) {
-            return Ok(());
+        if self.refresh_and_check_data_marker(dt_data) {
+            self.monitor.try_flush(false).await;
+            return Ok(None);
         }
 
-        self.monitor.counters.pushed_record_count += 1;
-        self.monitor.counters.pushed_data_size += dt_data.get_data_size();
-        self.monitor.try_flush(false).await;
+        Ok(Some(self.get_data_origin_node()))
+    }
 
-        let data_origin_node = if let Some(data_marker) = &mut self.data_marker {
-            data_marker.data_origin_node.clone()
-        } else {
-            String::new()
-        };
-
-        let item = DtItem {
-            dt_data,
-            position,
-            data_origin_node,
-        };
-        log_debug!("extracted item: {:?}", item);
-        self.buffer.push(item).await
+    pub fn get_data_origin_node(&self) -> String {
+        self.data_marker
+            .as_ref()
+            .map(|data_marker| data_marker.data_origin_node.clone())
+            .unwrap_or_default()
     }
 
     pub fn refresh_and_check_data_marker(&mut self, dt_data: &DtData) -> bool {
@@ -113,27 +126,109 @@ impl BaseExtractor {
         false
     }
 
-    pub async fn push_row(&mut self, row_data: RowData, position: Position) -> anyhow::Result<()> {
-        let row_data = self.router.route_row(row_data);
-        self.push_dt_data(DtData::Dml { row_data }, position).await
+    #[inline(always)]
+    pub fn record_extracted_metrics(&mut self, records: u64, bytes: u64) {
+        self.monitor.counters.extracted_record_count += records;
+        self.monitor.counters.extracted_data_size += bytes;
     }
 
-    pub async fn push_ddl(&mut self, ddl_data: DdlData, position: Position) -> anyhow::Result<()> {
-        let ddl_data = self.router.route_ddl(ddl_data);
+    #[inline(always)]
+    pub fn record_extracted_metrics_row(&mut self, row_data: &RowData) {
+        self.record_extracted_metrics(1, row_data.data_size as u64);
+    }
+}
+
+#[derive(Clone)]
+pub struct BaseExtractor {
+    pub buffer: Arc<DtQueue>,
+    pub router: Option<RdbRouter>,
+    pub shut_down: Arc<AtomicBool>,
+}
+
+impl BaseExtractor {
+    pub async fn emit_dt_data(
+        &self,
+        state: &mut ExtractState,
+        dt_data: DtData,
+        position: Position,
+        data_origin_node: String,
+    ) -> anyhow::Result<()> {
+        state.monitor.counters.pushed_record_count += dt_data.get_data_count() as u64;
+        state.monitor.counters.pushed_data_size += dt_data.get_data_size();
+        state.monitor.try_flush(false).await;
+
+        let item = DtItem {
+            dt_data,
+            position,
+            data_origin_node,
+        };
+        log_debug!("extracted item: {:?}", item);
+        self.buffer.push(item).await
+    }
+
+    pub async fn push_dt_data(
+        &self,
+        state: &mut ExtractState,
+        dt_data: DtData,
+        position: Position,
+    ) -> anyhow::Result<()> {
+        state.push_dt_data(self, dt_data, position).await
+    }
+
+    pub async fn push_row(
+        &self,
+        state: &mut ExtractState,
+        row_data: RowData,
+        position: Position,
+    ) -> anyhow::Result<()> {
+        let row_data = if let Some(router) = &self.router {
+            router.route_row(row_data)
+        } else {
+            row_data
+        };
+        self.push_dt_data(state, DtData::Dml { row_data }, position)
+            .await
+    }
+
+    pub async fn push_ddl(
+        &self,
+        state: &mut ExtractState,
+        ddl_data: DdlData,
+        position: Position,
+    ) -> anyhow::Result<()> {
+        let ddl_data = if let Some(router) = &self.router {
+            router.route_ddl(ddl_data)
+        } else {
+            ddl_data
+        };
         while !self.buffer.is_empty() {
-            TimeUtil::sleep_millis(1).await;
+            yield_now().await;
         }
-        self.push_dt_data(DtData::Ddl { ddl_data }, position).await
+        self.push_dt_data(state, DtData::Ddl { ddl_data }, position)
+            .await
     }
 
-    pub async fn push_dcl(&mut self, dcl_data: DclData, position: Position) -> anyhow::Result<()> {
-        // Todo: route dcl data
-        self.push_dt_data(DtData::Dcl { dcl_data }, position).await
+    pub async fn push_dcl(
+        &self,
+        state: &mut ExtractState,
+        dcl_data: DclData,
+        position: Position,
+    ) -> anyhow::Result<()> {
+        self.push_dt_data(state, DtData::Dcl { dcl_data }, position)
+            .await
     }
 
-    pub async fn push_struct(&mut self, struct_data: StructData) -> anyhow::Result<()> {
-        let struct_data = self.router.route_struct(struct_data);
-        self.push_dt_data(DtData::Struct { struct_data }, Position::None)
+    pub async fn push_struct(
+        &self,
+        state: &mut ExtractState,
+        struct_data: StructData,
+    ) -> anyhow::Result<()> {
+        let struct_data = if let Some(router) = &self.router {
+            router.route_struct(struct_data)
+        } else {
+            struct_data
+        };
+        self.push_dt_data(state, DtData::Struct { struct_data }, Position::None)
             .await
     }
 
@@ -190,23 +285,6 @@ impl BaseExtractor {
         }
     }
 
-    pub fn get_where_sql(filter: &RdbFilter, schema: &str, tb: &str, condition: &str) -> String {
-        let mut res: String = String::new();
-        if let Some(where_condition) = filter.get_where_condition(schema, tb) {
-            res = format!("WHERE {}", where_condition);
-        }
-
-        if condition.is_empty() {
-            return res;
-        }
-
-        if res.is_empty() {
-            format!("WHERE {}", condition)
-        } else {
-            format!("{} AND {}", res, condition)
-        }
-    }
-
     pub fn precheck_heartbeat(
         &self,
         heartbeat_interval_secs: u64,
@@ -253,14 +331,26 @@ impl BaseExtractor {
         }
     }
 
-    pub async fn wait_task_finish(&mut self) -> anyhow::Result<()> {
-        // wait all data to be transferred
+    pub async fn wait_task_finish(&self, state: &mut ExtractState) -> anyhow::Result<()> {
         while !self.buffer.is_empty() {
-            TimeUtil::sleep_millis(1).await;
+            yield_now().await;
         }
 
-        self.monitor.try_flush(true).await;
+        state.monitor.try_flush(true).await;
         self.shut_down.store(true, Ordering::Release);
         Ok(())
+    }
+
+    pub async fn push_snapshot_finished(
+        &self,
+        state: &mut ExtractState,
+        finish_position: Position,
+    ) -> anyhow::Result<()> {
+        self.push_dt_data(
+            state,
+            DtData::Commit { xid: String::new() },
+            finish_position,
+        )
+        .await
     }
 }

@@ -25,13 +25,14 @@ impl TypeRegistry {
                     t.typelem AS element,
                     t.typbasetype AS parentoid,
                     t.typtypmod AS modifiers,
-                    t.typcategory AS category,
-                    e.values AS enum_values
+                    t.typcategory::text AS category,
+                    e.values AS enum_values,
+                    n.nspname AS schema_name
             FROM pg_catalog.pg_type t
             JOIN pg_catalog.pg_namespace n
             ON (t.typnamespace = n.oid)
             LEFT JOIN 
-            (SELECT t.enumtypid AS id, array_agg(t.enumlabel) AS values
+            (SELECT t.enumtypid AS id, array_agg(t.enumlabel::text) AS values
             FROM pg_catalog.pg_enum t
             GROUP BY id) e
             ON (t.oid = e.id)
@@ -59,6 +60,7 @@ impl TypeRegistry {
             let enum_values: Vec<String> = row.try_get("enum_values")?;
             Some(enum_values)
         };
+        let schema_name: String = row.try_get("schema_name")?;
 
         Ok(PgColType {
             oid,
@@ -69,6 +71,7 @@ impl TypeRegistry {
             parent_oid,
             category,
             enum_values,
+            schema_name,
         })
     }
 
@@ -79,8 +82,9 @@ impl TypeRegistry {
             "bigserial" => "serial8",
             "bit varying" => "varbit",
             "boolean" => "bool",
+            "char" => "\"char\"",
             // fixed-length, blank-padded, refer to: https://www.postgresql.org/docs/17/datatype-character.html
-            "character" | "char" => "bpchar",
+            "character" => "bpchar",
             "character varying" => "varchar",
             "double precision" => "float8",
             "int" | "integer" => "int4",

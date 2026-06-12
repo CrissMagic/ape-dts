@@ -1,11 +1,11 @@
-use std::sync::Arc;
-
 use tokio::time::Instant;
 
-use dt_common::monitor::{counter_type::CounterType, monitor::Monitor};
+use dt_common::monitor::{counter_type::CounterType, task_monitor_handle::TaskMonitorHandle};
 
 #[derive(Clone, Default)]
 pub struct ExtractorCounters {
+    pub extracted_record_count: u64,
+    pub extracted_data_size: u64,
     pub pushed_record_count: u64,
     pub pushed_data_size: u64,
 }
@@ -13,6 +13,8 @@ pub struct ExtractorCounters {
 impl ExtractorCounters {
     pub fn new() -> Self {
         Self {
+            extracted_record_count: 0,
+            extracted_data_size: 0,
             pushed_record_count: 0,
             pushed_data_size: 0,
         }
@@ -20,7 +22,8 @@ impl ExtractorCounters {
 }
 
 pub struct ExtractorMonitor {
-    pub monitor: Arc<Monitor>,
+    pub monitor: TaskMonitorHandle,
+    pub default_task_id: String,
     pub count_window: u64,
     pub time_window_secs: u64,
     pub last_flush_time: Instant,
@@ -29,11 +32,12 @@ pub struct ExtractorMonitor {
 }
 
 impl ExtractorMonitor {
-    pub async fn new(monitor: Arc<Monitor>) -> Self {
-        let count_window = monitor.count_window;
-        let time_window_secs = monitor.time_window_secs;
+    pub async fn new(monitor: TaskMonitorHandle, default_task_id: String) -> Self {
+        let count_window = monitor.count_window();
+        let time_window_secs = monitor.time_window_secs();
         Self {
             monitor,
+            default_task_id,
             last_flush_time: Instant::now(),
             count_window,
             time_window_secs,
@@ -43,18 +47,46 @@ impl ExtractorMonitor {
     }
 
     pub async fn try_flush(&mut self, force: bool) {
+        let extracted_record_count =
+            self.counters.extracted_record_count - self.flushed_counters.extracted_record_count;
+        let extracted_record_size =
+            self.counters.extracted_data_size - self.flushed_counters.extracted_data_size;
         let pushed_record_count =
             self.counters.pushed_record_count - self.flushed_counters.pushed_record_count;
         let pushed_record_size =
             self.counters.pushed_data_size - self.flushed_counters.pushed_data_size;
         // to avoid too many sub counters, add counter by batch
         if force
+            || extracted_record_count >= self.count_window
+            || extracted_record_size >= self.count_window
             || pushed_record_count >= self.count_window
             || self.last_flush_time.elapsed().as_secs() >= self.time_window_secs
         {
             self.monitor
-                .add_counter(CounterType::RecordCount, pushed_record_count)
-                .add_counter(CounterType::DataBytes, pushed_record_size);
+                .add_counter(
+                    &self.default_task_id,
+                    CounterType::RecordCount,
+                    pushed_record_count,
+                )
+                .await
+                .add_counter(
+                    &self.default_task_id,
+                    CounterType::DataBytes,
+                    pushed_record_size,
+                )
+                .await
+                .add_counter(
+                    &self.default_task_id,
+                    CounterType::ExtractedBytes,
+                    extracted_record_size,
+                )
+                .await
+                .add_counter(
+                    &self.default_task_id,
+                    CounterType::ExtractedRecords,
+                    extracted_record_count,
+                )
+                .await;
 
             self.last_flush_time = Instant::now();
             self.flushed_counters = self.counters.clone();

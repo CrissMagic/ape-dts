@@ -28,9 +28,8 @@ impl Merger for RdbMerger {
         }
 
         let mut results = Vec::new();
-        for (tb, mut rdb_tb_merged) in tb_data_map.drain() {
+        for (_, mut rdb_tb_merged) in tb_data_map.drain() {
             let tb_merged = TbMergedData {
-                tb,
                 insert_rows: rdb_tb_merged.get_insert_rows(),
                 delete_rows: rdb_tb_merged.get_delete_rows(),
                 unmerged_rows: rdb_tb_merged.get_unmerged_rows(),
@@ -63,6 +62,11 @@ impl RdbMerger {
             .get_tb_meta(&row_data.schema, &row_data.tb)
             .await?;
 
+        if row_data.contains_unchanged_toast() {
+            merged.unmerged_rows.push(row_data);
+            return Ok(());
+        }
+
         // case 1: table has no primary/unique key
         // case 2: any key col value is NULL
         let hash_code = Self::get_hash_code(&row_data, tb_meta).await?;
@@ -73,8 +77,8 @@ impl RdbMerger {
 
         match row_data.row_type {
             RowType::Delete => {
-                if Self::check_collision(&merged.insert_rows, tb_meta, &row_data, hash_code)
-                    || Self::check_collision(&merged.delete_rows, tb_meta, &row_data, hash_code)
+                if Self::check_collision(&merged.insert_rows, tb_meta, &row_data, hash_code)?
+                    || Self::check_collision(&merged.delete_rows, tb_meta, &row_data, hash_code)?
                 {
                     merged.unmerged_rows.push(row_data);
                     return Ok(());
@@ -84,21 +88,38 @@ impl RdbMerger {
             }
 
             RowType::Update => {
-                // if uk change found in any row_data, for safety, all following row_data won't be merged
-                if Self::check_uk_changed(tb_meta, &row_data) {
+                // if pk/uk change found in any row_data, for safety, all following row_data won't be merged
+                if Self::check_key_changed(tb_meta, &row_data) {
                     merged.unmerged_rows.push(row_data);
                     return Ok(());
                 }
 
-                let (delete, insert) = row_data.split_update_row_data();
+                let delete = RowData::new(
+                    row_data.schema.clone(),
+                    row_data.tb.clone(),
+                    0,
+                    RowType::Delete,
+                    row_data.before,
+                    None,
+                );
+                let insert = RowData::new(
+                    row_data.schema,
+                    row_data.tb,
+                    0,
+                    RowType::Insert,
+                    None,
+                    row_data.after,
+                );
+
                 let insert_hash_code = Self::get_hash_code(&insert, tb_meta).await?;
 
-                if Self::check_collision(&merged.insert_rows, tb_meta, &insert, insert_hash_code)
-                    || Self::check_collision(&merged.delete_rows, tb_meta, &delete, hash_code)
+                if Self::check_collision(&merged.insert_rows, tb_meta, &insert, insert_hash_code)?
+                    || Self::check_collision(&merged.delete_rows, tb_meta, &delete, hash_code)?
                 {
                     let row_data = RowData::new(
                         delete.schema,
                         delete.tb,
+                        0,
                         RowType::Update,
                         delete.before,
                         insert.after,
@@ -111,7 +132,7 @@ impl RdbMerger {
             }
 
             RowType::Insert => {
-                if Self::check_collision(&merged.insert_rows, tb_meta, &row_data, hash_code) {
+                if Self::check_collision(&merged.insert_rows, tb_meta, &row_data, hash_code)? {
                     merged.unmerged_rows.push(row_data);
                     return Ok(());
                 }
@@ -121,13 +142,15 @@ impl RdbMerger {
         Ok(())
     }
 
-    fn check_uk_changed(tb_meta: &RdbTbMeta, row_data: &RowData) -> bool {
+    fn check_key_changed(tb_meta: &RdbTbMeta, row_data: &RowData) -> bool {
         let before = row_data.before.as_ref().unwrap();
         let after = row_data.after.as_ref().unwrap();
-        for col in tb_meta.id_cols.iter() {
-            if before.get(col) != after.get(col) {
-                log_debug!("rdb_merger, uk change found, row_data: {:?}", row_data);
-                return true;
+        for key_cols in tb_meta.key_map.values() {
+            for col in key_cols {
+                if before.get(col) != after.get(col) {
+                    log_debug!("rdb_merger, key change found, row_data: {:?}", row_data);
+                    return true;
+                }
             }
         }
         false
@@ -138,38 +161,37 @@ impl RdbMerger {
         tb_meta: &RdbTbMeta,
         row_data: &RowData,
         hash_code: u128,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         if let Some(exist) = buffer.get(&hash_code) {
             let col_values = match row_data.row_type {
-                RowType::Insert => row_data.after.as_ref().unwrap(),
-                _ => row_data.before.as_ref().unwrap(),
+                RowType::Insert => row_data.require_after()?,
+                _ => row_data.require_before()?,
             };
 
             let exist_col_values = match exist.row_type {
-                RowType::Insert => exist.after.as_ref().unwrap(),
-                _ => exist.before.as_ref().unwrap(),
+                RowType::Insert => exist.require_after()?,
+                _ => exist.require_before()?,
             };
 
             for col in tb_meta.id_cols.iter() {
                 if col_values.get(col) != exist_col_values.get(col) {
                     log_debug!("rdb_merger, collision found, row_data: {:?}", row_data);
-                    return true;
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     async fn get_hash_code(row_data: &RowData, tb_meta: &RdbTbMeta) -> anyhow::Result<u128> {
         if tb_meta.key_map.is_empty() {
             return Ok(0);
         }
-        Ok(row_data.get_hash_code(tb_meta))
+        row_data.get_hash_code(tb_meta)
     }
 }
 
 struct RdbTbMergedData {
-    // HashMap<row_key_hash_code, RowData>
     delete_rows: HashMap<u128, RowData>,
     insert_rows: HashMap<u128, RowData>,
     unmerged_rows: Vec<RowData>,
@@ -194,5 +216,84 @@ impl RdbTbMergedData {
 
     pub fn get_unmerged_rows(&mut self) -> Vec<RowData> {
         self.unmerged_rows.drain(..).collect::<Vec<_>>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use dt_common::meta::{col_value::ColValue, row_type::RowType};
+
+    use super::*;
+
+    fn build_tb_meta() -> RdbTbMeta {
+        RdbTbMeta {
+            schema: "test_db".to_string(),
+            tb: "test_tb".to_string(),
+            cols: vec![
+                "id".to_string(),
+                "uk_1".to_string(),
+                "uk_2".to_string(),
+                "value".to_string(),
+            ],
+            key_map: HashMap::from([
+                ("primary".to_string(), vec!["id".to_string()]),
+                (
+                    "uk_test".to_string(),
+                    vec!["uk_1".to_string(), "uk_2".to_string()],
+                ),
+            ]),
+            partition_col: "id".to_string(),
+            id_cols: vec!["id".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn build_update_row(changed_col: &str) -> RowData {
+        let before = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("uk_1".to_string(), ColValue::Long(10)),
+            ("uk_2".to_string(), ColValue::Long(20)),
+            ("value".to_string(), ColValue::String("before".to_string())),
+        ]);
+        let mut after = before.clone();
+        after.insert(
+            changed_col.to_string(),
+            ColValue::String("after".to_string()),
+        );
+
+        RowData::new(
+            "test_db".to_string(),
+            "test_tb".to_string(),
+            0,
+            RowType::Update,
+            Some(before),
+            Some(after),
+        )
+    }
+
+    #[test]
+    fn check_key_changed_detects_primary_key_change() {
+        let tb_meta = build_tb_meta();
+        let row_data = build_update_row("id");
+
+        assert!(RdbMerger::check_key_changed(&tb_meta, &row_data));
+    }
+
+    #[test]
+    fn check_key_changed_detects_unique_key_change() {
+        let tb_meta = build_tb_meta();
+        let row_data = build_update_row("uk_1");
+
+        assert!(RdbMerger::check_key_changed(&tb_meta, &row_data));
+    }
+
+    #[test]
+    fn check_key_changed_ignores_non_key_change() {
+        let tb_meta = build_tb_meta();
+        let row_data = build_update_row("value");
+
+        assert!(!RdbMerger::check_key_changed(&tb_meta, &row_data));
     }
 }

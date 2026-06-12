@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use anyhow::{bail, Ok};
 use sqlx::{
@@ -7,7 +7,7 @@ use sqlx::{
 };
 
 use crate::{
-    config::config_enums::ConflictPolicyEnum,
+    config::{config_enums::ConflictPolicyEnum, connection_auth_config::ConnectionAuthConfig},
     log_error, log_info,
     meta::ddl_meta::{ddl_data::DdlData, ddl_type::DdlType},
 };
@@ -18,17 +18,20 @@ use super::mysql_meta_fetcher::MysqlMetaFetcher;
 pub struct MysqlDbEngineMetaCenter {
     pub meta_fetcher: MysqlMetaFetcher,
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     pub ddl_conflict_policy: ConflictPolicyEnum,
 }
 
 impl MysqlDbEngineMetaCenter {
     pub async fn new(
         url: String,
+        connection_auth: ConnectionAuthConfig,
         conn_pool: Pool<MySql>,
         ddl_conflict_policy: ConflictPolicyEnum,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             url,
+            connection_auth,
             meta_fetcher: MysqlMetaFetcher::new(conn_pool).await?,
             ddl_conflict_policy,
         })
@@ -53,14 +56,40 @@ impl MysqlDbEngineMetaCenter {
             }
         }
 
+        match &self.connection_auth {
+            ConnectionAuthConfig::Basic { username, password } => {
+                conn_options = conn_options.username(username);
+                if let Some(pwd) = password {
+                    conn_options = conn_options.password(pwd);
+                }
+            }
+            ConnectionAuthConfig::BasicSsl {
+                username, password, ..
+            } => {
+                if let Some(name) = username {
+                    conn_options = conn_options.username(name);
+                }
+                if let Some(pwd) = password {
+                    conn_options = conn_options.password(pwd);
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(ssl) = self.connection_auth.ssl_config() {
+            conn_options = ssl.apply_mysql(conn_options);
+        }
+
         let conn_pool = MySqlPoolOptions::new()
             .max_connections(1)
+            .acquire_timeout(Duration::from_secs(15))
+            .idle_timeout(Some(Duration::from_secs(5 * 60)))
             .connect_with(conn_options)
             .await?;
         let query = sqlx::query(&ddl_data.query);
         if let Err(error) = query.execute(&conn_pool).await {
             if self.ddl_conflict_policy == ConflictPolicyEnum::Ignore {
-                log_error!("failed to sync dll to meta_center: {}", error);
+                log_error!("failed to sync ddl to meta_center: {}", error);
             } else {
                 conn_pool.close().await;
                 bail!(error);

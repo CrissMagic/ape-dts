@@ -4,7 +4,11 @@ use super::{
     message_format::MessageFormat,
     s3_config::S3Config,
 };
-use crate::config::config_enums::SinkType;
+use crate::config::{
+    config_enums::{RdbTransactionIsolation, SinkType},
+    connection_auth_config::ConnectionAuthConfig,
+    limiter_config::RateLimiterConfig,
+};
 
 #[derive(Clone, Debug)]
 pub enum SinkerConfig {
@@ -12,13 +16,18 @@ pub enum SinkerConfig {
 
     Mysql {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         batch_size: usize,
         replace: bool,
         disable_foreign_key_checks: bool,
+        // Specifies the transaction isolation level used for writes. The database default is used if not specified.
+        // If ReadCommitted or ReadUncommitted is set, the target database must have BINLOG_FORMAT set to at least MIXED (ROW is recommended). Otherwise, write operations will fail.
+        transaction_isolation: RdbTransactionIsolation,
     },
 
     Pg {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         batch_size: usize,
         replace: bool,
         disable_foreign_key_checks: bool,
@@ -26,36 +35,20 @@ pub enum SinkerConfig {
 
     Mongo {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         app_name: String,
         batch_size: usize,
-    },
-
-    MysqlCheck {
-        url: String,
-        batch_size: usize,
-        check_log_dir: String,
-    },
-
-    PgCheck {
-        url: String,
-        batch_size: usize,
-        check_log_dir: String,
-    },
-
-    MongoCheck {
-        url: String,
-        app_name: String,
-        batch_size: usize,
-        check_log_dir: String,
     },
 
     MysqlStruct {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         conflict_policy: ConflictPolicyEnum,
     },
 
     PgStruct {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         conflict_policy: ConflictPolicyEnum,
     },
 
@@ -71,6 +64,7 @@ pub enum SinkerConfig {
 
     Redis {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         batch_size: usize,
         method: String,
         is_cluster: bool,
@@ -85,6 +79,7 @@ pub enum SinkerConfig {
 
     StarRocks {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         batch_size: usize,
         stream_load_url: String,
         hard_delete: bool,
@@ -92,17 +87,20 @@ pub enum SinkerConfig {
 
     DorisStruct {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         conflict_policy: ConflictPolicyEnum,
     },
 
     Doris {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         batch_size: usize,
         stream_load_url: String,
     },
 
     StarRocksStruct {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         conflict_policy: ConflictPolicyEnum,
     },
 
@@ -149,11 +147,27 @@ pub enum SinkerConfig {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Hash)]
 pub struct BasicSinkerConfig {
     pub sink_type: SinkType,
     pub db_type: DbType,
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     pub batch_size: usize,
     pub max_connections: u32,
+    pub rate_limiter: RateLimiterConfig,
+}
+
+impl Default for BasicSinkerConfig {
+    fn default() -> Self {
+        Self {
+            sink_type: SinkType::default(),
+            db_type: DbType::default(),
+            url: String::new(),
+            connection_auth: ConnectionAuthConfig::default(),
+            batch_size: 0,
+            max_connections: 10,
+            rate_limiter: RateLimiterConfig::default(),
+        }
+    }
 }

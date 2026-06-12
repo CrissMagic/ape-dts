@@ -1,26 +1,18 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
-
-use ratelimit::Ratelimiter;
+use std::collections::{HashMap, VecDeque};
 
 use super::task_util::TaskUtil;
+use anyhow::anyhow;
 use dt_common::{
-    config::{
-        config_enums::{DbType, ParallelType},
-        sinker_config::SinkerConfig,
-        task_config::TaskConfig,
-    },
+    config::{config_enums::ParallelType, sinker_config::SinkerConfig, task_config::TaskConfig},
     meta::redis::command::key_parser::KeyParser,
-    monitor::monitor::Monitor,
+    monitor::task_monitor_handle::TaskMonitorHandle,
     utils::redis_util::RedisUtil,
 };
 use dt_parallelizer::{
-    base_parallelizer::BaseParallelizer, check_parallelizer::CheckParallelizer,
-    foxlake_parallelizer::FoxlakeParallelizer, merge_parallelizer::MergeParallelizer,
-    mongo_merger::MongoMerger, partition_parallelizer::PartitionParallelizer,
-    rdb_merger::RdbMerger, rdb_partitioner::RdbPartitioner, redis_parallelizer::RedisParallelizer,
+    base_parallelizer::BaseParallelizer, foxlake_parallelizer::FoxlakeParallelizer,
+    merge_parallelizer::MergeParallelizer, mongo_merger::MongoMerger,
+    partition_parallelizer::PartitionParallelizer, rdb_merger::RdbMerger,
+    rdb_partitioner::RdbPartitioner, redis_parallelizer::RedisParallelizer,
     serial_parallelizer::SerialParallelizer, snapshot_parallelizer::SnapshotParallelizer,
     table_parallelizer::TableParallelizer, Merger, Parallelizer,
 };
@@ -30,21 +22,24 @@ pub struct ParallelizerUtil {}
 impl ParallelizerUtil {
     pub async fn create_parallelizer(
         config: &TaskConfig,
-        monitor: Arc<Monitor>,
-        rps_limiter: Option<Ratelimiter>,
+        monitor: TaskMonitorHandle,
     ) -> anyhow::Result<Box<dyn Parallelizer + Send + Sync>> {
-        let parallel_size = config.parallelizer.parallel_size;
-        let parallel_type = &config.parallelizer.parallel_type;
+        let parallel_size = config.parallelizer.parallel_size();
+        let parallel_type = config.parallelizer.parallel_type();
         let base_parallelizer = BaseParallelizer {
             popped_data: VecDeque::new(),
             monitor,
-            rps_limiter,
         };
 
         let parallelizer: Box<dyn Parallelizer + Send + Sync> = match parallel_type {
             ParallelType::Snapshot => Box::new(SnapshotParallelizer {
                 base_parallelizer,
                 parallel_size,
+                chunk_partitioner_rebalance: config
+                    .parallelizer
+                    .chunk_partitioner_rebalance()
+                    .expect("snapshot parallelizer should have rebalance config")
+                    .clone(),
             }),
 
             ParallelType::RdbPartition => {
@@ -57,27 +52,8 @@ impl ParallelizerUtil {
             }
 
             ParallelType::RdbMerge => {
-                let merger = Self::create_rdb_merger(config).await?;
-                let meta_manager = TaskUtil::create_rdb_meta_manager(config).await?;
-                Box::new(MergeParallelizer {
-                    base_parallelizer,
-                    merger,
-                    parallel_size,
-                    sinker_basic_config: config.sinker_basic.clone(),
-                    meta_manager,
-                })
-            }
-
-            ParallelType::RdbCheck => {
-                let merger = match config.sinker_basic.db_type {
-                    DbType::Mongo => Self::create_mongo_merger().await?,
-                    _ => Self::create_rdb_merger(config).await?,
-                };
-                Box::new(CheckParallelizer {
-                    base_parallelizer,
-                    merger,
-                    parallel_size,
-                })
+                Self::create_rdb_merge_parallelizer(config, base_parallelizer, parallel_size)
+                    .await?
             }
 
             ParallelType::Serial => Box::new(SerialParallelizer { base_parallelizer }),
@@ -88,20 +64,17 @@ impl ParallelizerUtil {
             }),
 
             ParallelType::Mongo => {
-                let merger = Box::new(MongoMerger {});
-                Box::new(MergeParallelizer {
-                    base_parallelizer,
-                    merger,
-                    parallel_size,
-                    sinker_basic_config: config.sinker_basic.clone(),
-                    meta_manager: None,
-                })
+                Self::create_mongo_parallelizer(config, base_parallelizer, parallel_size).await?
             }
 
             ParallelType::Redis => {
                 let mut slot_node_map = HashMap::new();
                 if let SinkerConfig::Redis { is_cluster, .. } = config.sinker {
-                    let mut conn = RedisUtil::create_redis_conn(&config.sinker_basic.url).await?;
+                    let mut conn = RedisUtil::create_redis_conn(
+                        &config.sinker_basic.url,
+                        &config.sinker_basic.connection_auth,
+                    )
+                    .await?;
                     if is_cluster {
                         let nodes = RedisUtil::get_cluster_master_nodes(&mut conn)?;
                         slot_node_map = RedisUtil::get_slot_address_map(&nodes);
@@ -120,6 +93,7 @@ impl ParallelizerUtil {
                 let snapshot_parallelizer = SnapshotParallelizer {
                     base_parallelizer,
                     parallel_size,
+                    chunk_partitioner_rebalance: Default::default(),
                 };
                 Box::new(FoxlakeParallelizer {
                     task_config: config.clone(),
@@ -133,19 +107,63 @@ impl ParallelizerUtil {
     async fn create_rdb_merger(
         config: &TaskConfig,
     ) -> anyhow::Result<Box<dyn Merger + Send + Sync>> {
-        let rdb_merger = RdbMerger {
-            rdb_meta_manager: TaskUtil::create_rdb_meta_manager(config).await?.unwrap(),
-        };
+        let rdb_meta_manager = TaskUtil::create_rdb_meta_manager(config)
+            .await?
+            .ok_or_else(|| anyhow!("failed to create RDB meta manager for merger target"))?;
+
+        let rdb_merger = RdbMerger { rdb_meta_manager };
         Ok(Box::new(rdb_merger))
     }
 
-    async fn create_mongo_merger() -> anyhow::Result<Box<dyn Merger + Send + Sync>> {
-        let mongo_merger = MongoMerger {};
-        Ok(Box::new(mongo_merger))
+    async fn create_rdb_partitioner(config: &TaskConfig) -> anyhow::Result<RdbPartitioner> {
+        let meta_manager = TaskUtil::create_rdb_meta_manager(config)
+            .await?
+            .ok_or_else(|| anyhow!("failed to create RDB meta manager for partitioner target"))?;
+        Ok(RdbPartitioner { meta_manager })
     }
 
-    async fn create_rdb_partitioner(config: &TaskConfig) -> anyhow::Result<RdbPartitioner> {
-        let meta_manager = TaskUtil::create_rdb_meta_manager(config).await?.unwrap();
-        Ok(RdbPartitioner { meta_manager })
+    async fn create_rdb_merge_parallelizer(
+        config: &TaskConfig,
+        base_parallelizer: BaseParallelizer,
+        parallel_size: usize,
+    ) -> anyhow::Result<Box<dyn Parallelizer + Send + Sync>> {
+        let merger = Self::create_rdb_merger(config).await?;
+        if config.checker.is_some() {
+            Ok(Box::new(MergeParallelizer::for_check(
+                base_parallelizer,
+                merger,
+                parallel_size,
+                config.sinker_basic.clone(),
+            )))
+        } else {
+            Ok(Box::new(MergeParallelizer::for_rdb_merge(
+                base_parallelizer,
+                merger,
+                parallel_size,
+                config.sinker_basic.clone(),
+                TaskUtil::create_rdb_meta_manager(config).await?,
+            )))
+        }
+    }
+
+    async fn create_mongo_parallelizer(
+        config: &TaskConfig,
+        base_parallelizer: BaseParallelizer,
+        parallel_size: usize,
+    ) -> anyhow::Result<Box<dyn Parallelizer + Send + Sync>> {
+        if config.checker.is_some() {
+            Ok(Box::new(MergeParallelizer::for_check(
+                base_parallelizer,
+                Box::new(MongoMerger {}),
+                parallel_size,
+                config.sinker_basic.clone(),
+            )))
+        } else {
+            Ok(Box::new(MergeParallelizer::for_mongo(
+                base_parallelizer,
+                parallel_size,
+                config.sinker_basic.clone(),
+            )))
+        }
     }
 }

@@ -186,7 +186,7 @@ fn col_values_to_json_value(col_values: &HashMap<String, ColValue>) -> Value {
 
 fn col_value_to_json_value(value: &ColValue) -> Value {
     match value {
-        ColValue::None => Value::Null,
+        ColValue::None | ColValue::UnchangedToast => Value::Null,
         ColValue::Bool(v) => Value::Bool(*v),
         ColValue::Tiny(v) => Value::Number((*v).into()),
         ColValue::UnsignedTiny(v) => Value::Number((*v).into()),

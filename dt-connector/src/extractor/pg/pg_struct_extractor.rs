@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use sqlx::{Pool, Postgres};
 
-use crate::close_conn_pool;
 use crate::{
-    extractor::base_extractor::BaseExtractor, meta_fetcher::pg::pg_struct_fetcher::PgStructFetcher,
+    extractor::base_extractor::{BaseExtractor, ExtractState},
+    meta_fetcher::pg::pg_struct_fetcher::PgStructFetcher,
     Extractor,
 };
 use dt_common::{
@@ -20,6 +20,7 @@ use dt_common::{
 
 pub struct PgStructExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub conn_pool: Pool<Postgres>,
     pub schemas: Vec<String>,
     pub do_global_structs: bool,
@@ -36,23 +37,23 @@ impl Extractor for PgStructExtractor {
             .chunks(self.db_batch_size)
             .map(|chunk| chunk.to_vec())
             .collect();
-        let do_global_structs = schema_chunks.len() - 1;
-        for (flag, schema_chunk) in schema_chunks.into_iter().enumerate() {
+        let last_idx = schema_chunks.len().saturating_sub(1);
+        for (idx, schema_chunk) in schema_chunks.into_iter().enumerate() {
             log_info!(
                 "PgStructExtractor extracts schemas: {}",
                 schema_chunk.join(",")
             );
-            self.extract_internal(
-                schema_chunk.into_iter().collect(),
-                flag == do_global_structs,
-            )
-            .await?;
+            let do_global_struct = idx == last_idx && self.do_global_structs;
+            self.extract_internal(schema_chunk.into_iter().collect(), do_global_struct)
+                .await?;
         }
-        self.base_extractor.wait_task_finish().await
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
-        close_conn_pool!(self)
+        Ok(())
     }
 }
 
@@ -67,6 +68,24 @@ impl PgStructExtractor {
             schemas,
             filter: Some(self.filter.to_owned()),
         };
+
+        // User-Defined Type
+        if do_global_structs && !self.filter.filter_structure(&StructureType::Udt) {
+            let udt_statements = pg_fetcher.get_udt_statements().await?;
+            for statement in udt_statements {
+                self.push_dt_data(StructStatement::PgCreateUdt(statement))
+                    .await?;
+            }
+        }
+
+        // User-Defined Function
+        if do_global_structs && !self.filter.filter_structure(&StructureType::Udf) {
+            let udf_statements = pg_fetcher.get_udf_statements().await?;
+            for statement in udf_statements {
+                self.push_dt_data(StructStatement::PgCreateUdf(statement))
+                    .await?;
+            }
+        }
 
         // schemas
         for schema_statement in pg_fetcher.get_create_schema_statements("").await? {
@@ -97,7 +116,9 @@ impl PgStructExtractor {
             schema: "".to_string(),
             statement,
         };
-        self.base_extractor.push_struct(struct_data).await
+        self.base_extractor
+            .push_struct(&mut self.extract_state, struct_data)
+            .await
     }
 
     pub fn validate_db_batch_size(db_batch_size: usize) -> anyhow::Result<usize> {

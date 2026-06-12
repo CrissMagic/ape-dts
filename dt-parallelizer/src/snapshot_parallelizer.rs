@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dt_common::{
+    config::parallelizer_config::ChunkPartitionerRebalanceConfig,
+    meta::{dt_data::DtItem, dt_queue::DtQueue, row_data::RowData},
+};
+use dt_connector::Sinker;
 
 use super::base_parallelizer::BaseParallelizer;
-use crate::{DataSize, Parallelizer};
-use dt_common::meta::{dt_data::DtItem, dt_queue::DtQueue, row_data::RowData};
-use dt_connector::Sinker;
+use crate::{chunk_partitioner::ChunkPartitioner, DataSize, Parallelizer};
 
 pub struct SnapshotParallelizer {
     pub base_parallelizer: BaseParallelizer,
     pub parallel_size: usize,
+    pub chunk_partitioner_rebalance: ChunkPartitionerRebalanceConfig,
 }
 
 #[async_trait]
@@ -29,10 +33,15 @@ impl Parallelizer for SnapshotParallelizer {
     ) -> anyhow::Result<DataSize> {
         let data_size = DataSize {
             count: data.len() as u64,
-            bytes: data.iter().map(|v| v.data_size as u64).sum(),
+            bytes: data.iter().map(|v| v.get_data_size()).sum(),
         };
 
-        let sub_datas = Self::partition(data, self.parallel_size)?;
+        let effective_parallelism = self.parallel_size.min(sinkers.len());
+        let sub_datas = ChunkPartitioner::partition_dml(
+            data,
+            effective_parallelism,
+            &self.chunk_partitioner_rebalance,
+        )?;
         self.base_parallelizer
             .sink_dml(sub_datas, sinkers, self.parallel_size, true)
             .await?;

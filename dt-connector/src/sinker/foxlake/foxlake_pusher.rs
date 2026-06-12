@@ -3,12 +3,11 @@ use std::{cmp, str::FromStr, sync::Arc};
 use anyhow::{Context, Ok};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Timelike, Utc};
+use opendal::Operator;
 use orc_format::{
     schema::{Field, Schema},
     writer::{data::GenericData, Config, Writer},
 };
-use rusoto_core::ByteStream;
-use rusoto_s3::{PutObjectRequest, S3Client, S3};
 use rust_decimal::Decimal;
 use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
@@ -35,7 +34,6 @@ use dt_common::{
         row_type::RowType,
         time::dt_utc_time::DtNaiveTime,
     },
-    monitor::monitor::Monitor,
     utils::{limit_queue::LimitedQueue, time_util::TimeUtil},
 };
 
@@ -43,14 +41,14 @@ pub struct FoxlakePusher {
     pub url: String,
     pub batch_size: usize,
     pub meta_manager: MysqlMetaManager,
-    pub monitor: Arc<Monitor>,
-    pub s3_client: S3Client,
+    pub base_sinker: BaseSinker,
+    pub s3_client: Operator,
     pub s3_config: S3Config,
     pub extract_type: ExtractType,
     pub batch_memory_bytes: usize,
     pub schema: Option<String>,
     pub tb: Option<String>,
-    pub reverse_router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub orc_sequencer: Arc<Mutex<OrcSequencer>>,
 }
 
@@ -72,13 +70,7 @@ impl Sinker for FoxlakePusher {
         if let Some(schema) = &self.schema {
             if let Some(tb) = &self.tb {
                 let finished_meta = self.get_finished_meta_info(schema, tb);
-                Self::put_to_s3(
-                    &self.s3_client,
-                    &self.s3_config.bucket,
-                    &finished_meta,
-                    Vec::new(),
-                )
-                .await?;
+                Self::put_to_s3(&self.s3_client, &finished_meta, Vec::new()).await?;
             }
         }
 
@@ -96,7 +88,8 @@ impl FoxlakePusher {
         let batch_size = items.len();
         let (_, all_data_size) = self.batch_push(items, false).await?;
 
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, all_data_size as u64)
+        self.base_sinker
+            .update_batch_monitor(batch_size as u64, all_data_size as u64)
             .await
     }
 
@@ -105,7 +98,6 @@ impl FoxlakePusher {
         items: Vec<DtItem>,
         async_push: bool,
     ) -> anyhow::Result<(Vec<S3FileMeta>, usize)> {
-        let bucket = self.s3_config.bucket.clone();
         let mut s3_file_metas = Vec::new();
         let mut futures = Vec::new();
 
@@ -161,9 +153,11 @@ impl FoxlakePusher {
 
             let (orc_data, insert_only) = self.generate_orc_data(batch_data, &tb_meta).await?;
 
-            let (src_schema, src_tb) = self
-                .reverse_router
-                .get_tb_map(&tb_meta.basic.schema, &tb_meta.basic.tb);
+            let (src_schema, src_tb) = if let Some(router) = &self.router {
+                router.reverse_get_tb_map(&tb_meta.basic.schema, &tb_meta.basic.tb)
+            } else {
+                (tb_meta.basic.schema.as_str(), tb_meta.basic.tb.as_str())
+            };
             let (data_file_name, meta_file_name, sequence_info) =
                 self.get_s3_file_info(src_schema, src_tb).await;
 
@@ -184,17 +178,16 @@ impl FoxlakePusher {
             // push to s3
             if async_push {
                 let s3_client = self.s3_client.clone();
-                let bucket = bucket.clone();
                 let s3_file_meta = s3_file_meta.clone();
                 let future = tokio::spawn(async move {
-                    Self::push(&s3_client, &bucket, &s3_file_meta, orc_data)
+                    Self::push(&s3_client, &s3_file_meta, orc_data)
                         .await
                         .unwrap();
                 });
                 futures.push(future);
             } else {
                 let start_time = Instant::now();
-                Self::push(&self.s3_client, &bucket, &s3_file_meta, orc_data).await?;
+                Self::push(&self.s3_client, &s3_file_meta, orc_data).await?;
                 rts.push((start_time.elapsed().as_millis() as u64, 1));
             }
 
@@ -212,21 +205,19 @@ impl FoxlakePusher {
             future.await.unwrap();
             rts.push((start_time.elapsed().as_millis() as u64, 1));
         }
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await?;
+        self.base_sinker.update_monitor_rt(&rts).await?;
 
         Ok((s3_file_metas, all_data_size))
     }
 
     async fn push(
-        s3_client: &S3Client,
-        bucket: &str,
+        s3_client: &Operator,
         s3_file_meta: &S3FileMeta,
         orc_data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        Self::put_to_s3(s3_client, bucket, &s3_file_meta.data_file_name, orc_data).await?;
+        Self::put_to_s3(s3_client, &s3_file_meta.data_file_name, orc_data).await?;
         Self::put_to_s3(
             s3_client,
-            bucket,
             &s3_file_meta.meta_file_name,
             s3_file_meta.to_string().as_bytes().to_vec(),
         )
@@ -237,11 +228,11 @@ impl FoxlakePusher {
 // ORC functions
 impl FoxlakePusher {
     #[inline(always)]
-    fn get_col_value<'a>(row_data: &'a RowData, col: &str) -> Option<&'a ColValue> {
+    fn get_col_value<'a>(row_data: &'a RowData, col: &str) -> anyhow::Result<Option<&'a ColValue>> {
         if row_data.row_type == RowType::Delete {
-            row_data.before.as_ref().unwrap().get(col)
+            Ok(row_data.require_before()?.get(col))
         } else {
-            row_data.after.as_ref().unwrap().get(col)
+            Ok(row_data.require_after()?.get(col))
         }
     }
 
@@ -266,7 +257,7 @@ impl FoxlakePusher {
                 Schema::Long => {
                     let field_data = root.child(i).unwrap_long();
                     for row_data in data.iter() {
-                        match Self::get_col_value(row_data, col) {
+                        match Self::get_col_value(row_data, col)? {
                             Some(ColValue::Tiny(v)) => field_data.write(*v as i64),
                             Some(ColValue::UnsignedTiny(v)) => field_data.write(*v as i64),
                             Some(ColValue::Short(v)) => field_data.write(*v as i64),
@@ -302,7 +293,7 @@ impl FoxlakePusher {
                 Schema::Decimal(..) => {
                     let field_data = root.child(i).unwrap_decimal();
                     for row_data in data.iter() {
-                        match Self::get_col_value(row_data, col) {
+                        match Self::get_col_value(row_data, col)? {
                             Some(ColValue::Decimal(v)) => {
                                 let decimal = Decimal::from_str(v)
                                     .with_context(|| format!("invalid decimal: {}", v))?;
@@ -316,7 +307,7 @@ impl FoxlakePusher {
                 Schema::Float => {
                     let field_data = root.child(i).unwrap_float();
                     for row_data in data.iter() {
-                        match Self::get_col_value(row_data, col) {
+                        match Self::get_col_value(row_data, col)? {
                             Some(ColValue::Float(v)) => field_data.write(*v),
                             _ => field_data.write_null(),
                         };
@@ -326,7 +317,7 @@ impl FoxlakePusher {
                 Schema::Double => {
                     let field_data = root.child(i).unwrap_double();
                     for row_data in data.iter() {
-                        match Self::get_col_value(row_data, col) {
+                        match Self::get_col_value(row_data, col)? {
                             Some(ColValue::Double(v)) => field_data.write(*v),
                             _ => field_data.write_null(),
                         };
@@ -336,7 +327,7 @@ impl FoxlakePusher {
                 Schema::String => {
                     let field_data = root.child(i).unwrap_string();
                     for row_data in data.iter() {
-                        match Self::get_col_value(row_data, col) {
+                        match Self::get_col_value(row_data, col)? {
                             Some(ColValue::String(v))
                             | Some(ColValue::Set2(v))
                             | Some(ColValue::Enum2(v))
@@ -349,7 +340,7 @@ impl FoxlakePusher {
                 Schema::Binary => {
                     let field_data = root.child(i).unwrap_binary();
                     for row_data in data.iter() {
-                        match Self::get_col_value(row_data, col) {
+                        match Self::get_col_value(row_data, col)? {
                             Some(ColValue::Json(v))
                             | Some(ColValue::Blob(v))
                             | Some(ColValue::RawString(v)) => field_data.write(v),
@@ -549,25 +540,12 @@ impl FoxlakePusher {
         dir
     }
 
-    async fn put_to_s3(
-        s3_client: &S3Client,
-        bucket: &str,
-        key: &str,
-        data: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        let byte_stream = ByteStream::from(data);
-        let request = PutObjectRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            body: Some(byte_stream),
-            ..Default::default()
-        };
-
+    async fn put_to_s3(s3_client: &Operator, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
         s3_client
-            .put_object(request)
+            .write(key, data)
             .await
-            .with_context(|| format!("failed to push: {}", key))?;
-        log_info!("pushed: {}", key);
+            .with_context(|| format!("failed to push: {key}"))?;
+        log_info!("pushed: {key}");
         Ok(())
     }
 }

@@ -7,8 +7,8 @@ use futures::executor::block_on;
 use crate::test_runner::rdb_test_runner::DST;
 
 use super::{
-    mongo_check_test_runner::MongoCheckTestRunner, mongo_test_runner::MongoTestRunner,
-    precheck_test_runner::PrecheckTestRunner, rdb_check_test_runner::RdbCheckTestRunner,
+    check_test_runner::CheckTestRunner, mongo_check_test_runner::MongoCheckTestRunner,
+    mongo_test_runner::MongoTestRunner, precheck_test_runner::PrecheckTestRunner,
     rdb_kafka_rdb_test_runner::RdbKafkaRdbTestRunner, rdb_lua_test_runner::RdbLuaTestRunner,
     rdb_redis_test_runner::RdbRedisTestRunner, rdb_sql_test_runner::RdbSqlTestRunner,
     rdb_starrocks_test_runner::RdbStarRocksTestRunner, rdb_struct_test_runner::RdbStructTestRunner,
@@ -37,8 +37,10 @@ impl TestBase {
         let assert_dst_count = |db_tb: &(String, String), count: usize| {
             let dst_data = block_on(runner.fetch_data(db_tb, DST)).unwrap();
             println!(
-                "check dst table {:?} record count, expect: {}",
-                db_tb, count
+                "check dst table {:?} record count, expect: {}, actual: {}",
+                db_tb,
+                count,
+                dst_data.len()
             );
             assert_eq!(dst_data.len(), count);
         };
@@ -116,20 +118,72 @@ impl TestBase {
     }
 
     pub async fn run_check_test(test_dir: &str) {
-        let runner = RdbCheckTestRunner::new(test_dir).await.unwrap();
-        runner.run_check_test().await.unwrap();
-        runner.close().await.unwrap();
+        let runner = CheckTestRunner::new(test_dir)
+            .await
+            .expect("Failed to create CheckTestRunner");
+        runner
+            .run_check_test()
+            .await
+            .expect("Failed to run check test");
+        runner.close().await.expect("Failed to close runner");
+    }
+
+    pub async fn run_cdc_check_test(test_dir: &str, start_millis: u64, parse_millis: u64) {
+        let runner = CheckTestRunner::new(test_dir)
+            .await
+            .expect("Failed to create CheckTestRunner");
+        runner
+            .run_cdc_check_test(start_millis, parse_millis)
+            .await
+            .expect("Failed to run CDC check test");
+        runner.close().await.expect("Failed to close runner");
+    }
+
+    pub async fn run_cdc_position_resume_test(
+        test_dir: &str,
+        start_millis: u64,
+        parse_millis: u64,
+    ) {
+        let runner = CheckTestRunner::new(test_dir)
+            .await
+            .expect("Failed to create CheckTestRunner");
+        runner
+            .run_cdc_position_resume_test(start_millis, parse_millis)
+            .await
+            .expect("Failed to run CDC position resume test");
+        runner.close().await.expect("Failed to close runner");
+    }
+
+    pub async fn run_cdc_checker_state_resume_test(
+        test_dir: &str,
+        start_millis: u64,
+        parse_millis: u64,
+    ) {
+        let runner = CheckTestRunner::new(test_dir)
+            .await
+            .expect("Failed to create CheckTestRunner");
+        runner
+            .run_cdc_checker_state_resume_test(start_millis, parse_millis)
+            .await
+            .expect("Failed to run CDC checker-state resume test");
+        runner.close().await.expect("Failed to close runner");
     }
 
     pub async fn run_review_test(test_dir: &str) {
-        let runner = RdbCheckTestRunner::new(test_dir).await.unwrap();
+        let runner = CheckTestRunner::new(test_dir).await.unwrap();
         runner.run_review_test().await.unwrap();
         runner.close().await.unwrap();
     }
 
     pub async fn run_revise_test(test_dir: &str) {
-        let runner = RdbCheckTestRunner::new(test_dir).await.unwrap();
+        let runner = CheckTestRunner::new(test_dir).await.unwrap();
         runner.run_revise_test().await.unwrap();
+        runner.close().await.unwrap();
+    }
+
+    pub async fn run_recheck_test(test_dir: &str) {
+        let runner = CheckTestRunner::new(test_dir).await.unwrap();
+        runner.run_recheck_test().await.unwrap();
         runner.close().await.unwrap();
     }
 
@@ -145,13 +199,15 @@ impl TestBase {
         let runner = MongoTestRunner::new(test_dir).await.unwrap();
         runner.run_snapshot_test(false).await.unwrap();
 
-        let assert_dst_count = |db: &str, tb: &str, count: usize| {
-            let dst_data = block_on(runner.fetch_data(db, tb, DST));
-            assert_eq!(dst_data.len(), count);
-        };
-
         for ((db, tb), count) in dst_expected_counts.iter() {
-            assert_dst_count(db, tb, *count);
+            let dst_data = runner.fetch_data(db, tb, DST).await;
+            println!(
+                "check dst table {:?} record count, expect: {}, actual: {}",
+                (db, tb),
+                count,
+                dst_data.len()
+            );
+            assert_eq!(dst_data.len(), *count);
         }
     }
 
@@ -182,6 +238,11 @@ impl TestBase {
     pub async fn run_mongo_check_test(test_dir: &str) {
         let runner = MongoCheckTestRunner::new(test_dir).await.unwrap();
         runner.run_check_test().await.unwrap();
+    }
+
+    pub async fn run_mongo_recheck_test(test_dir: &str) {
+        let runner = MongoCheckTestRunner::new(test_dir).await.unwrap();
+        runner.run_recheck_test().await.unwrap();
     }
 
     pub async fn run_mongo_revise_test(test_dir: &str) {

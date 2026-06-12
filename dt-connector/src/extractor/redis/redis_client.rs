@@ -1,20 +1,20 @@
-use anyhow::bail;
-use async_std::io::BufReader;
-use async_std::net::TcpStream;
-use async_std::prelude::*;
-use async_trait::async_trait;
 use futures::executor::block_on;
 use url::Url;
 
-use super::redis_resp_reader::RedisRespReader;
-use super::redis_resp_types::Value;
-use super::StreamReader;
-use dt_common::error::Error;
-use dt_common::meta::redis::command::cmd_encoder::CmdEncoder;
-use dt_common::meta::redis::redis_object::RedisCmd;
+use anyhow::bail;
+use async_std::{io::BufReader, net::TcpStream, prelude::*};
+use async_trait::async_trait;
+
+use super::{redis_resp_reader::RedisRespReader, redis_resp_types::Value, StreamReader};
+use dt_common::{
+    config::connection_auth_config::ConnectionAuthConfig,
+    error::Error,
+    meta::redis::{command::cmd_encoder::CmdEncoder, redis_object::RedisCmd},
+};
 
 pub struct RedisClient {
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     stream: BufReader<TcpStream>,
 }
 
@@ -26,16 +26,18 @@ impl StreamReader for RedisClient {
 }
 
 impl RedisClient {
-    pub async fn new(url: &str) -> anyhow::Result<Self> {
+    pub async fn new(url: &str, connection_auth: &ConnectionAuthConfig) -> anyhow::Result<Self> {
         let url_info = Url::parse(url)?;
         let host = url_info.host_str().unwrap();
         let port = url_info.port().unwrap();
-        let username = url_info.username();
-        let password = url_info.password();
+
+        let username = Self::extract_username(connection_auth, &url_info)?;
+        let password = Self::extract_password(connection_auth, &url_info)?;
 
         let stream = TcpStream::connect(format!("{}:{}", host, port)).await?;
         let mut me = Self {
             url: url.into(),
+            connection_auth: connection_auth.clone(),
             stream: BufReader::new(stream),
         };
 
@@ -43,18 +45,9 @@ impl RedisClient {
             let mut cmd = RedisCmd::new();
             cmd.add_str_arg("AUTH");
             if !username.is_empty() {
-                cmd.add_str_arg(
-                    &percent_encoding::percent_decode_str(username)
-                        .decode_utf8()
-                        .map_err(|e| Error::ConfigError(format!("username parse failed: {}", e)))?,
-                );
+                cmd.add_str_arg(&username);
             }
-
-            cmd.add_str_arg(
-                &percent_encoding::percent_decode_str(pwd)
-                    .decode_utf8()
-                    .map_err(|e| Error::ConfigError(format!("password parse failed: {}", e)))?,
-            );
+            cmd.add_str_arg(&pwd);
 
             me.send(&cmd).await?;
             if let Ok(Value::Okay) = me.read().await {
@@ -104,15 +97,7 @@ impl RedisClient {
 
     pub async fn read_bytes(&mut self, length: usize) -> anyhow::Result<Vec<u8>> {
         let mut buf = vec![0; length];
-        // if length is bigger than buffer size of BufReader, the buf will be filled by 0,
-        // so here we must read from inner TcpStream instead of BufReader
-        // let n = self.stream.read(&mut buf).await.unwrap();
-        let mut read_count = 0;
-        while read_count < length {
-            // use async_std::net::TcpStream instead of tokio::net::TcpStream, tokio TcpStream may stuck
-            // when trying to get big data by multiple read.
-            read_count += self.stream.get_mut().read(&mut buf[read_count..]).await?;
-        }
+        self.stream.read_exact(&mut buf).await?;
         Ok(buf)
     }
 
@@ -141,5 +126,45 @@ impl RedisClient {
             }
         }
         Ok(results)
+    }
+
+    fn decode_url_component(component: &str, field_name: &str) -> anyhow::Result<String> {
+        percent_encoding::percent_decode_str(component)
+            .decode_utf8()
+            .map(|s| s.to_string())
+            .map_err(|e| Error::ConfigError(format!("{} parse failed: {}", field_name, e)).into())
+    }
+
+    fn extract_username<'a>(
+        connection_auth: &'a ConnectionAuthConfig,
+        url_info: &'a Url,
+    ) -> anyhow::Result<String> {
+        match connection_auth {
+            ConnectionAuthConfig::Basic { username, .. } => Ok(username.clone()),
+            _ => {
+                let usr_in_url = url_info.username();
+                if usr_in_url.is_empty() {
+                    Ok(String::new())
+                } else {
+                    Self::decode_url_component(usr_in_url, "username")
+                }
+            }
+        }
+    }
+
+    fn extract_password(
+        connection_auth: &ConnectionAuthConfig,
+        url_info: &Url,
+    ) -> anyhow::Result<Option<String>> {
+        match connection_auth {
+            ConnectionAuthConfig::Basic {
+                password: Some(password),
+                ..
+            } => Ok(Some(password.clone())),
+            _ => url_info
+                .password()
+                .map(|pwd| Self::decode_url_component(pwd, "password"))
+                .transpose(),
+        }
     }
 }

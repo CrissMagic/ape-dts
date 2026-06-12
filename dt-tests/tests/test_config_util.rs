@@ -5,14 +5,15 @@ use std::{
 };
 
 use dt_common::config::{
-    extractor_config::ExtractorConfig, ini_loader::IniLoader, sinker_config::SinkerConfig,
-    task_config::TaskConfig,
+    extractor_config::ExtractorConfig, ini_loader::IniLoader, resumer_config::ResumerConfig,
+    sinker_config::SinkerConfig, task_config::TaskConfig,
 };
 
 pub struct TestConfigUtil {}
 
 const EXTRACTOR: &str = "extractor";
 const SINKER: &str = "sinker";
+const CHECKER: &str = "checker";
 const RUNTIME: &str = "runtime";
 const RESUMER: &str = "resumer";
 const TEST_PROJECT: &str = "dt-tests";
@@ -104,20 +105,21 @@ impl TestConfigUtil {
         update_configs.push((RUNTIME.to_string(), "log_dir".to_string(), log_dir.clone()));
 
         // resumer/resume_log_dir
-        let resume_log_dir = format!("{}/{}", project_root, config.resumer.resume_log_dir);
-        update_configs.push((
-            RESUMER.to_string(),
-            "resume_log_dir".to_string(),
-            resume_log_dir,
-        ));
-
-        // resumer/resume_config_file
-        let resume_config_file = format!("{}/{}", project_root, config.resumer.resume_config_file);
-        update_configs.push((
-            RESUMER.to_string(),
-            "resume_config_file".to_string(),
-            resume_config_file,
-        ));
+        if let ResumerConfig::FromLog {
+            log_dir,
+            config_file,
+        } = config.resumer
+        {
+            let resume_log_dir = format!("{}/{}", project_root, log_dir);
+            update_configs.push((RESUMER.to_string(), "log_dir".to_string(), resume_log_dir));
+            // resumer/resume_config_file
+            let resume_config_file = format!("{}/{}", project_root, config_file);
+            update_configs.push((
+                RESUMER.to_string(),
+                "config_file".to_string(),
+                resume_config_file,
+            ));
+        }
 
         // extractor/check_log_dir
         match config.extractor {
@@ -140,23 +142,20 @@ impl TestConfigUtil {
             _ => {}
         }
 
-        match config.sinker {
-            // sinker/check_log_dir
-            SinkerConfig::MysqlCheck { check_log_dir, .. }
-            | SinkerConfig::PgCheck { check_log_dir, .. }
-            | SinkerConfig::MongoCheck { check_log_dir, .. } => {
-                let sinker_check_log_dir = if !check_log_dir.is_empty() {
-                    format!("{}/{}", project_root, check_log_dir)
-                } else {
-                    format!("{}/check", log_dir)
-                };
-                update_configs.push((
-                    SINKER.to_string(),
-                    "check_log_dir".to_string(),
-                    sinker_check_log_dir,
-                ));
-            }
+        if let Some(checker) = &config.checker {
+            let checker_check_log_dir = if !checker.check_log_dir.is_empty() {
+                format!("{}/{}", project_root, checker.check_log_dir)
+            } else {
+                format!("{}/check", log_dir)
+            };
+            update_configs.push((
+                CHECKER.to_string(),
+                "check_log_dir".to_string(),
+                checker_check_log_dir,
+            ));
+        }
 
+        match config.sinker {
             // sinker/statistic_log_dir
             SinkerConfig::RedisStatistic {
                 statistic_log_dir, ..

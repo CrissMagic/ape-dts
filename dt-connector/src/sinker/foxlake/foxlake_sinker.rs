@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, time::Duration};
 
 use anyhow::Ok;
 use async_trait::async_trait;
@@ -17,16 +17,15 @@ use dt_common::{
         mysql::mysql_meta_manager::MysqlMetaManager,
         position::Position,
     },
-    monitor::monitor::Monitor,
 };
 
 pub struct FoxlakeSinker {
     pub url: String,
     pub batch_size: usize,
     pub meta_manager: MysqlMetaManager,
-    pub monitor: Arc<Monitor>,
+    pub base_sinker: BaseSinker,
     pub conn_pool: Pool<MySql>,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub pusher: FoxlakePusher,
     pub merger: FoxlakeMerger,
     pub engine: String,
@@ -71,6 +70,8 @@ impl Sinker for FoxlakeSinker {
 
             let conn_pool = MySqlPoolOptions::new()
                 .max_connections(1)
+                .acquire_timeout(Duration::from_secs(15))
+                .idle_timeout(Some(Duration::from_secs(5 * 60)))
                 .connect_with(conn_options)
                 .await?;
             query.execute(&conn_pool).await?;
@@ -114,7 +115,8 @@ impl FoxlakeSinker {
         }
         let (all_data_size, all_row_count) = self.merger.batch_merge(dt_items).await?;
 
-        BaseSinker::update_batch_monitor(&self.monitor, all_row_count as u64, all_data_size as u64)
+        self.base_sinker
+            .update_batch_monitor(all_row_count as u64, all_data_size as u64)
             .await
     }
 }

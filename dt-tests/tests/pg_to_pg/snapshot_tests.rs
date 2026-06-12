@@ -14,6 +14,25 @@ mod test {
         TestBase::run_snapshot_test("pg_to_pg/snapshot/basic_test").await;
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_big_packet_test() {
+        TestBase::run_snapshot_test("pg_to_pg/snapshot/big_packet_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[ignore = "requires SSL-enabled PostgreSQL instances and configured ssl_ca_path"]
+    async fn snapshot_ssl_test() {
+        TestBase::run_snapshot_test("pg_to_pg/snapshot/ssl_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_custom_type_test() {
+        TestBase::run_snapshot_test("pg_to_pg/snapshot/custom_type_test").await;
+    }
+
     /// dst table already has records with same primary keys of src table,
     /// src data should be synced to dst table by "ON CONFLICT (pk) DO UPDATE SET"
     #[tokio::test]
@@ -46,7 +65,7 @@ mod test {
         TestBase::run_snapshot_test("pg_to_pg/snapshot/charset_test").await;
     }
 
-    // #[tokio::test]
+    #[tokio::test]
     #[serial]
     async fn snapshot_charset_euc_cn_test() {
         TestBase::run_snapshot_test("pg_to_pg/snapshot/charset_euc_cn_test").await;
@@ -54,12 +73,14 @@ mod test {
 
     #[tokio::test]
     #[serial]
-    async fn snapshot_resume_test() {
+    async fn snapshot_resume_from_log_test() {
         let mut dst_expected_counts = HashMap::new();
         dst_expected_counts.insert("public.resume_table_1", 1);
         dst_expected_counts.insert("public.resume_table_2", 1);
-        dst_expected_counts.insert("public.resume_table_3", 2);
+        dst_expected_counts.insert("public.resume_table_3", 1);
         dst_expected_counts.insert("public.resume_table_*$4", 1);
+        dst_expected_counts.insert("public.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("public.bytea_pk_test", 2);
         dst_expected_counts.insert(r#""test_db_*.*"."resume_table_*$5""#, 1);
         dst_expected_counts.insert(r#""test_db_*.*"."finished_table_*$1""#, 0);
         dst_expected_counts.insert(r#""test_db_*.*"."finished_table_*$2""#, 0);
@@ -68,7 +89,57 @@ mod test {
         dst_expected_counts.insert(r#""test_db_*.*"."in_finished_log_table_*$2""#, 0);
 
         TestBase::run_snapshot_test_and_check_dst_count(
-            "pg_to_pg/snapshot/resume_test",
+            "pg_to_pg/snapshot/resume_log_test",
+            &DbType::Pg,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_resume_from_log_charset_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("public.bytea_pk_test", 2);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "pg_to_pg/snapshot/resume_log_test/resume_charset_test",
+            &DbType::Pg,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_resume_from_db_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("public.resume_table_1", 1);
+        dst_expected_counts.insert("public.resume_table_2", 1);
+        dst_expected_counts.insert("public.resume_table_3", 1);
+        dst_expected_counts.insert("public.resume_table_*$4", 1);
+        dst_expected_counts.insert("public.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("public.bytea_pk_test", 2);
+        dst_expected_counts.insert(r#""test_db_*.*"."resume_table_*$5""#, 1);
+        dst_expected_counts.insert(r#""test_db_*.*"."finished_table_*$1""#, 0);
+        dst_expected_counts.insert(r#""test_db_*.*"."finished_table_*$2""#, 0);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "pg_to_pg/snapshot/resume_db_test",
+            &DbType::Pg,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_resume_from_db_charset_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("public.bytea_pk_test", 2);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "pg_to_pg/snapshot/resume_db_test/resume_charset_test",
             &DbType::Pg,
             dst_expected_counts,
         )
@@ -92,4 +163,74 @@ mod test {
     async fn snapshot_route_test() {
         TestBase::run_snapshot_test("pg_to_pg/snapshot/route_test").await;
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_chunk_parallel_test() {
+        TestBase::run_snapshot_test("pg_to_pg/snapshot/parallel_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_table_parallel_test() {
+        TestBase::run_snapshot_test("pg_to_pg/snapshot/table_parallel_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_parallel_resume_from_log_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("test_db_1.no_pk_one_uk", 4);
+        // resume_filter works
+        dst_expected_counts.insert("test_db_1.no_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.no_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.multi_pk", 4);
+        dst_expected_counts.insert("test_db_1.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("test_db_1.varchar_uk", 6);
+        // with special characters in db && tb && col names
+        dst_expected_counts.insert("test_db_@.resume_table_*$4", 4);
+        dst_expected_counts.insert("test_db_@.finished_table_*$1", 0);
+        dst_expected_counts.insert("test_db_@.in_position_log_table_*$1", 4);
+        dst_expected_counts.insert("test_db_@.in_finished_log_table_*$1", 0);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "pg_to_pg/snapshot/parallel_test/resume_log_test",
+            &DbType::Pg,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_parallel_resume_from_db_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("test_db_1.no_pk_one_uk", 4);
+        // resume_filter works
+        dst_expected_counts.insert("test_db_1.no_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.no_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.multi_pk", 4);
+        dst_expected_counts.insert("test_db_1.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("test_db_1.varchar_uk", 6);
+        // with special characters in db && tb && col names
+        dst_expected_counts.insert("test_db_@.resume_table_*$4", 4);
+        dst_expected_counts.insert("test_db_@.finished_table_*$1", 0);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "pg_to_pg/snapshot/parallel_test/resume_db_test",
+            &DbType::Pg,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    // #[tokio::test]
+    // #[serial]
+    // async fn snapshot_mock_test() {
+    //     TestBase::run_snapshot_test("pg_to_pg/snapshot/mock_test").await;
+    // }
 }

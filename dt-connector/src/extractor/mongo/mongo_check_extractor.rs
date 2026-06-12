@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use anyhow::Context;
 use async_trait::async_trait;
 
 use dt_common::log_info;
@@ -12,18 +13,22 @@ use dt_common::meta::{
 };
 
 use mongodb::{
-    bson::{doc, Document},
+    bson::{doc, oid::ObjectId, Bson, Document},
     Client,
 };
 
 use crate::{
-    check_log::{check_log::CheckLog, log_type::LogType},
-    extractor::{base_check_extractor::BaseCheckExtractor, base_extractor::BaseExtractor},
+    checker::check_log::CheckLog,
+    extractor::{
+        base_check_extractor::BaseCheckExtractor,
+        base_extractor::{BaseExtractor, ExtractState},
+    },
     BatchCheckExtractor, Extractor,
 };
 
 pub struct MongoCheckExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub mongo_client: Client,
     pub check_log_dir: String,
     pub batch_size: usize,
@@ -37,8 +42,10 @@ impl Extractor for MongoCheckExtractor {
             check_log_dir: self.check_log_dir.clone(),
             batch_size: self.batch_size,
         };
-        base_check_extractor.extract(self).await.unwrap();
-        self.base_extractor.wait_task_finish().await
+        base_check_extractor.extract(self).await?;
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
@@ -50,7 +57,7 @@ impl Extractor for MongoCheckExtractor {
 #[async_trait]
 impl BatchCheckExtractor for MongoCheckExtractor {
     async fn batch_extract(&mut self, check_logs: &[CheckLog]) -> anyhow::Result<()> {
-        let log_type = &check_logs[0].log_type;
+        let is_diff = !check_logs[0].diff_col_values.is_empty();
         let schema = &check_logs[0].schema;
         let tb = &check_logs[0].tb;
         let collection = self
@@ -62,8 +69,9 @@ impl BatchCheckExtractor for MongoCheckExtractor {
         for check_log in check_logs.iter() {
             // check log has only one col: _id
             if let Some(Some(col_value)) = check_log.id_col_values.get(MongoConstants::ID) {
-                let key: MongoKey = serde_json::from_str(col_value).unwrap();
-                ids.push(key.to_mongo_id());
+                let key: MongoKey = serde_json::from_str(col_value)
+                    .with_context(|| format!("invalid mongo _id: {}", col_value))?;
+                ids.push(Self::normalize_lookup_id(key));
             }
         }
 
@@ -73,31 +81,49 @@ impl BatchCheckExtractor for MongoCheckExtractor {
             }
         };
 
-        let mut cursor = collection.find(filter, None).await.unwrap();
-        while cursor.advance().await.unwrap() {
-            let doc = cursor.deserialize_current().unwrap();
+        let mut cursor = collection.find(filter, None).await?;
+        while cursor.advance().await? {
+            let doc = cursor.deserialize_current()?;
             let mut after = HashMap::new();
-            let id: String = MongoKey::from_doc(&doc).unwrap().to_string();
+            let id = MongoKey::from_doc(&doc)
+                .with_context(|| {
+                    format!(
+                        "dst doc _id type not supported, schema: {}, tb: {}",
+                        schema, tb
+                    )
+                })?
+                .to_string();
             after.insert(MongoConstants::ID.to_string(), ColValue::String(id));
             after.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
             let mut row_data = RowData::new(
                 schema.clone(),
                 tb.clone(),
+                0,
                 RowType::Insert,
                 None,
                 Some(after),
             );
 
-            if log_type == &LogType::Diff {
+            if is_diff {
                 row_data.row_type = RowType::Update;
                 row_data.before = row_data.after.clone();
             }
 
             self.base_extractor
-                .push_row(row_data, Position::None)
-                .await
-                .unwrap();
+                .push_row(&mut self.extract_state, row_data, Position::None)
+                .await?;
         }
         Ok(())
+    }
+}
+
+impl MongoCheckExtractor {
+    fn normalize_lookup_id(key: MongoKey) -> Bson {
+        match key {
+            MongoKey::String(value) => ObjectId::parse_str(&value)
+                .map(Bson::ObjectId)
+                .unwrap_or_else(|_| Bson::String(value)),
+            other => other.to_mongo_id(),
+        }
     }
 }

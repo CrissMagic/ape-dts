@@ -1,27 +1,29 @@
+use async_trait::async_trait;
+use sqlx::{MySql, Pool};
+
 use crate::{
     close_conn_pool,
     rdb_router::RdbRouter,
-    sinker::base_struct_sinker::{BaseStructSinker, DBConnPool},
+    sinker::{
+        base_sinker::BaseSinker,
+        base_struct_sinker::{BaseStructSinker, DBConnPool},
+    },
     Sinker,
 };
-
 use dt_common::{
     config::config_enums::ConflictPolicyEnum,
     meta::struct_meta::{statement::struct_statement::StructStatement, struct_data::StructData},
     rdb_filter::RdbFilter,
 };
 
-use sqlx::{MySql, Pool};
-
-use async_trait::async_trait;
-
 #[derive(Clone)]
 pub struct FoxlakeStructSinker {
     pub conn_pool: Pool<MySql>,
     pub conflict_policy: ConflictPolicyEnum,
     pub filter: RdbFilter,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub engine: String,
+    pub base_sinker: BaseSinker,
 }
 
 #[async_trait]
@@ -50,6 +52,7 @@ impl Sinker for FoxlakeStructSinker {
             &self.conflict_policy,
             data,
             &self.filter,
+            &self.base_sinker,
         )
         .await
     }

@@ -1,22 +1,26 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use anyhow::bail;
-use ratelimit::Ratelimiter;
 
-use dt_common::meta::dcl_meta::dcl_data::DclData;
-use dt_common::meta::ddl_meta::ddl_data::DdlData;
-use dt_common::meta::{dt_data::DtItem, dt_queue::DtQueue, row_data::RowData};
-use dt_common::monitor::counter::Counter;
-use dt_common::monitor::counter_type::CounterType;
-use dt_common::{error::Error, monitor::monitor::Monitor};
+use dt_common::{
+    error::Error,
+    meta::{
+        dcl_meta::dcl_data::DclData, ddl_meta::ddl_data::DdlData, dt_data::DtItem,
+        dt_queue::DtQueue, row_data::RowData,
+    },
+    monitor::{
+        counter::Counter, counter_type::CounterType, task_monitor_handle::TaskMonitorHandle,
+    },
+};
 use dt_connector::Sinker;
+use tokio::task::JoinSet;
+
+type SharedSinker = Arc<async_mutex::Mutex<Box<dyn Sinker + Send>>>;
 
 #[derive(Default)]
 pub struct BaseParallelizer {
     pub popped_data: VecDeque<DtItem>,
-    pub monitor: Arc<Monitor>,
-    pub rps_limiter: Option<Ratelimiter>,
+    pub monitor: TaskMonitorHandle,
 }
 
 impl BaseParallelizer {
@@ -30,10 +34,10 @@ impl BaseParallelizer {
         // ddls and dmls should be drained separately
         while let Ok(item) = self.pop(buffer, &mut record_size_counter).await {
             if data.is_empty()
-                || (data[0].is_ddl() == item.is_ddl()
+                || (data[0].get_row_sql_type() == item.get_row_sql_type()
                     && data[0].data_origin_node == item.data_origin_node)
-                || data[0].is_dcl() == item.is_dcl()
             {
+                // merge when sql type is the same
                 data.push(item);
             } else {
                 self.popped_data.push_back(item);
@@ -67,20 +71,8 @@ impl BaseParallelizer {
         buffer: &DtQueue,
         record_size_counter: &mut Counter,
     ) -> anyhow::Result<DtItem> {
-        // rps limit
-        if let Some(rps_limiter) = &self.rps_limiter {
-            // refer: https://docs.rs/ratelimit/0.10.0/ratelimit/
-            if let Err(_sleep) = rps_limiter.try_wait() {
-                bail! {Error::PipelineError(format!(
-                    "reach rps limit: {}",
-                    rps_limiter.max_tokens(),
-                ))};
-            }
-        }
-
-        match buffer.pop() {
+        match buffer.pop().await {
             Ok(item) => {
-                // counter
                 record_size_counter.add(
                     item.dt_data.get_data_size(),
                     item.dt_data.get_data_count() as u64,
@@ -93,92 +85,143 @@ impl BaseParallelizer {
 
     pub async fn update_monitor(&self, record_size_counter: &Counter) {
         if record_size_counter.value > 0 {
-            self.monitor.add_batch_counter(
-                CounterType::RecordSize,
-                record_size_counter.value,
-                record_size_counter.count,
-            );
+            self.monitor
+                .add_batch_counter(
+                    self.monitor.default_task_id(),
+                    CounterType::RecordSize,
+                    record_size_counter.value,
+                    record_size_counter.count,
+                )
+                .await;
         }
     }
 
     pub async fn sink_dml(
         &self,
-        mut sub_data_items: Vec<Vec<RowData>>,
-        sinkers: &[Arc<async_mutex::Mutex<Box<dyn Sinker + Send>>>],
+        sub_data_items: Vec<Vec<RowData>>,
+        sinkers: &[SharedSinker],
         parallel_size: usize,
         batch: bool,
     ) -> anyhow::Result<()> {
-        let mut join_set = tokio::task::JoinSet::new();
-        for i in 0..sub_data_items.len() {
-            let data = sub_data_items.remove(0);
-            let sinker = sinkers[i % parallel_size].clone();
-            join_set.spawn(async move { sinker.lock().await.sink_dml(data, batch).await });
-        }
-        while let Some(result) = join_set.join_next().await {
-            result??;
-        }
-        Ok(())
+        self.sink_by_available_sinker(
+            sub_data_items,
+            sinkers,
+            parallel_size,
+            move |sinker, data| async move { sinker.lock().await.sink_dml(data, batch).await },
+        )
+        .await
     }
 
     pub async fn sink_ddl(
         &self,
-        mut sub_data_items: Vec<Vec<DdlData>>,
-        sinkers: &[Arc<async_mutex::Mutex<Box<dyn Sinker + Send>>>],
+        sub_data_items: Vec<Vec<DdlData>>,
+        sinkers: &[SharedSinker],
         parallel_size: usize,
         batch: bool,
     ) -> anyhow::Result<()> {
-        let mut join_set = tokio::task::JoinSet::new();
-        for i in 0..sub_data_items.len() {
-            let data = sub_data_items.remove(0);
-            let sinker = sinkers[i % parallel_size].clone();
-            join_set.spawn(async move { sinker.lock().await.sink_ddl(data, batch).await });
-        }
-        while let Some(result) = join_set.join_next().await {
-            result??;
-        }
-        Ok(())
+        self.sink_by_available_sinker(
+            sub_data_items,
+            sinkers,
+            parallel_size,
+            move |sinker, data| async move { sinker.lock().await.sink_ddl(data, batch).await },
+        )
+        .await
     }
 
     pub async fn sink_dcl(
         &self,
-        mut sub_data_items: Vec<Vec<DclData>>,
-        sinkers: &[Arc<async_mutex::Mutex<Box<dyn Sinker + Send>>>],
+        sub_data_items: Vec<Vec<DclData>>,
+        sinkers: &[SharedSinker],
         parallel_size: usize,
         batch: bool,
     ) -> anyhow::Result<()> {
-        let mut futures = Vec::new();
-        for i in 0..sub_data_items.len() {
-            let data = sub_data_items.remove(0);
-            let sinker = sinkers[i % parallel_size].clone();
-            let future =
-                tokio::spawn(
-                    async move { sinker.lock().await.sink_dcl(data, batch).await.unwrap() },
-                );
-            futures.push(future);
-        }
-
-        for future in futures {
-            future.await.unwrap();
-        }
-        Ok(())
+        self.sink_by_available_sinker(
+            sub_data_items,
+            sinkers,
+            parallel_size,
+            move |sinker, data| async move { sinker.lock().await.sink_dcl(data, batch).await },
+        )
+        .await
     }
 
     pub async fn sink_raw(
         &self,
-        mut sub_data_items: Vec<Vec<DtItem>>,
-        sinkers: &[Arc<async_mutex::Mutex<Box<dyn Sinker + Send>>>],
+        sub_data_items: Vec<Vec<DtItem>>,
+        sinkers: &[SharedSinker],
         parallel_size: usize,
         batch: bool,
     ) -> anyhow::Result<()> {
-        let mut join_set = tokio::task::JoinSet::new();
-        for i in 0..sub_data_items.len() {
-            let data = sub_data_items.remove(0);
-            let sinker = sinkers[i % parallel_size].clone();
-            join_set.spawn(async move { sinker.lock().await.sink_raw(data, batch).await });
+        self.sink_by_available_sinker(
+            sub_data_items,
+            sinkers,
+            parallel_size,
+            move |sinker, data| async move { sinker.lock().await.sink_raw(data, batch).await },
+        )
+        .await
+    }
+
+    async fn sink_by_available_sinker<T, Run, Fut>(
+        &self,
+        sub_data_items: Vec<Vec<T>>,
+        sinkers: &[SharedSinker],
+        parallel_size: usize,
+        run: Run,
+    ) -> anyhow::Result<()>
+    where
+        T: Send + 'static,
+        Run: Fn(SharedSinker, Vec<T>) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        if sub_data_items.is_empty() {
+            return Ok(());
         }
+        if parallel_size < 1 {
+            bail!("parallel_size must be greater than 0");
+        }
+        if sinkers.is_empty() {
+            bail!("sinkers must not be empty");
+        }
+
+        let mut pending = sub_data_items.into_iter();
+        let active_sinkers = parallel_size.min(sinkers.len());
+        let mut join_set = JoinSet::new();
+        let spawn_sink_task = |join_set: &mut JoinSet<anyhow::Result<usize>>,
+                               sinker_index: usize,
+                               sinker: SharedSinker,
+                               data: Vec<T>,
+                               run: Run| {
+            join_set.spawn(async move {
+                run(sinker, data).await?;
+                Ok(sinker_index)
+            });
+        };
+
+        for (sinker_index, sinker) in sinkers.iter().enumerate().take(active_sinkers) {
+            let Some(data) = pending.next() else {
+                break;
+            };
+            spawn_sink_task(
+                &mut join_set,
+                sinker_index,
+                sinker.clone(),
+                data,
+                run.clone(),
+            );
+        }
+
         while let Some(result) = join_set.join_next().await {
-            result??;
+            let sinker_index = result??;
+            if let Some(data) = pending.next() {
+                spawn_sink_task(
+                    &mut join_set,
+                    sinker_index,
+                    sinkers[sinker_index].clone(),
+                    data,
+                    run.clone(),
+                );
+            }
         }
+
         Ok(())
     }
 }

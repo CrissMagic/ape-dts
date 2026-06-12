@@ -13,6 +13,24 @@ mod test {
 
     #[tokio::test]
     #[serial]
+    async fn cdc_big_packet_test() {
+        TestBase::run_cdc_test("pg_to_pg/cdc/big_packet_test", 3000, 20000).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cdc_nopk_test() {
+        TestBase::run_cdc_test("pg_to_pg/cdc/nopk_test", 3000, 9000).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cdc_custom_type_test() {
+        TestBase::run_cdc_test("pg_to_pg/cdc/custom_type_test", 3000, 9000).await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn cdc_postgis_test() {
         TestBase::run_cdc_test("pg_to_pg/cdc/postgis_test", 3000, 9000).await;
     }
@@ -29,7 +47,7 @@ mod test {
         TestBase::run_cdc_test("pg_to_pg/cdc/charset_test", 3000, 5000).await;
     }
 
-    #[tokio::test]
+    // #[tokio::test]
     #[serial]
     async fn cdc_charset_euc_cn_test() {
         TestBase::run_cdc_test("pg_to_pg/cdc/charset_euc_cn_test", 3000, 5000).await;

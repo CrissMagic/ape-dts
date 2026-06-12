@@ -1,15 +1,22 @@
 use std::io::Cursor;
 
-use crate::{config::config_enums::DbType, error::Error, meta::time::dt_utc_time::DtNaiveTime};
 use anyhow::bail;
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
+use sqlx::{mysql::MySqlRow, types::BigDecimal, Row};
+
 use mysql_binlog_connector_rust::column::{
     column_value::ColumnValue, json::json_binary::JsonBinary,
 };
-use sqlx::{mysql::MySqlRow, types::BigDecimal, Row};
 
-use crate::meta::{col_value::ColValue, mysql::mysql_col_type::MysqlColType};
+use crate::{
+    config::config_enums::DbType,
+    error::Error,
+    meta::{
+        col_value::ColValue, mysql::mysql_col_type::MysqlColType, time::dt_utc_time::DtNaiveTime,
+    },
+    utils::sql_util::SqlUtil,
+};
 
 pub struct MysqlColValueConvertor {}
 
@@ -324,8 +331,8 @@ impl MysqlColValueConvertor {
                 | MysqlColType::TinyBlob
                 | MysqlColType::MediumBlob
                 | MysqlColType::Blob
-                | MysqlColType::LongBlob
-                | MysqlColType::Unknown => {
+                | MysqlColType::LongBlob => ColValue::Blob(hex::decode(value_str)?),
+                MysqlColType::Unknown => {
                     bail! {Error::Unexpected(format!(
                         "unsupported column type: {:?}",
                         col_type
@@ -352,7 +359,7 @@ impl MysqlColValueConvertor {
     ) -> anyhow::Result<ColValue> {
         let value: Option<Vec<u8>> = row.get_unchecked(col);
         if value.is_none() {
-            return Self::from_query_none_value(col_type);
+            return Self::from_query_none_value(row, col, col_type);
         }
 
         match col_type {
@@ -461,7 +468,7 @@ impl MysqlColValueConvertor {
             | MysqlColType::MediumText { .. }
             | MysqlColType::Text { .. }
             | MysqlColType::LongText { .. } => {
-                let value: String = row.try_get(col)?;
+                let value = SqlUtil::try_get_mysql_string(row, col)?;
                 Ok(ColValue::String(value))
             }
 
@@ -480,11 +487,11 @@ impl MysqlColValueConvertor {
                 Ok(ColValue::Bit(value))
             }
             MysqlColType::Set { .. } => {
-                let value: String = row.try_get(col)?;
+                let value: String = SqlUtil::try_get_mysql_string(row, col)?;
                 Ok(ColValue::Set2(value))
             }
             MysqlColType::Enum { .. } => {
-                let value: String = row.try_get(col)?;
+                let value: String = SqlUtil::try_get_mysql_string(row, col)?;
                 Ok(ColValue::Enum2(value))
             }
             MysqlColType::Json => {
@@ -500,23 +507,38 @@ impl MysqlColValueConvertor {
         }
     }
 
-    fn from_query_none_value(col_type: &MysqlColType) -> anyhow::Result<ColValue> {
+    fn from_query_none_value(
+        row: &MySqlRow,
+        col: &str,
+        col_type: &MysqlColType,
+    ) -> anyhow::Result<ColValue> {
         // fix: https://github.com/apecloud/ape-dts/issues/328
         // table: CREATE TABLE `a` (`id` int, `value` timestamp NOT NULL DEFAULT '0000-00-00 00:00:00');
         // source value: insert into a values(1, '0000-00-00 00:00:00')
-        // ape-dts extractor get: (1, None)
+        // ape-dts extractor get: (1, None) when using Option to get value.
         // ape-dts sinker: insert into `a` values(1, NULL, NULL, NULL) which will fail
-        match col_type {
-            MysqlColType::Timestamp {
-                is_nullable: false, ..
-            } => Ok(ColValue::Timestamp("0000-00-00 00:00:00".to_string())),
-            MysqlColType::DateTime {
-                is_nullable: false, ..
-            } => Ok(ColValue::DateTime("0000-00-00 00:00:00".to_string())),
-            MysqlColType::Date { is_nullable: false } => {
-                Ok(ColValue::DateTime("0000-00-00".to_string()))
+        if matches!(
+            col_type,
+            MysqlColType::Date { .. }
+                | MysqlColType::Timestamp { .. }
+                | MysqlColType::DateTime { .. }
+        ) && row.try_get_unchecked::<Vec<u8>, _>(col).is_ok()
+        // Determine if it is NULL by checking the unchecked bytes.
+        {
+            match col_type {
+                MysqlColType::Timestamp {
+                    is_nullable: false, ..
+                } => Ok(ColValue::Timestamp("0000-00-00 00:00:00".to_string())),
+                MysqlColType::DateTime {
+                    is_nullable: false, ..
+                } => Ok(ColValue::DateTime("0000-00-00 00:00:00".to_string())),
+                MysqlColType::Date { is_nullable: false } => {
+                    Ok(ColValue::DateTime("0000-00-00".to_string()))
+                }
+                _ => Ok(ColValue::None),
             }
-            _ => Ok(ColValue::None),
+        } else {
+            Ok(ColValue::None)
         }
     }
 }

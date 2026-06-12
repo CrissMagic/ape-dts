@@ -10,8 +10,9 @@ on:
       targets:
         description: 'JSON array of target platforms to build [{"os": "ubuntu-latest", "target": "x86_64-unknown-linux-gnu"}, ...]'
         required: true
-        default: '[{"os": "ubuntu-latest", "target": "x86_64-unknown-linux-gnu"}, {"os": "ubuntu-latest", "target": "aarch64-unknown-linux-gnu"}, {"os": "macos-latest", "target": "x86_64-apple-darwin"}]'
-
+        default: '[{"os": "ubuntu-latest", "target": "x86_64-unknown-linux-gnu"}, {"os": "ubuntu-latest", "target": "aarch64-unknown-linux-gnu"}, {"os": "macos-latest", "target": "x86_64-apple-darwin"}, {"os": "macos-latest", "target": "aarch64-apple-darwin"}]'
+env:
+  GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -29,7 +30,7 @@ jobs:
       - name: Get Release Upload URL
         id: get_upload_url
         run: |
-          tag_info=$(curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          tag_info=$(curl -H "Authorization: token ${{ env.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.tag_name }}")
           echo "tag_info: ${tag_info}"
           upload_url=$(echo $tag_info | jq -r '.upload_url')
@@ -41,7 +42,13 @@ jobs:
           echo "UPLOAD_URL=${upload_url}" >> $GITHUB_ENV
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@1.85.0
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-pc-windows-gnu'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       # Build linux targets by cross, otherwise there may be runtime errors when running on other linux versions:
       # ./ape-dts: /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.38' not found (required by ./ape-dts)
@@ -49,29 +56,73 @@ jobs:
       - name: Cross build
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'x86_64-pc-windows-gnu'
         run: |
-          cargo install cross --version 0.2.5
-          cross build --release --target=${{ matrix.target }}
+          cross build --release --target=${{ matrix.target }} --features metrics
 
       - name: Local build
-        if: matrix.target == 'x86_64-apple-darwin'
+        if: matrix.target == 'x86_64-apple-darwin' || matrix.target == 'aarch64-apple-darwin'
         run: |
           rustup target add ${{ matrix.target }}
-          cargo build --release --features metrics --target=${{ matrix.target }}
+          cargo build --release --target=${{ matrix.target }} --features metrics
 
       - name: Create release artifact
         run: |
           mkdir -p artifacts
-          cp target/${{ matrix.target }}/release/dt-main artifacts/ape-dts
+          cp target/${{ matrix.target }}/release/dt-main artifacts/dt-main
+          cp target/${{ matrix.target }}/release/dtscli artifacts/dtscli
           cp log4rs.yaml artifacts/log4rs.yaml
           tar -czvf ape-dts-${{ github.run_id }}-${{ matrix.target }}.tar.gz -C artifacts .
+          cp target/${{ matrix.target }}/release/dtscli dtscli-${{ matrix.target }}
 
       - name: Upload Release Asset
         id: upload_release_asset
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ env.UPLOAD_URL }}
-          asset_path: ape-dts-${{ github.run_id }}-${{ matrix.target }}.tar.gz
-          asset_name: ape-dts-${{ github.run_id }}-${{ matrix.target }}.tar.gz
+          asset_path: ape-dts-${{ inputs.tag_name }}-${{ matrix.target }}.tar.gz
+          asset_name: ape-dts-${{ inputs.tag_name }}-${{ matrix.target }}.tar.gz
           asset_content_type: application/gzip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload dtscli Asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: dtscli-${{ matrix.target }}
+          asset_name: dtscli-${{ matrix.target }}
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload install_cli.sh
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: dt-cli/scripts/install.sh
+          asset_name: install_cli.sh
+          asset_content_type: text/x-shellscript
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload install_cli.sh
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: dt-cli/scripts/uninstall.sh
+          asset_name: uninstall_cli.sh
+          asset_content_type: text/x-shellscript
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload CHANGELOG
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: CHANGELOG.md
+          asset_name: CHANGELOG.md
+          asset_content_type: text/markdown
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

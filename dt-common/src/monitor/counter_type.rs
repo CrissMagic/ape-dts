@@ -2,33 +2,32 @@ use strum::{Display, EnumString, IntoStaticStr};
 
 #[derive(EnumString, IntoStaticStr, Display, PartialEq, Eq, Hash, Clone)]
 pub enum CounterType {
-    // time window counter, aggregate by: sum by window
+    // time window counter, aggregate by: sum, avg/max/min by second
     #[strum(serialize = "batch_write_failures")]
     BatchWriteFailures,
     #[strum(serialize = "serial_writes")]
     SerialWrites,
-
-    // time window counter, aggregate by: avg by window
     #[strum(serialize = "record_count")]
     RecordCount,
-
-    // time window counter, aggregate by: avg by count
+    #[strum(serialize = "data_bytes")]
+    DataBytes,
+    #[strum(serialize = "extracted_records")]
+    ExtractedRecords,
+    #[strum(serialize = "extracted_bytes")]
+    ExtractedBytes,
     #[strum(serialize = "records_per_query")]
     RecordsPerQuery,
     #[strum(serialize = "rt_per_query")]
     RtPerQuery,
     #[strum(serialize = "buffer_size")]
     BufferSize,
-    #[strum(serialize = "data_bytes")]
-    DataBytes,
+    #[strum(serialize = "checker_miss_count")]
+    CheckerMissCount,
+    #[strum(serialize = "checker_diff_count")]
+    CheckerDiffCount,
+    // time window counter, aggregate by: avg by count
     #[strum(serialize = "record_size")]
     RecordSize,
-
-    // TODO:
-    #[strum(serialize = "extracted_records")]
-    ExtractedRecords,
-    #[strum(serialize = "extracted_bytes")]
-    ExtractedBytes,
 
     // no window counter
     #[strum(serialize = "plan_records")]
@@ -37,7 +36,8 @@ pub enum CounterType {
     QueuedRecordCurrent,
     #[strum(serialize = "queued_bytes")]
     QueuedByteCurrent,
-
+    #[strum(serialize = "checker_pending")]
+    CheckerPending,
     #[strum(serialize = "sinked_records")]
     SinkedRecordTotal,
     #[strum(serialize = "sinked_bytes")]
@@ -81,6 +81,8 @@ impl CounterType {
             Self::BatchWriteFailures
             | Self::SerialWrites
             | Self::RecordCount
+            | Self::CheckerMissCount
+            | Self::CheckerDiffCount
             | Self::RecordsPerQuery
             | Self::RtPerQuery
             | Self::BufferSize
@@ -94,6 +96,7 @@ impl CounterType {
             | Self::SinkedByteTotal
             | Self::QueuedRecordCurrent
             | Self::QueuedByteCurrent
+            | Self::CheckerPending
             | Self::DDLRecordTotal
             | Self::Timestamp => WindowType::NoWindow,
         }
@@ -120,6 +123,8 @@ impl CounterType {
                 Self::BatchWriteFailures
                 | Self::SerialWrites
                 | Self::RecordCount
+                | Self::CheckerMissCount
+                | Self::CheckerDiffCount
                 | Self::DataBytes
                 | Self::ExtractedRecords
                 | Self::ExtractedBytes => {

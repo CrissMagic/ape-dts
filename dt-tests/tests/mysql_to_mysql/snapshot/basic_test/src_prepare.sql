@@ -16,9 +16,12 @@ CREATE TABLE test_db_1.one_pk_multi_uk ( f_0 tinyint, f_1 smallint, f_2 mediumin
 
 CREATE TABLE test_db_1.col_has_special_character_table (`p:k` tinyint, `col"1` text, `col,2` text, `col\3` text, PRIMARY KEY(`p:k`));
 
+CREATE TABLE test_db_1.longtext_bin_collation_table (pk int, content longtext CHARACTER SET utf8 COLLATE utf8_bin NOT NULL, PRIMARY KEY(pk)) ENGINE=InnoDB;
+
+CREATE TABLE test_db_1.enum_set_bin_collation_table (pk int, enum_col enum('small','medium','large') CHARACTER SET utf8 COLLATE utf8_bin NOT NULL, set_col set('a','b','c') CHARACTER SET utf8 COLLATE utf8_bin NOT NULL, PRIMARY KEY(pk)) ENGINE=InnoDB;
+
 CREATE TABLE test_db_1.numeric_table ( f_0 tinyint, f_1 tinyint unsigned, f_2 smallint, f_3 smallint unsigned, f_4 mediumint, f_5 mediumint unsigned, f_6 int, f_7 int unsigned, f_8 bigint, f_9 bigint unsigned, PRIMARY KEY(f_0));
 
-```sql
 CREATE TABLE test_db_1.date_time_table( f_0 tinyint, 
     f_1 datetime DEFAULT NULL, 
     f_2 datetime(6) DEFAULT NULL, 
@@ -29,18 +32,14 @@ CREATE TABLE test_db_1.date_time_table( f_0 tinyint,
     f_7 date DEFAULT NULL, 
     f_8 year DEFAULT NULL,
     PRIMARY KEY(f_0));
-```
 
-```
 CREATE TABLE test_db_1.set_table( f_0 tinyint,
     f_1 SET('a','b','c','d','e'),
     PRIMARY KEY(f_0));
-```
 
 CREATE TABLE test_db_1.ignore_cols_1 ( f_0 tinyint, f_1 smallint DEFAULT NULL, f_2 smallint DEFAULT NULL, f_3 smallint DEFAULT NULL, PRIMARY KEY (f_0) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; 
 CREATE TABLE test_db_1.ignore_cols_2 ( f_0 tinyint, f_1 smallint DEFAULT NULL, f_2 smallint DEFAULT NULL, f_3 smallint DEFAULT NULL, PRIMARY KEY (f_0) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; 
 
-```
 CREATE TABLE Upper_Case_DB.Upper_Case_TB (
     Id INT, 
     FIELD_1 INT,
@@ -50,7 +49,6 @@ CREATE TABLE Upper_Case_DB.Upper_Case_TB (
     PRIMARY KEY(Id),
     UNIQUE KEY(FIELD_1, field_2, Field_3)
 );
-```
 
 CREATE TABLE test_db_1.where_condition_1 ( f_0 int, f_1 int ); 
 CREATE TABLE test_db_1.where_condition_2 ( f_0 int, f_1 int, PRIMARY KEY (f_0) ); 
@@ -75,3 +73,15 @@ ALTER TABLE test_db_1.fk_tb_1 ADD CONSTRAINT fk_tb_1_2 FOREIGN KEY (f_2) REFEREN
 
 -- test view filtered
 CREATE OR REPLACE VIEW test_db_1.one_pk_no_uk_view AS SELECT * FROM test_db_1.one_pk_no_uk;
+
+-- test composite primary key
+CREATE TABLE test_db_1.composite_pk_table (pk1 int, pk2 varchar(10), val int, PRIMARY KEY(pk1, pk2));
+
+-- test non-nullable composite unique key
+CREATE TABLE test_db_1.composite_unique_key_table (uk1 int not null, uk2 varchar(10) not null, val int, UNIQUE(uk1, uk2));
+
+--test nullable composite unique key
+CREATE TABLE test_db_1.composite_unique_key_table_2 (val int, uk2 varchar(10), uk1 int, UNIQUE(uk1, uk2));
+
+--test multi primary and single unique key
+CREATE TABLE test_db_1.multi_primary_and_single_unique_table (pk1 int, pk2 varchar(10), uk1 int not null, uk2 varchar(10), val int, PRIMARY KEY(pk1, pk2), UNIQUE(uk1), UNIQUE(uk2));

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    mem::size_of_val,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -8,7 +9,6 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use anyhow::bail;
 use async_trait::async_trait;
 use futures::StreamExt;
 use postgres_protocol::message::backend::{
@@ -26,36 +26,42 @@ use tokio::{sync::Mutex, time::Duration, time::Instant};
 use tokio_postgres::replication::LogicalReplicationStream;
 
 use crate::{
-    close_conn_pool,
     extractor::{
-        base_extractor::BaseExtractor, pg::pg_cdc_client::PgCdcClient,
-        resumer::cdc_resumer::CdcResumer,
+        base_extractor::{BaseExtractor, ExtractState},
+        pg::pg_cdc_client::PgCdcClient,
+        resumer::recovery::Recovery,
     },
     Extractor,
 };
 use dt_common::{
-    config::{config_enums::DbType, config_token_parser::ConfigTokenParser},
-    error::Error,
-    log_error, log_info,
-    meta::adaptor::pg_col_value_convertor::PgColValueConvertor,
-    meta::col_value::ColValue,
-    meta::dt_data::DtData,
-    meta::pg::{pg_meta_manager::PgMetaManager, pg_tb_meta::PgTbMeta},
-    meta::position::Position,
-    meta::rdb_tb_meta::RdbTbMeta,
-    meta::row_data::RowData,
-    meta::row_type::RowType,
-    meta::syncer::Syncer,
+    config::{
+        config_enums::DbType, config_token_parser::ConfigTokenParser,
+        connection_auth_config::ConnectionAuthConfig,
+    },
+    log_error, log_info, log_warn,
+    meta::{
+        adaptor::pg_col_value_convertor::PgColValueConvertor,
+        col_value::ColValue,
+        dt_data::DtData,
+        pg::{pg_meta_manager::PgMetaManager, pg_tb_meta::PgTbMeta},
+        position::Position,
+        rdb_tb_meta::RdbTbMeta,
+        row_data::RowData,
+        row_type::RowType,
+        syncer::Syncer,
+    },
     rdb_filter::RdbFilter,
     utils::time_util::TimeUtil,
 };
 
 pub struct PgCdcExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub meta_manager: PgMetaManager,
     pub conn_pool: Pool<Postgres>,
     pub filter: RdbFilter,
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     pub slot_name: String,
     pub pub_name: String,
     pub start_lsn: String,
@@ -65,7 +71,7 @@ pub struct PgCdcExtractor {
     pub heartbeat_tb: String,
     pub ddl_meta_tb: String,
     pub syncer: Arc<Mutex<Syncer>>,
-    pub resumer: CdcResumer,
+    pub recovery: Option<Arc<dyn Recovery + Send + Sync>>,
 }
 
 const SECS_FROM_1970_TO_2000: i64 = 946_684_800;
@@ -73,16 +79,22 @@ const SECS_FROM_1970_TO_2000: i64 = 946_684_800;
 #[async_trait]
 impl Extractor for PgCdcExtractor {
     async fn extract(&mut self) -> anyhow::Result<()> {
-        if let Position::PgCdc { lsn, .. } = &self.resumer.checkpoint_position {
-            self.start_lsn = lsn.to_owned();
-            log_info!("resume from: {}", self.resumer.checkpoint_position);
-            self.base_extractor
-                .push_dt_data(
-                    DtData::Heartbeat {},
-                    self.resumer.checkpoint_position.clone(),
-                )
-                .await?;
-        };
+        if let Some(recovery) = &self.recovery {
+            if let Some(position) = recovery.get_cdc_resume_position().await {
+                match &position {
+                    Position::PgCdc { lsn, .. } => {
+                        self.start_lsn = lsn.to_owned();
+                        log_info!("cdc recovery from lsn:[{}]", lsn);
+                        self.base_extractor
+                            .push_dt_data(&mut self.extract_state, DtData::Heartbeat {}, position)
+                            .await?;
+                    }
+                    _ => {
+                        log_warn!("position:{} is not a valid pg cdc position", position);
+                    }
+                }
+            }
+        }
 
         log_info!(
             "PgCdcExtractor starts, slot_name: {}, start_lsn: {}, keepalive_interval_secs: {}, heartbeat_interval_secs: {}, heartbeat_tb: {}, ddl_meta_tb: {}",
@@ -94,12 +106,13 @@ impl Extractor for PgCdcExtractor {
             self.ddl_meta_tb,
         );
         self.extract_internal().await?;
-        self.base_extractor.wait_task_finish().await
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
-        self.meta_manager.close().await?;
-        close_conn_pool!(self)
+        self.meta_manager.close().await
     }
 }
 
@@ -107,6 +120,7 @@ impl PgCdcExtractor {
     async fn extract_internal(&mut self) -> anyhow::Result<()> {
         let mut cdc_client = PgCdcClient {
             url: self.url.clone(),
+            connection_auth: self.connection_auth.clone(),
             pub_name: self.pub_name.clone(),
             slot_name: self.slot_name.clone(),
             start_lsn: self.start_lsn.clone(),
@@ -141,7 +155,7 @@ impl PgCdcExtractor {
 
         // refer: https://www.postgresql.org/docs/10/protocol-replication.html to get WAL data details
         loop {
-            if self.base_extractor.time_filter.ended {
+            if self.extract_state.time_filter.ended {
                 // cdc stream will be dropped automatically if postgres receives no keepalive ack
                 return Ok(());
             }
@@ -166,7 +180,7 @@ impl PgCdcExtractor {
 
                             let timestamp = begin.timestamp() / 1_000_000 + SECS_FROM_1970_TO_2000;
                             BaseExtractor::update_time_filter(
-                                &mut self.base_extractor.time_filter,
+                                &mut self.extract_state.time_filter,
                                 timestamp as u32,
                                 &position,
                             );
@@ -177,7 +191,7 @@ impl PgCdcExtractor {
                             position = get_position(&last_tx_end_lsn, commit.timestamp());
                             let commit = DtData::Commit { xid: xid.clone() };
                             self.base_extractor
-                                .push_dt_data(commit, position.clone())
+                                .push_dt_data(&mut self.extract_state, commit, position.clone())
                                 .await?;
                         }
 
@@ -188,19 +202,19 @@ impl PgCdcExtractor {
                         Type(_typee) => {}
 
                         Insert(insert) => {
-                            if self.base_extractor.time_filter.started {
+                            if self.extract_state.time_filter.started {
                                 self.decode_insert(&insert, &position, &ddl_meta).await?;
                             }
                         }
 
                         Update(update) => {
-                            if self.base_extractor.time_filter.started {
+                            if self.extract_state.time_filter.started {
                                 self.decode_update(&update, &position).await?;
                             }
                         }
 
                         Delete(delete) => {
-                            if self.base_extractor.time_filter.started {
+                            if self.extract_state.time_filter.started {
                                 self.decode_delete(&delete, &position).await?;
                             }
                         }
@@ -268,7 +282,7 @@ impl PgCdcExtractor {
         // if the tb is filtered, we won't try to get the tb_meta since we may get privilege errors,
         // but we need to keep the oid —— tb_meta map which may be used for decoding events,
         // the built-in object used by datamarker, although it is not in filter config, still needs to get tb_meta.
-        if self.filter.filter_tb(schema, tb) && !self.base_extractor.is_data_marker_info(schema, tb)
+        if self.filter.filter_tb(schema, tb) && !self.extract_state.is_data_marker_info(schema, tb)
         {
             let tb_meta = Self::mock_pg_tb_meta(schema, tb, event.rel_id() as i32);
             self.meta_manager
@@ -313,6 +327,8 @@ impl PgCdcExtractor {
             .meta_manager
             .get_tb_meta_by_oid(event.rel_id() as i32)?;
         if self.filter_event(&tb_meta, RowType::Insert) {
+            self.extract_state
+                .record_extracted_metrics(1, size_of_val(event) as u64);
             return Ok(());
         }
 
@@ -320,12 +336,15 @@ impl PgCdcExtractor {
         let row_data = RowData::new(
             tb_meta.basic.schema,
             tb_meta.basic.tb,
+            0,
             RowType::Insert,
             None,
             Some(col_values),
         );
 
         if ddl_meta.len() == 2 && row_data.schema == ddl_meta[0] && row_data.tb == ddl_meta[1] {
+            self.extract_state
+                .record_extracted_metrics(1, size_of_val(event) as u64);
             return self.decode_ddl(&row_data, position).await;
         }
 
@@ -341,6 +360,8 @@ impl PgCdcExtractor {
             .meta_manager
             .get_tb_meta_by_oid(event.rel_id() as i32)?;
         if self.filter_event(&tb_meta, RowType::Update) {
+            self.extract_state
+                .record_extracted_metrics(1, size_of_val(event) as u64);
             return Ok(());
         }
 
@@ -363,6 +384,7 @@ impl PgCdcExtractor {
         let row_data = RowData::new(
             basic.schema.clone(),
             basic.tb.clone(),
+            0,
             RowType::Update,
             Some(col_values_before),
             Some(col_values_after),
@@ -379,6 +401,8 @@ impl PgCdcExtractor {
             .meta_manager
             .get_tb_meta_by_oid(event.rel_id() as i32)?;
         if self.filter_event(&tb_meta, RowType::Delete) {
+            self.extract_state
+                .record_extracted_metrics(1, size_of_val(event) as u64);
             return Ok(());
         }
 
@@ -393,6 +417,7 @@ impl PgCdcExtractor {
         let row_data = RowData::new(
             tb_meta.basic.schema,
             tb_meta.basic.tb,
+            0,
             RowType::Delete,
             Some(col_values),
             None,
@@ -406,8 +431,8 @@ impl PgCdcExtractor {
         }
 
         let get_string = |row_data: &RowData, col: &str| -> String {
-            if let Some(col_value) = row_data.after.as_ref().unwrap().get(col) {
-                if let Some(str) = col_value.to_option_string() {
+            if let Ok(after) = row_data.require_after() {
+                if let Some(str) = after.get(col).and_then(|v| v.to_option_string()) {
                     return str;
                 }
             }
@@ -447,7 +472,7 @@ impl PgCdcExtractor {
 
                 if !self.filter.filter_ddl(&schema, &tb, &ddl_data.ddl_type) {
                     self.base_extractor
-                        .push_ddl(ddl_data, position.clone())
+                        .push_ddl(&mut self.extract_state, ddl_data, position.clone())
                         .await?;
                 }
             }
@@ -484,9 +509,13 @@ impl PgCdcExtractor {
                 }
 
                 TupleData::UnchangedToast => {
-                    bail! {Error::ExtractorError(
-                        "unexpected UnchangedToast value received".into(),
-                    )}
+                    log_warn!(
+                        "schema: {}, tb: {}, col: {}, UnchangedToast value received",
+                        tb_meta.basic.schema,
+                        tb_meta.basic.tb,
+                        col
+                    );
+                    col_values.insert(col.to_string(), ColValue::UnchangedToast);
                 }
             }
         }
@@ -498,7 +527,9 @@ impl PgCdcExtractor {
         row_data: RowData,
         position: Position,
     ) -> anyhow::Result<()> {
-        self.base_extractor.push_row(row_data, position).await
+        self.base_extractor
+            .push_row(&mut self.extract_state, row_data, position)
+            .await
     }
 
     fn filter_event(&mut self, tb_meta: &PgTbMeta, row_type: RowType) -> bool {
@@ -506,7 +537,7 @@ impl PgCdcExtractor {
         let tb = &tb_meta.basic.tb;
         let filtered = self.filter.filter_event(schema, tb, &row_type);
         if filtered {
-            return !self.base_extractor.is_data_marker_info(schema, tb);
+            return !self.extract_state.is_data_marker_info(schema, tb);
         }
         filtered
     }

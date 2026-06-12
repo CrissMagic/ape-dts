@@ -8,30 +8,34 @@ use sqlx::{
 };
 use tokio::{sync::RwLock, time::Instant};
 
+use crate::sinker::checkable_sinker::CheckableSink;
 use crate::{
     call_batch_fn, data_marker::DataMarker, rdb_query_builder::RdbQueryBuilder,
     rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker,
 };
 use dt_common::{
+    config::connection_auth_config::ConnectionAuthConfig,
     log_error, log_info,
     meta::{
         ddl_meta::{ddl_data::DdlData, ddl_type::DdlType},
+        dt_data::{DtData, DtItem},
         pg::pg_meta_manager::PgMetaManager,
+        position::Position,
         row_data::RowData,
         row_type::RowType,
     },
-    monitor::monitor::Monitor,
     utils::limit_queue::LimitedQueue,
 };
 
 #[derive(Clone)]
 pub struct PgSinker {
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     pub conn_pool: Pool<Postgres>,
     pub meta_manager: PgMetaManager,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
     pub batch_size: usize,
-    pub monitor: Arc<Monitor>,
+    pub base_sinker: BaseSinker,
     pub data_marker: Option<Arc<RwLock<DataMarker>>>,
     pub replace: bool,
 }
@@ -60,14 +64,31 @@ impl Sinker for PgSinker {
     }
 
     async fn sink_ddl(&mut self, data: Vec<DdlData>, _batch: bool) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
         let mut rts = LimitedQueue::new(cmp::min(100, data.len()));
+        let monitor_interval = self.base_sinker.monitor_interval_secs();
         let mut data_size = 0;
+        let mut data_len = 0;
+        let mut last_monitor_time = Instant::now();
 
         for ddl_data in data.iter() {
             let (schema, _tb) = ddl_data.get_schema_tb();
             data_size += ddl_data.get_data_size();
-            let conn_options = PgConnectOptions::from_str(&self.url)?;
+            data_len += 1;
+
+            let final_url = ConnectionAuthConfig::merge_url_with_auth(
+                self.url.as_str(),
+                &self.connection_auth,
+            )?;
+            let mut conn_options = PgConnectOptions::from_str(final_url.as_str())?;
             let mut pool_options = PgPoolOptions::new().max_connections(1);
+            if let Some(ssl) = self.connection_auth.ssl_config() {
+                conn_options = ssl.apply_pg(conn_options);
+            }
+
             let sql = format!("SET search_path = '{}';", schema);
 
             if !schema.is_empty() {
@@ -88,18 +109,34 @@ impl Sinker for PgSinker {
             let sql = ddl_data.to_sql();
             log_info!("sink ddl, schema: {}, sql: {}", schema, sql);
 
+            let start_time = Instant::now();
+
             let conn_pool = pool_options.connect_with(conn_options).await?;
             let query = sqlx::query(&sql);
-
-            let start_time = Instant::now();
             query.execute(&conn_pool).await?;
-            rts.push((start_time.elapsed().as_millis() as u64, 1));
 
+            rts.push((start_time.elapsed().as_millis() as u64, 1));
             conn_pool.close().await;
+
+            if last_monitor_time.elapsed().as_secs() >= monitor_interval {
+                self.base_sinker
+                    .update_serial_monitor(data_len as u64, data_size)
+                    .await?;
+                self.base_sinker.update_monitor_rt(&rts).await?;
+                rts.clear();
+                data_size = 0;
+                data_len = 0;
+                last_monitor_time = Instant::now();
+            }
         }
 
-        BaseSinker::update_serial_monitor(&self.monitor, data.len() as u64, data_size).await?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await
+        if data_len > 0 || data_size > 0 {
+            self.base_sinker
+                .update_serial_monitor(data_len as u64, data_size)
+                .await?;
+            self.base_sinker.update_monitor_rt(&rts).await?;
+        }
+        Ok(())
     }
 
     async fn refresh_meta(&mut self, data: Vec<DdlData>) -> anyhow::Result<()> {
@@ -109,44 +146,112 @@ impl Sinker for PgSinker {
         Ok(())
     }
 
+    async fn handle_control_item(&mut self, item: &DtItem) -> anyhow::Result<()> {
+        if let (DtData::Commit { .. }, Position::RdbSnapshotFinished { schema, tb, .. }) =
+            (&item.dt_data, &item.position)
+        {
+            // Snapshot finished positions keep source table names, so route them before
+            // invalidating target-side metadata cache.
+            let (routed_schema, routed_tb) = if let Some(router) = &self.router {
+                router.get_tb_map(schema, tb)
+            } else {
+                (schema.as_str(), tb.as_str())
+            };
+            self.meta_manager
+                .invalidate_cache_for_table(routed_schema, routed_tb);
+        }
+        Ok(())
+    }
+
     async fn close(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckableSink for PgSinker {
+    async fn sink_dml_borrowed(&mut self, data: &mut [RowData], batch: bool) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        if !batch {
+            self.serial_sink(data).await?;
+        } else {
+            match data[0].row_type {
+                RowType::Insert => {
+                    call_batch_fn!(self, data, Self::batch_insert);
+                }
+                RowType::Delete => {
+                    call_batch_fn!(self, data, Self::batch_delete);
+                }
+                _ => self.serial_sink(data).await?,
+            }
+        }
         Ok(())
     }
 }
 
 impl PgSinker {
     async fn serial_sink(&mut self, data: &[RowData]) -> anyhow::Result<()> {
+        let task_id = self.base_sinker.source_task_id_for_rows(data, &self.router);
+        self.base_sinker.ensure_monitor_for(&task_id);
+        let monitor_interval = self.base_sinker.monitor_interval_secs();
         let mut data_size = 0;
+        let mut data_len = 0;
+        let mut last_monitor_time = Instant::now();
 
         let mut tx = self.conn_pool.begin().await?;
         if let Some(sql) = self.get_data_marker_sql().await {
             sqlx::query(&sql)
-                .execute(&mut tx)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| format!("failed to execute data marker sql: [{}]", sql))?;
         }
         let mut rts = LimitedQueue::new(cmp::min(100, data.len()));
         for row_data in data.iter() {
-            data_size += row_data.data_size;
+            data_size += row_data.get_data_size() as usize;
+            data_len += 1;
 
             let tb_meta = self.meta_manager.get_tb_meta_by_row_data(row_data).await?;
             let query_builder = RdbQueryBuilder::new_for_pg(tb_meta, None);
 
             let query_info = query_builder.get_query_info(row_data, self.replace)?;
-            let query = query_builder.create_pg_query(&query_info);
+            let query = query_builder.create_pg_query(&query_info)?;
 
             let start_time = Instant::now();
-            query
-                .execute(&mut tx)
-                .await
-                .with_context(|| format!("serial sink failed, row_data: [{}]", row_data))?;
+            query.execute(&mut *tx).await.with_context(|| {
+                format!(
+                    "serial sink failed, sql: [{}], row_data: [{}]",
+                    query_info.sql, row_data
+                )
+            })?;
+
             rts.push((start_time.elapsed().as_millis() as u64, 1));
+            if last_monitor_time.elapsed().as_secs() >= monitor_interval {
+                self.base_sinker
+                    .update_serial_monitor_for(&task_id, data_len as u64, data_size as u64)
+                    .await?;
+                self.base_sinker
+                    .update_monitor_rt_for(&task_id, &rts)
+                    .await?;
+                rts.clear();
+                data_size = 0;
+                data_len = 0;
+                last_monitor_time = Instant::now();
+            }
         }
         tx.commit().await?;
 
-        BaseSinker::update_serial_monitor(&self.monitor, data.len() as u64, data_size as u64)
-            .await?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await
+        if data_len > 0 || data_size > 0 {
+            self.base_sinker
+                .update_serial_monitor_for(&task_id, data_len as u64, data_size as u64)
+                .await?;
+            self.base_sinker
+                .update_monitor_rt_for(&task_id, &rts)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn batch_delete(
@@ -155,28 +260,33 @@ impl PgSinker {
         start_index: usize,
         batch_size: usize,
     ) -> anyhow::Result<()> {
+        let task_id = self
+            .base_sinker
+            .source_task_id_for_rows(&data[start_index..start_index + batch_size], &self.router);
+        self.base_sinker.ensure_monitor_for(&task_id);
         let tb_meta = self.meta_manager.get_tb_meta_by_row_data(&data[0]).await?;
         let query_builder = RdbQueryBuilder::new_for_pg(tb_meta, None);
 
         let (query_info, data_size) =
             query_builder.get_batch_delete_query(data, start_index, batch_size)?;
-        let query = query_builder.create_pg_query(&query_info);
+        let query = query_builder.create_pg_query(&query_info)?;
 
         let start_time = Instant::now();
         let mut rts = LimitedQueue::new(1);
         if let Some(sql) = self.get_data_marker_sql().await {
             let mut tx = self.conn_pool.begin().await?;
-            sqlx::query(&sql).execute(&mut tx).await?;
-            query.execute(&mut tx).await?;
+            sqlx::query(&sql).execute(&mut *tx).await?;
+            query.execute(&mut *tx).await?;
             tx.commit().await?;
         } else {
             query.execute(&self.conn_pool).await?;
         }
         rts.push((start_time.elapsed().as_millis() as u64, 1));
 
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, data_size as u64)
+        self.base_sinker
+            .update_batch_monitor_for(&task_id, batch_size as u64, data_size as u64)
             .await?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await
+        self.base_sinker.update_monitor_rt_for(&task_id, &rts).await
     }
 
     async fn batch_insert(
@@ -185,6 +295,10 @@ impl PgSinker {
         start_index: usize,
         batch_size: usize,
     ) -> anyhow::Result<()> {
+        let task_id = self
+            .base_sinker
+            .source_task_id_for_rows(&data[start_index..start_index + batch_size], &self.router);
+        self.base_sinker.ensure_monitor_for(&task_id);
         let tb_meta = self
             .meta_manager
             .get_tb_meta_by_row_data(&data[0])
@@ -194,14 +308,14 @@ impl PgSinker {
 
         let (query_info, data_size) =
             query_builder.get_batch_insert_query(data, start_index, batch_size, self.replace)?;
-        let query = query_builder.create_pg_query(&query_info);
+        let query = query_builder.create_pg_query(&query_info)?;
 
         let start_time = Instant::now();
         let mut rts = LimitedQueue::new(1);
         let exec_error = if let Some(sql) = self.get_data_marker_sql().await {
             let mut tx = self.conn_pool.begin().await?;
-            sqlx::query(&sql).execute(&mut tx).await?;
-            query.execute(&mut tx).await?;
+            sqlx::query(&sql).execute(&mut *tx).await?;
+            query.execute(&mut *tx).await?;
             tx.commit().await
         } else {
             match query.execute(&self.conn_pool).await {
@@ -223,9 +337,10 @@ impl PgSinker {
             rts.push((start_time.elapsed().as_millis() as u64, 1));
         }
 
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, data_size as u64)
+        self.base_sinker
+            .update_batch_monitor_for(&task_id, batch_size as u64, data_size as u64)
             .await?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await
+        self.base_sinker.update_monitor_rt_for(&task_id, &rts).await
     }
 
     async fn get_data_marker_sql(&self) -> Option<String> {

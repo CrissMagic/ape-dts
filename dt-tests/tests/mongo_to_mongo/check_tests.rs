@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod test {
+
     use serial_test::serial;
 
     use crate::test_runner::test_base::TestBase;
@@ -12,7 +13,43 @@ mod test {
 
     #[tokio::test]
     #[serial]
+    async fn snapshot_inline_basic_test() {
+        TestBase::run_mongo_check_test("mongo_to_mongo/check/snapshot_inline_basic_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn check_route_test() {
         TestBase::run_mongo_check_test("mongo_to_mongo/check/route_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn check_sample_test() {
+        TestBase::run_mongo_check_test("mongo_to_mongo/check/sample_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn check_output_full_row_test() {
+        TestBase::run_mongo_check_test("mongo_to_mongo/check/output_full_row_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn check_output_revise_sql_test() {
+        TestBase::run_mongo_check_test("mongo_to_mongo/check/output_revise_sql_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn check_recheck_test() {
+        TestBase::run_mongo_check_test("mongo_to_mongo/check/recheck_basic").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn check_recheck_recover_test() {
+        TestBase::run_mongo_recheck_test("mongo_to_mongo/check/recheck_recover").await;
     }
 }

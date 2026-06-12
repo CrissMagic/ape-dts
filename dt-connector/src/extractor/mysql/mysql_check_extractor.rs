@@ -14,20 +14,24 @@ use sqlx::{MySql, Pool};
 use std::collections::HashMap;
 
 use crate::{
-    check_log::{check_log::CheckLog, log_type::LogType},
-    close_conn_pool,
-    extractor::{base_check_extractor::BaseCheckExtractor, base_extractor::BaseExtractor},
+    checker::check_log::CheckLog,
+    extractor::{
+        base_check_extractor::BaseCheckExtractor,
+        base_extractor::{BaseExtractor, ExtractState},
+    },
     rdb_query_builder::RdbQueryBuilder,
     BatchCheckExtractor, Extractor,
 };
 
 pub struct MysqlCheckExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub conn_pool: Pool<MySql>,
     pub meta_manager: MysqlMetaManager,
     pub filter: RdbFilter,
     pub check_log_dir: String,
     pub batch_size: usize,
+    pub replay_diff_as_update: bool,
 }
 
 #[async_trait]
@@ -39,11 +43,13 @@ impl Extractor for MysqlCheckExtractor {
             batch_size: self.batch_size,
         };
         base_check_extractor.extract(self).await?;
-        self.base_extractor.wait_task_finish().await
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
-        close_conn_pool!(self)
+        Ok(())
     }
 }
 
@@ -52,34 +58,31 @@ impl BatchCheckExtractor for MysqlCheckExtractor {
     async fn batch_extract(&mut self, check_logs: &[CheckLog]) -> anyhow::Result<()> {
         let db = &check_logs[0].schema;
         let tb = &check_logs[0].tb;
-        let log_type = &check_logs[0].log_type;
+        let is_diff = !check_logs[0].diff_col_values.is_empty();
         let tb_meta = self.meta_manager.get_tb_meta(db, tb).await?;
         let check_row_data_items = Self::build_check_row_data_items(check_logs, tb_meta)?;
 
         let ignore_cols = self.filter.get_ignore_cols(db, tb);
         let query_builder = RdbQueryBuilder::new_for_mysql(tb_meta, ignore_cols);
+        let batch_refs: Vec<&RowData> = check_row_data_items.iter().collect();
         let query_info = if check_logs.len() == 1 {
             query_builder.get_select_query(&check_row_data_items[0])?
         } else {
-            query_builder.get_batch_select_query(
-                &check_row_data_items,
-                0,
-                check_row_data_items.len(),
-            )?
+            query_builder.get_batch_select_query(&batch_refs, 0, batch_refs.len())?
         };
-        let query = query_builder.create_mysql_query(&query_info);
+        let query = query_builder.create_mysql_query(&query_info)?;
 
         let mut rows = query.fetch(&self.conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
-            let mut row_data = RowData::from_mysql_row(&row, tb_meta, &ignore_cols);
+        while let Some(row) = rows.try_next().await? {
+            let mut row_data = RowData::from_mysql_row(&row, tb_meta, &ignore_cols, None);
 
-            if log_type == &LogType::Diff {
+            if is_diff && self.replay_diff_as_update {
                 row_data.row_type = RowType::Update;
                 row_data.before = row_data.after.clone();
             }
 
             self.base_extractor
-                .push_row(row_data, Position::None)
+                .push_row(&mut self.extract_state, row_data, Position::None)
                 .await?;
         }
         Ok(())
@@ -96,14 +99,12 @@ impl MysqlCheckExtractor {
             let mut after = HashMap::new();
             for (col, value) in check_log.id_col_values.iter() {
                 let col_type = tb_meta.get_col_type(col)?;
-                let col_value = if let Some(str) = value {
-                    MysqlColValueConvertor::from_str(col_type, str)?
-                } else {
-                    ColValue::None
-                };
+                let col_value = value.as_deref().map_or(Ok(ColValue::None), |v| {
+                    MysqlColValueConvertor::from_str(col_type, v)
+                })?;
                 after.insert(col.to_string(), col_value);
             }
-            let check_row_data = RowData::build_insert_row_data(after, &tb_meta.basic);
+            let check_row_data = RowData::build_insert_row_data(after, &tb_meta.basic, None);
             result.push(check_row_data);
         }
         Ok(result)

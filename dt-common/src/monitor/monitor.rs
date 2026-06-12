@@ -1,5 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::sync::Arc;
 
 use super::counter::Counter;
 use super::counter_type::{CounterType, WindowType};
@@ -9,15 +12,15 @@ use crate::log_monitor;
 use crate::monitor::counter_type::AggregateType;
 use crate::utils::limit_queue::LimitedQueue;
 
-#[derive(Clone, Default)]
 pub struct Monitor {
     pub name: String,
     pub description: String,
     pub no_window_counters: DashMap<CounterType, Counter>,
-    pub time_window_counters: DashMap<CounterType, TimeWindowCounter>,
+    pub time_window_counters: DashMap<CounterType, Arc<TimeWindowCounter>>,
     pub time_window_secs: u64,
     pub max_sub_count: u64,
     pub count_window: u64,
+    tombstone: AtomicBool,
 }
 
 #[async_trait]
@@ -43,56 +46,123 @@ impl Monitor {
             time_window_secs,
             max_sub_count,
             count_window,
+            tombstone: AtomicBool::new(false),
         }
+    }
+
+    pub fn clear_tombstone(&self) {
+        self.tombstone.store(false, Ordering::Release);
+    }
+
+    pub fn mark_tombstone(&self) {
+        self.tombstone.store(true, Ordering::Release);
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self.tombstone.load(Ordering::Acquire)
+    }
+
+    pub async fn has_live_time_window_data(&self) -> bool {
+        self.has_live_time_window_data_in(self.time_window_secs)
+            .await
+    }
+
+    pub async fn has_live_time_window_data_in(&self, time_window_secs: u64) -> bool {
+        let counter_types: Vec<CounterType> = self
+            .time_window_counters
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for counter_type in counter_types {
+            let counter = self
+                .time_window_counters
+                .get(&counter_type)
+                .map(|r| r.value().clone());
+            if let Some(counter) = counter {
+                if counter.has_live_data_in_window(time_window_secs).await {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub async fn is_tombstone_and_expired(&self) -> bool {
+        if !self.is_tombstone() {
+            return false;
+        }
+
+        !self.has_live_time_window_data().await
     }
 
     pub async fn flush(&self) {
-        for mut entry_mut in self.time_window_counters.iter_mut() {
-            let (counter_type, counter) = entry_mut.pair_mut();
-            let statistics = counter.statistics();
-            let mut log = format!("{} | {} | {}", self.name, self.description, counter_type);
-            for aggregate_type in counter_type.get_aggregate_types() {
-                let aggregate_value = match aggregate_type {
-                    AggregateType::AvgByCount => statistics.avg_by_count,
-                    AggregateType::AvgBySec => statistics.avg_by_sec,
-                    AggregateType::Sum => statistics.sum,
-                    AggregateType::MaxBySec => statistics.max_by_sec,
-                    AggregateType::MaxByCount => statistics.max,
-                    AggregateType::Count => statistics.count,
-                    _ => continue,
-                };
-                log = format!("{} | {}={}", log, aggregate_type, aggregate_value);
+        let window_counter_types = self
+            .time_window_counters
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for counter_type in window_counter_types {
+            let counter = self
+                .time_window_counters
+                .get(&counter_type)
+                .map(|r| r.value().clone());
+            if let Some(counter) = counter {
+                let statistics = counter.statistics().await;
+                let mut log = format!("{} | {} | {}", self.name, self.description, counter_type);
+                for aggregate_type in counter_type.get_aggregate_types() {
+                    let aggregate_value = match aggregate_type {
+                        AggregateType::AvgByCount => statistics.avg_by_count,
+                        AggregateType::AvgBySec => statistics.avg_by_sec,
+                        AggregateType::Sum => statistics.sum,
+                        AggregateType::MaxBySec => statistics.max_by_sec,
+                        AggregateType::MaxByCount => statistics.max,
+                        AggregateType::Count => statistics.count,
+                        _ => continue,
+                    };
+                    log = format!("{} | {}={}", log, aggregate_type, aggregate_value);
+                }
+                log_monitor!("{}", log);
             }
-            log_monitor!("{}", log);
         }
 
-        for entry in self.no_window_counters.iter() {
-            let (counter_type, counter) = entry.pair();
-            let mut log = format!("{} | {} | {}", self.name, self.description, counter_type);
-            for aggregate_type in counter_type.get_aggregate_types() {
-                let aggregate_value = match aggregate_type {
-                    AggregateType::Latest => counter.value,
-                    AggregateType::AvgByCount => counter.avg_by_count(),
-                    _ => continue,
-                };
-                log = format!("{} | {}={}", log, aggregate_type, aggregate_value);
+        let no_window_counter_types = self
+            .no_window_counters
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for counter_type in no_window_counter_types {
+            if let Some(counter) = self.no_window_counters.get(&counter_type) {
+                let mut log = format!("{} | {} | {}", self.name, self.description, counter_type);
+                for aggregate_type in counter_type.get_aggregate_types() {
+                    let aggregate_value = match aggregate_type {
+                        AggregateType::Latest => counter.value,
+                        AggregateType::AvgByCount => counter.avg_by_count(),
+                        _ => continue,
+                    };
+                    log = format!("{} | {}={}", log, aggregate_type, aggregate_value);
+                }
+                log_monitor!("{}", log);
             }
-            log_monitor!("{}", log);
         }
     }
 
-    pub fn add_batch_counter(&self, counter_type: CounterType, value: u64, count: u64) -> &Self {
+    pub(crate) async fn add_batch_counter(
+        &self,
+        counter_type: CounterType,
+        value: u64,
+        count: u64,
+    ) -> &Self {
         if count == 0 {
             return self;
         }
-        self.add_counter_internal(counter_type, value, count)
+        self.add_counter_internal(counter_type, value, count).await
     }
 
-    pub fn add_counter(&self, counter_type: CounterType, value: u64) -> &Self {
-        self.add_counter_internal(counter_type, value, 1)
+    pub(crate) async fn add_counter(&self, counter_type: CounterType, value: u64) -> &Self {
+        self.add_counter_internal(counter_type, value, 1).await
     }
 
-    pub fn set_counter(&self, counter_type: CounterType, value: u64) -> &Self {
+    pub(crate) fn set_counter(&self, counter_type: CounterType, value: u64) -> &Self {
         if let WindowType::NoWindow = counter_type.get_window_type() {
             self.no_window_counters
                 .entry(counter_type)
@@ -102,15 +172,20 @@ impl Monitor {
         self
     }
 
-    pub fn add_multi_counter(
+    pub(crate) async fn add_multi_counter(
         &self,
         counter_type: CounterType,
         entry: &LimitedQueue<(u64, u64)>,
     ) -> &Self {
-        self.add_muilti_counter_internal(counter_type, entry)
+        self.add_muilti_counter_internal(counter_type, entry).await
     }
 
-    fn add_counter_internal(&self, counter_type: CounterType, value: u64, count: u64) -> &Self {
+    async fn add_counter_internal(
+        &self,
+        counter_type: CounterType,
+        value: u64,
+        count: u64,
+    ) -> &Self {
         match counter_type.get_window_type() {
             WindowType::NoWindow => {
                 self.no_window_counters
@@ -120,18 +195,23 @@ impl Monitor {
             }
 
             WindowType::TimeWindow => {
-                self.time_window_counters
+                let counter = self
+                    .time_window_counters
                     .entry(counter_type)
                     .or_insert_with(|| {
-                        TimeWindowCounter::new(self.time_window_secs, self.max_sub_count)
+                        Arc::new(TimeWindowCounter::new(
+                            self.time_window_secs,
+                            self.max_sub_count,
+                        ))
                     })
-                    .add(value, count);
+                    .clone();
+                counter.add(value, count).await;
             }
         }
         self
     }
 
-    fn add_muilti_counter_internal(
+    async fn add_muilti_counter_internal(
         &self,
         counter_type: CounterType,
         entry: &LimitedQueue<(u64, u64)>,
@@ -145,12 +225,17 @@ impl Monitor {
             }
 
             WindowType::TimeWindow => {
-                self.time_window_counters
+                let counter = self
+                    .time_window_counters
                     .entry(counter_type)
                     .or_insert_with(|| {
-                        TimeWindowCounter::new(self.time_window_secs, self.max_sub_count)
+                        Arc::new(TimeWindowCounter::new(
+                            self.time_window_secs,
+                            self.max_sub_count,
+                        ))
                     })
-                    .adds(entry);
+                    .clone();
+                counter.adds(entry).await;
             }
         }
         self

@@ -17,14 +17,27 @@ use strum::{Display, EnumString, IntoStaticStr};
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TaskMetricsType {
-    // TODO:
+    // TODO
     Delay,
     Timestamp,
     Progress,
     TotalProgressCount,
     FinishedProgressCount,
+    CheckerMissCount,
+    CheckerDiffCount,
+    CheckerPending,
+    CheckerRpsMax,
+    CheckerRpsMin,
+    CheckerRpsAvg,
+    CheckerMissRpsMax,
+    CheckerMissRpsMin,
+    CheckerMissRpsAvg,
+    CheckerDiffRpsMax,
+    CheckerDiffRpsMin,
+    CheckerDiffRpsAvg,
 
-    // TODO: These metrics describe the records and bytes pulled by extractor, different from ExtractorPushed*, which describe the overall traffic before filtering
+    // describe the overall traffic before filtering
+    // TODO: some traffic need to be decoded first, e.g., sqlx row data which fields not directly map to dt row data, which need to track the size of tcp stream
     ExtractorRpsMax,
     ExtractorRpsMin,
     ExtractorRpsAvg,
@@ -34,6 +47,7 @@ pub enum TaskMetricsType {
 
     ExtractorPlanRecords,
 
+    // describe the overall traffic after filtering
     ExtractorPushedRpsMax,
     ExtractorPushedRpsMin,
     ExtractorPushedRpsAvg,

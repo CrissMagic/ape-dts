@@ -2,20 +2,27 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-
 use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     ClientConfig, Message, Offset, TopicPartitionList,
 };
+use tokio::sync::Mutex;
 
-use crate::extractor::resumer::cdc_resumer::CdcResumer;
-use crate::{extractor::base_extractor::BaseExtractor, Extractor};
-use dt_common::log_info;
-use dt_common::meta::{avro::avro_converter::AvroConverter, position::Position, syncer::Syncer};
+use crate::{
+    extractor::{
+        base_extractor::{BaseExtractor, ExtractState},
+        resumer::recovery::Recovery,
+    },
+    Extractor,
+};
+use dt_common::{
+    log_info, log_warn,
+    meta::{avro::avro_converter::AvroConverter, position::Position, syncer::Syncer},
+};
 
 pub struct KafkaExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub url: String,
     pub group: String,
     pub topic: String,
@@ -24,15 +31,25 @@ pub struct KafkaExtractor {
     pub ack_interval_secs: u64,
     pub avro_converter: AvroConverter,
     pub syncer: Arc<Mutex<Syncer>>,
-    pub resumer: CdcResumer,
+    pub recovery: Option<Arc<dyn Recovery + Send + Sync>>,
 }
 
 #[async_trait]
 impl Extractor for KafkaExtractor {
     async fn extract(&mut self) -> anyhow::Result<()> {
-        if let Position::Kafka { offset, .. } = &self.resumer.current_position {
-            self.offset = offset.to_owned();
-        };
+        if let Some(recovery) = &self.recovery {
+            if let Some(position) = recovery.get_cdc_resume_position().await {
+                match &position {
+                    Position::Kafka { offset, .. } => {
+                        self.offset = offset.to_owned();
+                        log_info!("cdc recovery from offset:[{}]", offset);
+                    }
+                    _ => {
+                        log_warn!("position:{} is not a valid kafka position", position);
+                    }
+                }
+            }
+        }
 
         log_info!(
             "KafkaCdcExtractor starts, topic: {}, partition: {}, offset: {}",
@@ -61,7 +78,9 @@ impl KafkaExtractor {
                     partition: self.partition,
                     offset: msg.offset(),
                 };
-                self.base_extractor.push_dt_data(dt_data, position).await?;
+                self.base_extractor
+                    .push_dt_data(&mut self.extract_state, dt_data, position)
+                    .await?;
             }
         }
     }

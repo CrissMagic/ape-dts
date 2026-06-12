@@ -1,30 +1,85 @@
-# Check structures
+# Structure Check
 
-After structure migration, you can choose from two methods for verification. One is provided by us, and the other is an open source tool called [Liquibase](./check_liquibase.md). This document primarily focuses on the former one.
+After structure migration, you can choose from two verification methods. One is the built-in checker provided by ape-dts, and the other is an open-source tool called [Liquibase](./check_by_liquibase.md). This document focuses on the built-in checker.
 
-# Example: MySQL -> MySQL
+Structure check is independent of CDC. Here, `inline cdc check` refers to row-level data check
+(see [data check docs](../snapshot/check.md)).
+
+## Example: MySQL -> MySQL
+
 Refer to [task templates](../../templates/mysql_to_mysql.md)
 
 # Results
 
-Based on the source structures, the check results include **miss**, **diff** and **extra**, all presented in sql. `miss.log` contains src_sqls, `diff.log` contains src_sqls and dst_sqls, and `extra.log` contains dst_sqls.
+Structure check writes `miss.log` and `diff.log` as JSON Lines only when there are missing or
+different objects. `summary.log` contains exactly one JSON line for the overall summary. When
+`output_revise_sql=true` and repair SQL exists, it also writes repair statements to `sql.log`.
+`sql.log` is plain SQL, one statement per line, with no JSON wrapper or schema/table/id metadata.
 
-- `miss.log`
-```
-[("table.struct_check_test_1.not_match_miss", "CREATE TABLE `struct_check_test_1`.`not_match_miss` (`id` int(11) NOT NULL  ,`text` varchar(10) CHARACTER SET utf8 COLLATE utf8_general_ci NULL  , PRIMARY KEY (`id`)) ENGINE=InnoDB  DEFAULT CHARSET=utf8 COLLATE=utf8_general_ci")]
-key: index.struct_check_test_1.not_match_index.i6_miss, src_sql: CREATE  INDEX `i6_miss` ON `struct_check_test_1`.`not_match_index` (`index_col`) 
-key: index.struct_check_test_1.not_match_index.i5_diff_name_src, src_sql: CREATE  INDEX `i5_diff_name_src` ON `struct_check_test_1`.`not_match_index` (`index_col`) 
+By default, stdout follows the normal runtime logging configuration. For orchestration paths that
+need stdout to contain only check results, set `[runtime].check_result_stdout_only=true` for that
+specific check task. In this mode, the files above remain the check artifacts, normal runtime stdout
+is silenced, and miss, diff, summary, and SQL records are emitted to stdout as one line in the form
+`<logger> - <payload>`. Only `summary_logger`, `miss_logger`, `diff_logger`, and `sql_logger` are
+part of this stdout result stream. The JSON payloads are the same objects as the file logs; SQL
+payloads are the same plain statements as `sql.log`.
+
+`miss.log` and `diff.log` use the same JSON structure (`StructCheckLog`). `src_sql` and
+`dst_sql` are optional and appear only when the corresponding side has a definition:
+
+```json
+{
+  "key": "index.db_name.tb_name.idx_name",
+  "src_sql": "source definition SQL",
+  "dst_sql": "target definition SQL"
+}
 ```
 
-- `diff.log`
-```
-key: index.struct_check_test_1.not_match_index.i4_diff_order, src_sql: CREATE  INDEX `i4_diff_order` ON `struct_check_test_1`.`not_match_index` (`composite_index_col2`,`composite_index_col1`,`composite_index_col3`) 
-key: index.struct_check_test_1.not_match_index.i4_diff_order, dst_sql: CREATE  INDEX `i4_diff_order` ON `struct_check_test_1`.`not_match_index` (`composite_index_col3`,`composite_index_col2`,`composite_index_col1`) 
-key: table.struct_check_test_1.not_match_column, src_sql: CREATE TABLE `struct_check_test_1`.`not_match_column` (`id` int(10) unsigned auto_increment NOT NULL  ,`varchar_col` varchar(255) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL  ,`char_col` char(10) CHARACTER SET utf8 COLLATE utf8_general_ci NULL  ,`text_col` text CHARACTER SET utf8 COLLATE utf8_general_ci NULL  ,`tinyint_col` tinyint(4) DEFAULT '0' NULL  ,`smallint_col` smallint(6) NULL  ,`mediumint_col` mediumint(9) NULL  ,`int_col` int(11) NULL  ,`bigint_col` bigint(20) NULL  ,`float_col` float(8,2) NULL  ,`double_col` double(16,4) NULL  ,`decimal_col` decimal(10,2) NULL  ,`date_col` date NULL  ,`datetime_col` datetime NULL  ,`timestamp_col` timestamp DEFAULT CURRENT_TIMESTAMP NOT NULL  ,`time_col` time NULL  ,`year_col` year(4) NULL  ,`binary_col` binary(16) NULL  ,`varbinary_col` varbinary(255) NULL  ,`blob_col` blob NULL  ,`tinyblob_col` tinyblob NULL  ,`mediumblob_col` mediumblob NULL  ,`longblob_col` longblob NULL  ,`enum_col` enum('value1','value2','value3') CHARACTER SET utf8 COLLATE utf8_general_ci NULL  ,`set_col` set('option1','option2','option3') CHARACTER SET utf8 COLLATE utf8_general_ci NULL  , PRIMARY KEY (`id`)) ENGINE=InnoDB  DEFAULT CHARSET=utf8 COLLATE=utf8_general_ci
-key: table.struct_check_test_1.not_match_column, dst_sql: CREATE TABLE `struct_check_test_1`.`not_match_column` (`id` int(10) unsigned auto_increment NOT NULL  ,`char_col` char(10) CHARACTER SET utf8 COLLATE utf8_general_ci NULL  ,`text_col` text CHARACTER SET utf8 COLLATE utf8_general_ci NULL  ,`tinyint_col` tinyint(4) DEFAULT '0' NULL  ,`smallint_col` smallint(6) NULL  ,`mediumint_col` mediumint(9) NULL  ,`int_col` int(11) NULL  ,`bigint_col` bigint(20) NULL  ,`float_col` float(8,2) NULL  ,`double_col` double(16,4) NULL  ,`decimal_col` decimal(10,2) NULL  ,`datetime_col` datetime NULL  ,`timestamp_col` timestamp DEFAULT CURRENT_TIMESTAMP NOT NULL  ,`time_col` time NULL  ,`year_col` year(4) NULL  ,`binary_col` binary(16) NULL  ,`varbinary_col` varbinary(255) NULL  ,`blob_col` blob NULL  ,`tinyblob_col` tinyblob NULL  ,`mediumblob_col` mediumblob NULL  ,`longblob_col` longblob NULL  ,`enum_col` enum('value1','value2','value3') CHARACTER SET utf8 COLLATE utf8_general_ci NULL  ,`set_col` set('option1','option2','option3') CHARACTER SET utf8 COLLATE utf8_general_ci NULL  , PRIMARY KEY (`id`)) ENGINE=InnoDB  DEFAULT CHARSET=utf8 COLLATE=utf8_general_ci
+`key` identifies the structure object and is always present. Structure logs do not contain
+`schema`, `tb`, `id_col_values`, `target_schema`, or `target_tb`. `src_sql` is included when the
+source-side definition exists; `dst_sql` is included when the target-side definition exists.
+Source-only missing objects usually have only `src_sql`; objects with different definitions have
+both `src_sql` and `dst_sql`; target-only extra objects have only `dst_sql`.
+
+The structure key has this format:
+
+```text
+<object_type>.<schema>.<table_or_object>[.<sub_object>]
 ```
 
-- `extra.log`
+Common table-scoped examples include `table.struct_check_test_1.not_match_column`,
+`index.struct_check_test_1.not_match_index.i6_miss`,
+`constraint.struct_check_test_1.not_match_missing.not_match_missing_pkey`,
+`table_comment.struct_check_test_1.not_match_comment`, and
+`column_comment.struct_check_test_1.not_match_comment.id`. PostgreSQL global objects use
+object-specific keys such as `udt.schema.type_name`, `udf.schema.function_name(arguments)`, and
+`rbac.role.role_name`.
+
+- `miss.log` (present in source but missing in target)
+```json
+{"key":"table.struct_check_test_1.not_match_miss","src_sql":"CREATE TABLE `not_match_miss` (`id` int NOT NULL, PRIMARY KEY (`id`))"}
+{"key":"index.struct_check_test_1.not_match_index.i6_miss","src_sql":"CREATE INDEX `i6_miss` ON `not_match_index` (`c6`)"}
 ```
-key: index.struct_check_test_1.not_match_index.i5_diff_name_dst, dst_sql: CREATE  INDEX `i5_diff_name_dst` ON `struct_check_test_1`.`not_match_index` (`index_col`) 
+
+- `diff.log` (object definition differs, or the object exists only in the target)
+```json
+{"key":"index.struct_check_test_1.not_match_index.i1","src_sql":"CREATE INDEX `i1` ON `not_match_index` (`c1`)","dst_sql":"CREATE INDEX `i1` ON `not_match_index` (`c2`)"}
+{"key":"table.struct_check_test_1.not_match_column","src_sql":"CREATE TABLE `not_match_column` (`id` int NOT NULL, PRIMARY KEY (`id`))","dst_sql":"CREATE TABLE `not_match_column` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}
+{"key":"index.struct_check_test_1.full_index_type.index_not_match_name_dst","dst_sql":"CREATE INDEX `index_not_match_name_dst` ON `full_index_type` (`c1`)"}
 ```
+
+- `summary.log` (overview of the check results)
+```json
+{"start_time":"2023-10-01T10:00:00+08:00","end_time":"2023-10-01T10:00:05+08:00","is_consistent":false,"miss_count":8,"diff_count":5,"skip_count":0,"sql_count":14,"tables":[{"schema":"struct_check_test_1","tb":"not_match_column","checked_count":0,"miss_count":0,"diff_count":1,"skip_count":0},{"schema":"struct_check_test_1","tb":"not_match_miss","checked_count":0,"miss_count":1,"diff_count":0,"skip_count":0}]}
+```
+
+- `sql.log` (generated when `output_revise_sql=true`)
+```sql
+CREATE TABLE IF NOT EXISTS `struct_check_test_1`.`not_match_miss` (`id` int NOT NULL, PRIMARY KEY (`id`));
+```
+
+# Scope
+
+- Structure check compares the source structures selected by the configured routing and filters with the corresponding target structures.
+- Extra objects that exist only in the target are reported in `diff.log`.
+- Objects outside the selected databases/schemas and filters are not checked.

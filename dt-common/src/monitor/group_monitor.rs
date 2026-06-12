@@ -36,18 +36,19 @@ impl GroupMonitor {
     }
 
     pub fn add_monitor(&self, id: &str, monitor: Arc<Monitor>) {
+        monitor.clear_tombstone();
         self.monitors.insert(id.to_string(), monitor);
     }
 
     pub fn remove_monitor(&self, id: &str) {
-        // keep statistics of no_window counters before removing:
-        // eg. 2025-02-18 05:43:37.028889 | pipeline | global | sinked_count | latest=4199364
-        if let Some((_, monitor)) = self.monitors.remove(id) {
-            Self::refresh_no_window_counter_statistics_map(
-                &self.no_window_counter_statistics_map,
-                &monitor,
-            );
-        }
+        self.monitors.remove(id);
+    }
+
+    pub fn settle_no_window_monitor(&self, monitor: &Arc<Monitor>) {
+        Self::refresh_no_window_counter_statistics_map(
+            &self.no_window_counter_statistics_map,
+            monitor,
+        );
     }
 
     pub async fn flush(&self) {
@@ -55,20 +56,43 @@ impl GroupMonitor {
             DashMap::new();
         let no_window_counter_statistics_map = self.no_window_counter_statistics_map.clone();
 
-        for entry in self.monitors.iter() {
-            let (_, monitor) = entry.pair();
-            for mut sub_entry in monitor.time_window_counters.iter_mut() {
-                let (counter_type, counter) = sub_entry.pair_mut();
-                let statistics = counter.statistics();
-                window_counter_statistics_map
-                    .entry(counter_type.to_owned())
-                    .or_default()
-                    .push(statistics);
+        let monitors: Vec<Arc<Monitor>> = self
+            .monitors
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        for monitor in monitors {
+            let counter_types: Vec<CounterType> = monitor
+                .time_window_counters
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect();
+
+            for counter_type in counter_types {
+                let counter = monitor
+                    .time_window_counters
+                    .get(&counter_type)
+                    .map(|r| r.value().clone());
+                if let Some(counter) = counter {
+                    if !counter.has_live_data().await {
+                        continue;
+                    }
+                    let statistics = counter.statistics().await;
+                    window_counter_statistics_map
+                        .entry(counter_type)
+                        .or_default()
+                        .push(statistics);
+                }
             }
-            Self::refresh_no_window_counter_statistics_map(
-                &no_window_counter_statistics_map,
-                monitor,
-            );
+
+            // Tombstoned monitors already settle their no-window counters during unregister.
+            if !monitor.is_tombstone() {
+                Self::refresh_no_window_counter_statistics_map(
+                    &no_window_counter_statistics_map,
+                    &monitor,
+                );
+            }
         }
 
         for (counter_type, statistics_vec) in window_counter_statistics_map {
@@ -109,22 +133,27 @@ impl GroupMonitor {
         no_window_counter_statistics_map: &DashMap<CounterType, DashMap<AggregateType, u64>>,
         monitor: &Arc<Monitor>,
     ) {
-        for entry in monitor.no_window_counters.iter() {
-            let (counter_type, counter) = entry.pair();
-            // let mut aggregate_value_map = HashMap::new();
-            for aggregate_type in counter_type.get_aggregate_types().iter() {
-                let aggregate_value = match aggregate_type {
-                    AggregateType::Latest => counter.value,
-                    AggregateType::AvgByCount => counter.avg_by_count(),
-                    _ => continue,
-                };
+        let no_window_counter_types = monitor
+            .no_window_counters
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for counter_type in no_window_counter_types {
+            if let Some(counter) = monitor.no_window_counters.get(&counter_type) {
+                for aggregate_type in counter_type.get_aggregate_types().iter() {
+                    let aggregate_value = match aggregate_type {
+                        AggregateType::Latest => counter.value,
+                        AggregateType::AvgByCount => counter.avg_by_count(),
+                        _ => continue,
+                    };
 
-                no_window_counter_statistics_map
-                    .entry(counter_type.to_owned())
-                    .or_default()
-                    .entry(aggregate_type.to_owned())
-                    .and_modify(|v| *v += aggregate_value)
-                    .or_insert(aggregate_value);
+                    no_window_counter_statistics_map
+                        .entry(counter_type.to_owned())
+                        .or_default()
+                        .entry(aggregate_type.to_owned())
+                        .and_modify(|v| *v += aggregate_value)
+                        .or_insert(aggregate_value);
+                }
             }
         }
     }

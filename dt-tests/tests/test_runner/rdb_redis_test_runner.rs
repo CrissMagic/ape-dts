@@ -1,5 +1,6 @@
 use anyhow::bail;
 use dt_common::config::config_enums::DbType;
+use dt_common::meta::col_value::ColValue;
 use dt_common::utils::redis_util::RedisUtil;
 use dt_common::{
     config::{sinker_config::SinkerConfig, task_config::TaskConfig},
@@ -30,10 +31,24 @@ impl RdbRedisTestRunner {
         let config = TaskConfig::new(&base.task_config_file).unwrap();
 
         let mysql_conn_pool = Some(
-            TaskUtil::create_mysql_conn_pool(&config.extractor_basic.url, 1, false, true).await?,
+            TaskUtil::create_mysql_conn_pool(
+                &config.extractor_basic.url,
+                &DbType::Mysql,
+                &config.extractor_basic.connection_auth,
+                1,
+                false,
+                None,
+            )
+            .await?,
         );
         let redis_conn = match config.sinker {
-            SinkerConfig::Redis { url, .. } => RedisUtil::create_redis_conn(&url).await.unwrap(),
+            SinkerConfig::Redis {
+                url,
+                connection_auth,
+                ..
+            } => RedisUtil::create_redis_conn(&url, &connection_auth)
+                .await
+                .unwrap(),
             _ => {
                 bail! {Error::ConfigError("unsupported sinker config".into())};
             }
@@ -139,21 +154,18 @@ impl RdbRedisTestRunner {
         if let Some(conn_pool) = &self.mysql_conn_pool {
             // mysql data
             let tb_meta = RdbUtil::get_tb_meta_mysql(conn_pool, db_tb).await?;
-            if tb_meta.basic.order_col.is_none() {
+            if tb_meta.basic.order_cols.is_empty() {
                 return Ok(true);
             }
-            let key_col = tb_meta.basic.order_col.as_ref().unwrap();
+            // only support single primary/unique column for redis test
+            let key_col = tb_meta.basic.order_cols.first().unwrap();
 
             let results = RdbUtil::fetch_data_mysql(conn_pool, None, db_tb, "").await?;
             for row_data in results {
-                let key = row_data
-                    .after
-                    .as_ref()
-                    .unwrap()
-                    .get(key_col)
-                    .unwrap()
-                    .to_option_string()
-                    .unwrap();
+                let after = row_data.require_after()?;
+                let Some(key) = after.get(key_col).and_then(Self::redis_expected_value) else {
+                    continue;
+                };
 
                 // redis data
                 let redis_k = format!("{}.{}.{}", db_tb.0, db_tb.1, key);
@@ -161,24 +173,38 @@ impl RdbRedisTestRunner {
                     .redis_util
                     .get_hash_entry(&mut self.redis_conn, &redis_k);
 
-                for (col, db_v) in row_data.after.unwrap() {
+                for (col, db_v) in after.iter() {
                     // check redis key exists
-                    assert!(redis_kvs.contains_key(&col));
+                    assert!(redis_kvs.contains_key(col));
                     // check redis value = db value
-                    if let Value::BulkString(v) = redis_kvs.get(&col).unwrap() {
+                    if let Value::BulkString(v) = redis_kvs.get(col).unwrap() {
                         let redis_v_str = String::from_utf8(v.clone()).unwrap();
-                        if let Some(db_v_str) = db_v.to_option_string() {
-                            if redis_v_str != db_v_str {
-                                println!("compare db: {}, tb: {}, col: {}", db_tb.0, db_tb.1, col);
-                            }
-                            assert_eq!(redis_v_str, db_v_str)
-                        } else {
-                            assert_eq!(redis_v_str, "")
+                        let expected = Self::redis_expected_value(db_v).unwrap_or_default();
+                        if redis_v_str != expected {
+                            println!("compare db: {}, tb: {}, col: {}", db_tb.0, db_tb.1, col);
                         }
+                        assert_eq!(redis_v_str, expected)
                     }
                 }
             }
         }
         Ok(true)
+    }
+
+    fn redis_expected_value(col_value: &ColValue) -> Option<String> {
+        match col_value {
+            ColValue::None | ColValue::UnchangedToast => None,
+            ColValue::RawString(_) => col_value.to_utf8_or_hex_string(),
+            ColValue::String(v)
+            | ColValue::Time(v)
+            | ColValue::Date(v)
+            | ColValue::DateTime(v)
+            | ColValue::Timestamp(v)
+            | ColValue::Decimal(v)
+            | ColValue::Set2(v)
+            | ColValue::Enum2(v)
+            | ColValue::Json2(v) => Some(v.clone()),
+            _ => col_value.to_option_string(),
+        }
     }
 }

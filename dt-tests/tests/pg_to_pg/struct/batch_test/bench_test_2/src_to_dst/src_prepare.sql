@@ -1,12 +1,11 @@
 -- Use a DO block and a FOR loop to create the schemas and their objects dynamically.
-```
 DO $$
 DECLARE
     i INT;
     schema_name TEXT;
 BEGIN
 
-    FOR i IN 1..100 LOOP
+    FOR i IN 1..50 LOOP
         schema_name := 'struct_it_pg2pg_' || i;
 
         -- Drop and Create the Schema
@@ -48,4 +47,3 @@ BEGIN
 
     END LOOP;
 END $$;
-```

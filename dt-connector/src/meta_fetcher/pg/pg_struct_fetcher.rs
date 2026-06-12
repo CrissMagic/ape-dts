@@ -6,6 +6,8 @@ use dt_common::meta::struct_meta::{
         pg_create_rbac_statement::PgCreateRbacStatement,
         pg_create_schema_statement::PgCreateSchemaStatement,
         pg_create_table_statement::PgCreateTableStatement,
+        pg_create_udf_statement::PgCreateUdfStatement,
+        pg_create_udt_statement::PgCreateUdtStatement,
     },
     structure::{
         column::{Column, ColumnDefault},
@@ -17,6 +19,7 @@ use dt_common::meta::struct_meta::{
         sequence::Sequence,
         sequence_owner::SequenceOwner,
         table::Table,
+        user_defined::{PgUdf, PgUdt, PgUdtType},
     },
 };
 use dt_common::{
@@ -39,7 +42,6 @@ pub struct PgStructFetcher {
 
 enum ColType {
     Text,
-    Char,
 }
 
 impl PgStructFetcher {
@@ -96,6 +98,66 @@ impl PgStructFetcher {
             members,
             privileges,
         }])
+    }
+
+    pub async fn get_udf_statements(&mut self) -> anyhow::Result<Vec<PgCreateUdfStatement>> {
+        let mut results = Vec::new();
+        let sql = "SELECT 
+                n.nspname AS schema_name,
+                p.proname AS function_name,
+                pg_catalog.pg_get_function_identity_arguments(p.oid) AS identity_arguments,
+                l.lanname,
+                pg_catalog.pg_get_functiondef(p.oid) AS create_statement
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            JOIN pg_language  l ON l.oid = p.prolang
+            LEFT JOIN pg_catalog.pg_depend d
+                ON d.classid = 'pg_proc'::regclass
+                AND d.objid   = p.oid
+                AND d.deptype = 'e'
+            LEFT JOIN pg_catalog.pg_extension e
+                ON e.oid = d.refobjid
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+            AND p.prokind = 'f'                 
+            AND e.extname IS NULL
+            AND l.lanname IN ('sql','plpgsql')
+            ORDER BY p.oid
+        ";
+
+        let mut rows = sqlx::query(sql).fetch(&self.conn_pool);
+        while let Some(row) = rows.try_next().await? {
+            let schema_name = Self::get_str_with_null(&row, "schema_name")?;
+            let function_name = Self::get_str_with_null(&row, "function_name")?;
+            let identity_arguments = Self::get_str_with_null(&row, "identity_arguments")?;
+            let lanname = Self::get_str_with_null(&row, "lanname")?;
+            let create_statement = Self::get_str_with_null(&row, "create_statement")?;
+
+            if !self.schemas.contains(&schema_name) || self.filter_schema(&schema_name) {
+                continue;
+            }
+
+            results.push(PgCreateUdfStatement {
+                udf: PgUdf {
+                    schema_name,
+                    function_name,
+                    identity_arguments,
+                    lanname,
+                    create_statement,
+                },
+            });
+        }
+        Ok(results)
+    }
+
+    pub async fn get_udt_statements(&mut self) -> anyhow::Result<Vec<PgCreateUdtStatement>> {
+        let mut results = Vec::new();
+
+        results.extend(self.get_enum_udt_statements().await?);
+        results.extend(self.get_range_udt_statements().await?);
+        results.extend(self.get_domain_udt_statements().await?);
+        results.extend(self.get_compose_udt_statements().await?);
+
+        Ok(results)
     }
 
     async fn get_schemas(&mut self, sch: &str) -> anyhow::Result<Vec<Schema>> {
@@ -551,7 +613,7 @@ impl PgStructFetcher {
             "SELECT nsp.nspname,
                 rel.relname,
                 con.conname AS constraint_name,
-                con.contype AS constraint_type,
+                con.contype::text AS constraint_type,
                 pg_get_constraintdef(con.oid) AS constraint_definition
             FROM pg_catalog.pg_constraint con
             JOIN pg_catalog.pg_class rel
@@ -566,7 +628,7 @@ impl PgStructFetcher {
         let mut rows = sqlx::query(&sql).fetch(&self.conn_pool);
         while let Some(row) = rows.try_next().await? {
             let table_name = Self::get_str_with_null(&row, "relname")?;
-            let constraint_type = Self::get_with_null(&row, "constraint_type", ColType::Char)?;
+            let constraint_type = Self::get_str_with_null(&row, "constraint_type")?;
 
             let constraint = Constraint {
                 database_name: String::new(),
@@ -768,7 +830,7 @@ impl PgStructFetcher {
     async fn get_roles(&mut self) -> anyhow::Result<Vec<PgRole>> {
         let sql = "SELECT a.rolname, a.rolpassword, a.rolsuper, a.rolinherit, a.rolcreaterole, 
                 a.rolcreatedb, a.rolcanlogin, a.rolreplication, a.rolbypassrls, a.rolconnlimit, 
-                a.rolvaliduntil, r.rolconfig 
+                a.rolvaliduntil::text AS rolvaliduntil, r.rolconfig 
             FROM pg_authid a
             JOIN pg_roles r ON a.oid = r.oid
             WHERE a.rolname NOT LIKE 'pg_%' 
@@ -860,6 +922,7 @@ impl PgStructFetcher {
     async fn get_schema_privilege(&mut self) -> anyhow::Result<Vec<PgPrivilege>> {
         let sql = "SELECT
               n.nspname AS schema_name,
+              acl.grantee::regrole::text AS grantee,
               'GRANT ' || 
               string_agg(acl.privilege_type, ',') || 
               ' ON SCHEMA ' || quote_ident(n.nspname) || 
@@ -880,12 +943,14 @@ impl PgStructFetcher {
         while let Some(row) = rows.try_next().await? {
             let grant_command = row.get::<String, _>("grant_command");
             let schema_name = Self::get_str_with_null(&row, "schema_name")?;
+            let grantee = Self::get_str_with_null(&row, "grantee")?;
 
-            if self.filter_schema(schema_name.as_str()) {
+            if !self.schemas.contains(&schema_name) || self.filter_schema(schema_name.as_str()) {
                 continue;
             }
 
             results.push(PgPrivilege {
+                key: format!("rbac.privilege.schema.{}.{}", schema_name, grantee),
                 origin: grant_command,
             });
         }
@@ -897,6 +962,8 @@ impl PgStructFetcher {
         let sql = "SELECT 
                 table_schema,
                 table_name,
+                grantee,
+                is_grantable,
                 'GRANT ' || 
                 array_to_string(array_agg(privilege_type), ',') || 
                 ' ON ' || quote_ident(table_schema) || '.' || quote_ident(table_name) || 
@@ -918,13 +985,19 @@ impl PgStructFetcher {
         while let Some(row) = rows.try_next().await? {
             let schema_name = Self::get_str_with_null(&row, "table_schema")?;
             let table_name = Self::get_str_with_null(&row, "table_name")?;
+            let grantee = Self::get_str_with_null(&row, "grantee")?;
+            let is_grantable = Self::get_str_with_null(&row, "is_grantable")?;
             let grant_command = Self::get_str_with_null(&row, "grant_command")?;
 
-            if self.filter_tb(&schema_name, &table_name) {
+            if !self.schemas.contains(&schema_name) || self.filter_tb(&schema_name, &table_name) {
                 continue;
             }
 
             results.push(PgPrivilege {
+                key: format!(
+                    "rbac.privilege.table.{}.{}.{}.{}",
+                    schema_name, table_name, grantee, is_grantable
+                ),
                 origin: grant_command,
             });
         }
@@ -971,7 +1044,7 @@ impl PgStructFetcher {
             let schema_name = Self::get_str_with_null(&row, "table_schema")?;
             let table_name = Self::get_str_with_null(&row, "table_name")?;
 
-            if self.filter_tb(&schema_name, &table_name) {
+            if !self.schemas.contains(&schema_name) || self.filter_tb(&schema_name, &table_name) {
                 continue;
             }
 
@@ -1013,6 +1086,10 @@ impl PgStructFetcher {
                 );
 
                 results.push(PgPrivilege {
+                    key: format!(
+                        "rbac.privilege.column.{}.{}.{}.{}.{}",
+                        schema, table, privilege_type, grantee, is_grantable
+                    ),
                     origin: grant_command,
                 });
             }
@@ -1094,10 +1171,234 @@ impl PgStructFetcher {
             );
 
             results.push(PgPrivilege {
+                key: format!(
+                    "rbac.privilege.sequence.{}.{}.{}.{}",
+                    schema, sequence, grantee, is_grantable
+                ),
                 origin: grant_command,
             });
         }
 
+        Ok(results)
+    }
+
+    async fn get_enum_udt_statements(&mut self) -> anyhow::Result<Vec<PgCreateUdtStatement>> {
+        let mut results = Vec::new();
+        let sql = r#"SELECT
+            format(
+                'CREATE TYPE "%I"."%I" AS ENUM (%s);',
+                n.nspname,
+                t.typname,
+                pg_catalog.string_agg(
+                    quote_literal(e.enumlabel)::text,
+                    ', '::text
+                    ORDER BY e.enumsortorder
+                )
+            ) AS create_enum_sql,
+            n.nspname::text,
+            t.typname::text
+        FROM pg_catalog.pg_type t
+        JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        JOIN pg_catalog.pg_enum e ON e.enumtypid = t.oid
+        LEFT JOIN pg_catalog.pg_depend d
+            ON d.classid = 'pg_type'::regclass
+            AND d.objid   = t.oid
+            AND d.deptype = 'e'
+        LEFT JOIN pg_catalog.pg_extension ext
+            ON ext.oid = d.refobjid
+        WHERE t.typtype = 'e'
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND ext.extname IS NULL
+        GROUP BY n.nspname, t.typname, t.oid
+        ORDER BY t.oid"#;
+
+        let mut rows = sqlx::query(sql).fetch(&self.conn_pool);
+        while let Some(row) = rows.try_next().await? {
+            let schema_name = Self::get_str_with_null(&row, "nspname")?;
+            let typ_name = Self::get_str_with_null(&row, "typname")?;
+            let create_statement = Self::get_str_with_null(&row, "create_enum_sql")?;
+
+            if !self.schemas.contains(&schema_name) || self.filter_schema(&schema_name) {
+                continue;
+            }
+
+            results.push(PgCreateUdtStatement {
+                udt: PgUdt {
+                    schema_name,
+                    typ_name,
+                    typ_type: PgUdtType::Enum,
+                    create_statement,
+                },
+            });
+        }
+        Ok(results)
+    }
+
+    async fn get_compose_udt_statements(&mut self) -> anyhow::Result<Vec<PgCreateUdtStatement>> {
+        let mut results = Vec::new();
+        let sql = r#"SELECT
+            format(
+                'CREATE TYPE "%I"."%I" AS (%s);',
+                n.nspname,
+                t.typname,
+                (
+                    SELECT string_agg(
+                            format('%I %s',
+                                    a.attname,
+                                    pg_catalog.format_type(a.atttypid, a.atttypmod)),
+                            ', ' ORDER BY a.attnum
+                        )
+                    FROM pg_catalog.pg_attribute a
+                    WHERE a.attrelid = t.typrelid
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                )
+            ) AS create_composite_sql,
+            n.nspname::text,
+            t.typname::text
+        FROM pg_catalog.pg_type t
+        JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        LEFT JOIN pg_catalog.pg_class c
+            ON c.oid = t.typrelid
+        LEFT JOIN pg_catalog.pg_depend d
+            ON d.classid = 'pg_type'::regclass
+            AND d.objid   = t.oid
+            AND d.deptype = 'e'
+        LEFT JOIN pg_catalog.pg_extension ext
+            ON ext.oid = d.refobjid
+        WHERE t.typtype = 'c'
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND (c.oid IS NULL OR c.relkind = 'c')
+        AND ext.extname IS NULL
+        ORDER BY t.oid"#;
+
+        let mut rows = sqlx::query(sql).fetch(&self.conn_pool);
+        while let Some(row) = rows.try_next().await? {
+            let schema_name = Self::get_str_with_null(&row, "nspname")?;
+            let typ_name = Self::get_str_with_null(&row, "typname")?;
+            let create_statement = Self::get_str_with_null(&row, "create_composite_sql")?;
+
+            if !self.schemas.contains(&schema_name) || self.filter_schema(&schema_name) {
+                continue;
+            }
+
+            results.push(PgCreateUdtStatement {
+                udt: PgUdt {
+                    schema_name,
+                    typ_name,
+                    typ_type: PgUdtType::Composite,
+                    create_statement,
+                },
+            });
+        }
+        Ok(results)
+    }
+
+    async fn get_range_udt_statements(&mut self) -> anyhow::Result<Vec<PgCreateUdtStatement>> {
+        let mut results = Vec::new();
+        let sql = r#"SELECT
+            n.nspname AS schema_name,
+            t.typname AS type_name,
+            format(
+                'CREATE TYPE "%I"."%I" AS RANGE (subtype = %s%s%s);',
+                n.nspname,
+                t.typname,
+                pg_catalog.format_type(r.rngsubtype, NULL),
+                CASE
+                    WHEN r.rngcanonical <> 0::oid THEN format(
+                        ', canonical = %I',
+                        (SELECT p.proname FROM pg_catalog.pg_proc p WHERE p.oid = r.rngcanonical)
+                    )
+                    ELSE ''
+                END,
+                CASE
+                    WHEN r.rngsubdiff <> 0::oid THEN format(
+                        ', subtype_diff = %I',
+                        (SELECT p.proname FROM pg_catalog.pg_proc p WHERE p.oid = r.rngsubdiff)
+                    )
+                    ELSE ''
+                END
+            ) AS create_statement
+        FROM pg_catalog.pg_type t
+        JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        JOIN pg_catalog.pg_range r      ON r.rngtypid = t.oid
+        LEFT JOIN pg_catalog.pg_depend d
+            ON d.classid = 'pg_type'::regclass
+            AND d.objid   = t.oid
+            AND d.deptype = 'e'
+        LEFT JOIN pg_catalog.pg_extension ext
+            ON ext.oid = d.refobjid
+        WHERE t.typtype = 'r'
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND ext.extname IS NULL
+        ORDER BY t.oid"#;
+
+        let mut rows = sqlx::query(sql).fetch(&self.conn_pool);
+        while let Some(row) = rows.try_next().await? {
+            let schema_name = Self::get_str_with_null(&row, "schema_name")?;
+            let typ_name = Self::get_str_with_null(&row, "type_name")?;
+            let create_statement = Self::get_str_with_null(&row, "create_statement")?;
+
+            if !self.schemas.contains(&schema_name) || self.filter_schema(&schema_name) {
+                continue;
+            }
+
+            results.push(PgCreateUdtStatement {
+                udt: PgUdt {
+                    schema_name,
+                    typ_name,
+                    typ_type: PgUdtType::Range,
+                    create_statement,
+                },
+            });
+        }
+        Ok(results)
+    }
+
+    async fn get_domain_udt_statements(&mut self) -> anyhow::Result<Vec<PgCreateUdtStatement>> {
+        let mut results = Vec::new();
+        let sql = r#"SELECT
+            format(
+                'CREATE DOMAIN "%I"."%I" AS %s%s;',
+                n.nspname,
+                t.typname,
+                pg_catalog.format_type(t.typbasetype, t.typtypmod),
+                COALESCE(' ' || pg_catalog.pg_get_constraintdef(c.oid), '')
+            ) AS create_domain_sql,
+            n.nspname::text,
+            t.typname::text
+        FROM pg_catalog.pg_type t
+        JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        LEFT JOIN pg_catalog.pg_constraint c ON c.contypid = t.oid
+        LEFT JOIN pg_catalog.pg_depend d
+            ON d.classid = 'pg_type'::regclass
+            AND d.objid   = t.oid
+            AND d.deptype = 'e'
+        LEFT JOIN pg_catalog.pg_extension ext
+            ON ext.oid = d.refobjid
+        WHERE t.typtype = 'd'
+        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND ext.extname IS NULL
+        ORDER BY t.oid"#;
+        let mut rows = sqlx::query(sql).fetch(&self.conn_pool);
+        while let Some(row) = rows.try_next().await? {
+            let schema_name = Self::get_str_with_null(&row, "nspname")?;
+            let typ_name = Self::get_str_with_null(&row, "typname")?;
+            let create_statement = Self::get_str_with_null(&row, "create_domain_sql")?;
+
+            if !self.schemas.contains(&schema_name) || self.filter_schema(&schema_name) {
+                continue;
+            }
+
+            results.push(PgCreateUdtStatement {
+                udt: PgUdt {
+                    schema_name,
+                    typ_name,
+                    typ_type: PgUdtType::Domain,
+                    create_statement,
+                },
+            });
+        }
         Ok(results)
     }
 
@@ -1121,10 +1422,6 @@ impl PgStructFetcher {
                 if let Some(s) = str_val_option {
                     str_val = s
                 }
-            }
-            ColType::Char => {
-                let char_val: i8 = row.get(col_name);
-                str_val = char_val.to_string();
             }
         }
         Ok(str_val)

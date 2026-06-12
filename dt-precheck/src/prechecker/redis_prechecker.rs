@@ -16,16 +16,15 @@ use dt_common::{
         task_config::TaskConfig,
     },
     meta::{dt_queue::DtQueue, syncer::Syncer},
-    monitor::monitor::Monitor,
+    monitor::{task_monitor::MonitorType, task_monitor_handle::TaskMonitorHandle},
     rdb_filter::RdbFilter,
     time_filter::TimeFilter,
 };
 use dt_connector::{
     extractor::{
-        base_extractor::BaseExtractor,
+        base_extractor::{BaseExtractor, ExtractState},
         extractor_monitor::ExtractorMonitor,
         redis::{redis_client::RedisClient, redis_psync_extractor::RedisPsyncExtractor},
-        resumer::cdc_resumer::CdcResumer,
     },
     rdb_router::RdbRouter,
 };
@@ -80,33 +79,39 @@ impl Prechecker for RedisPrechecker {
             // should never happen since we've already checked the extractor type before into this function
             _ => 0,
         };
-        let buffer = Arc::new(DtQueue::new(1, 0));
+        let buffer = Arc::new(DtQueue::new(1, 0, None, None));
 
         let filter = RdbFilter::from_config(&self.task_config.filter, &DbType::Redis)?;
-        let monitor = Arc::new(Monitor::new("extractor", "", 1, 100, 1));
+        let monitor = TaskMonitorHandle::noop(MonitorType::Extractor);
+
         let base_extractor = BaseExtractor {
             buffer,
             router: RdbRouter::from_config(&self.task_config.router, &DbType::Redis)?,
             shut_down: Arc::new(AtomicBool::new(false)),
-            monitor: ExtractorMonitor::new(monitor).await,
+        };
+        let extract_state = ExtractState {
+            monitor: ExtractorMonitor::new(monitor, String::new()).await,
             data_marker: None,
             time_filter: TimeFilter::default(),
         };
 
         let mut psyncer = RedisPsyncExtractor {
-            conn: RedisClient::new(&self.fetcher.url).await?,
+            conn: RedisClient::new(&self.fetcher.url, &self.fetcher.connection_auth).await?,
             repl_id: String::new(),
             repl_offset: 0,
             now_db_id: 0,
             repl_port,
             filter,
             base_extractor,
+            extract_state,
             extract_type: ExtractType::Snapshot,
             syncer: Arc::new(Mutex::new(Syncer::default())),
-            resumer: CdcResumer::default(),
             keepalive_interval_secs: 0,
             heartbeat_interval_secs: 0,
             heartbeat_key: String::new(),
+            recovery: None,
+            cluster_node: None,
+            wait_task_finish: true,
         };
 
         if let Err(error) = psyncer.start_psync().await {

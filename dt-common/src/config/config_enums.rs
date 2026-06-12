@@ -2,7 +2,17 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
 #[derive(
-    Clone, Display, EnumString, IntoStaticStr, Debug, PartialEq, Eq, Default, Serialize, Deserialize,
+    Clone,
+    Display,
+    EnumString,
+    IntoStaticStr,
+    Debug,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    Hash,
 )]
 pub enum DbType {
     #[default]
@@ -28,7 +38,7 @@ pub enum DbType {
     Tidb,
 }
 
-#[derive(Display, EnumString, IntoStaticStr, Debug, Clone)]
+#[derive(Display, EnumString, IntoStaticStr, Debug, Clone, Hash, PartialEq, Eq)]
 pub enum ExtractType {
     #[strum(serialize = "snapshot")]
     Snapshot,
@@ -50,15 +60,13 @@ pub enum ExtractType {
     FoxlakeS3,
 }
 
-#[derive(Display, EnumString, IntoStaticStr, Clone, Debug, Default)]
+#[derive(Display, EnumString, IntoStaticStr, Clone, Debug, Default, Hash)]
 pub enum SinkType {
     #[default]
     #[strum(serialize = "dummy")]
     Dummy,
     #[strum(serialize = "write")]
     Write,
-    #[strum(serialize = "check")]
-    Check,
     #[strum(serialize = "struct")]
     Struct,
     #[strum(serialize = "statistic")]
@@ -81,8 +89,6 @@ pub enum ParallelType {
     RdbPartition,
     #[strum(serialize = "rdb_merge")]
     RdbMerge,
-    #[strum(serialize = "rdb_check")]
-    RdbCheck,
     #[strum(serialize = "table")]
     Table,
     #[strum(serialize = "mongo")]
@@ -118,24 +124,81 @@ pub enum MetaCenterType {
     DbEngine,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Display, EnumString, IntoStaticStr)]
-pub enum TaskType {
-    #[strum(serialize = "struct")]
+// TaskKind/TaskType cover only regular struct/snapshot/cdc flows, with optional check mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskKind {
     Struct,
-    #[strum(serialize = "snapshot")]
     Snapshot,
-    #[strum(serialize = "cdc")]
     Cdc,
-    #[strum(serialize = "check")]
-    Check,
 }
 
-pub fn build_task_type(extract_type: &ExtractType, sink_type: &SinkType) -> Option<TaskType> {
-    match (extract_type, sink_type) {
-        (ExtractType::Struct, SinkType::Struct) => Some(TaskType::Struct),
-        (ExtractType::Snapshot, SinkType::Write) => Some(TaskType::Snapshot),
-        (ExtractType::Cdc, SinkType::Write) => Some(TaskType::Cdc),
-        (ExtractType::Snapshot, SinkType::Check) => Some(TaskType::Check),
-        _ => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CheckMode {
+    Standalone,
+    Inline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskType {
+    pub kind: TaskKind,
+    pub check: Option<CheckMode>,
+}
+
+impl TaskType {
+    pub const fn new(kind: TaskKind, check: Option<CheckMode>) -> Self {
+        Self { kind, check }
     }
+
+    pub const fn has_check(&self) -> bool {
+        self.check.is_some()
+    }
+
+    pub const fn is_inline_check(&self) -> bool {
+        matches!(self.check, Some(CheckMode::Inline))
+    }
+
+    pub const fn is_cdc_inline_check(&self) -> bool {
+        matches!(self.kind, TaskKind::Cdc) && self.is_inline_check()
+    }
+
+    pub const fn is_standalone_snapshot_check(&self) -> bool {
+        matches!(self.kind, TaskKind::Snapshot) && matches!(self.check, Some(CheckMode::Standalone))
+    }
+}
+
+#[derive(Display, EnumString, IntoStaticStr, PartialEq, Default)]
+pub enum ResumeType {
+    #[strum(serialize = "from_log")]
+    FromLog,
+    #[strum(serialize = "from_target")]
+    FromTarget,
+    #[strum(serialize = "from_db")]
+    FromDB,
+    #[default]
+    #[strum(serialize = "dummy")]
+    Dummy,
+}
+
+#[derive(Display, EnumString, IntoStaticStr, PartialEq, Default, Clone, Debug)]
+pub enum RdbTransactionIsolation {
+    #[strum(serialize = "read_uncommitted")]
+    ReadUncommitted,
+    #[strum(serialize = "read_committed")]
+    ReadCommitted,
+    #[strum(serialize = "repeatable_read")]
+    RepeatableRead,
+    #[strum(serialize = "serializable")]
+    Serializable,
+    #[default]
+    #[strum(serialize = "default")]
+    Default,
+}
+
+#[derive(Display, EnumString, IntoStaticStr, PartialEq, Default, Clone, Debug)]
+pub enum RdbParallelType {
+    #[default]
+    #[strum(serialize = "table")]
+    Table,
+    #[strum(serialize = "chunk")]
+    Chunk,
 }

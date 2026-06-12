@@ -16,6 +16,13 @@ mod test {
 
     #[tokio::test]
     #[serial]
+    #[ignore = "requires SSL-enabled MySQL instances and configured ssl_ca_path"]
+    async fn snapshot_ssl_test() {
+        TestBase::run_snapshot_test("mysql_to_mysql/snapshot/ssl_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn snapshot_on_duplicate_test() {
         TestBase::run_snapshot_test("mysql_to_mysql/snapshot/on_duplicate_test").await;
     }
@@ -40,14 +47,17 @@ mod test {
 
     #[tokio::test]
     #[serial]
-    async fn snapshot_resume_test() {
+    async fn snapshot_resume_from_log_test() {
         let mut dst_expected_counts = HashMap::new();
-        dst_expected_counts.insert("test_db_1.no_pk_no_uk", 9);
-        // no_pk_one_uk has a uk with multiple cols, UNIQUE KEY uk_1 (f_1,f_2), resume_filter won't work
         dst_expected_counts.insert("test_db_1.no_pk_one_uk", 9);
         // resume_filter works
+        dst_expected_counts.insert("test_db_1.no_pk_no_uk", 4);
         dst_expected_counts.insert("test_db_1.one_pk_multi_uk", 4);
         dst_expected_counts.insert("test_db_1.one_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.multi_pk", 1);
+        dst_expected_counts.insert("test_db_1.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("test_db_1.bytea_pk_gb2312_test", 2);
+        dst_expected_counts.insert("test_db_1.bytea_pk_utf8_test", 2);
         // with special characters in db && tb && col names
         dst_expected_counts.insert("test_db_@.resume_table_*$4", 1);
 
@@ -60,7 +70,34 @@ mod test {
         dst_expected_counts.insert("test_db_@.in_finished_log_table_*$2", 0);
 
         TestBase::run_snapshot_test_and_check_dst_count(
-            "mysql_to_mysql/snapshot/resume_test",
+            "mysql_to_mysql/snapshot/resume_log_test",
+            &DbType::Mysql,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_resume_from_db_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("test_db_1.no_pk_one_uk", 9);
+        // resume_filter works
+        dst_expected_counts.insert("test_db_1.no_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.multi_pk", 1);
+        dst_expected_counts.insert("test_db_1.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("test_db_1.bytea_pk_gb2312_test", 2);
+        dst_expected_counts.insert("test_db_1.bytea_pk_utf8_test", 2);
+        // with special characters in db && tb && col names
+        dst_expected_counts.insert("test_db_@.resume_table_*$4", 1);
+
+        dst_expected_counts.insert("test_db_@.finished_table_*$1", 0);
+        dst_expected_counts.insert("test_db_@.finished_table_*$2", 0);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "mysql_to_mysql/snapshot/resume_db_test",
             &DbType::Mysql,
             dst_expected_counts,
         )
@@ -87,15 +124,98 @@ mod test {
 
     #[tokio::test]
     #[serial]
-    async fn snapshot_parallel_test() {
+    async fn snapshot_chunk_parallel_test() {
         TestBase::run_snapshot_test("mysql_to_mysql/snapshot/parallel_test").await;
     }
 
     #[tokio::test]
     #[serial]
+    async fn snapshot_table_parallel_test() {
+        TestBase::run_snapshot_test("mysql_to_mysql/snapshot/table_parallel_test").await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_parallel_resume_from_log_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("test_db_1.no_pk_one_uk", 4);
+        // resume_filter works
+        dst_expected_counts.insert("test_db_1.no_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.no_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.multi_pk", 4);
+        dst_expected_counts.insert("test_db_1.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("test_db_1.varchar_uk", 6);
+        // with special characters in db && tb && col names
+        dst_expected_counts.insert("test_db_@.resume_table_*$4", 4);
+        dst_expected_counts.insert("test_db_@.finished_table_*$1", 0);
+        dst_expected_counts.insert("test_db_@.in_position_log_table_*$1", 4);
+        dst_expected_counts.insert("test_db_@.in_finished_log_table_*$1", 0);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "mysql_to_mysql/snapshot/parallel_test/resume_log_test",
+            &DbType::Mysql,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_parallel_resume_from_db_test() {
+        let mut dst_expected_counts = HashMap::new();
+        dst_expected_counts.insert("test_db_1.no_pk_one_uk", 4);
+        // resume_filter works
+        dst_expected_counts.insert("test_db_1.no_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.no_pk_multi_uk", 4);
+        dst_expected_counts.insert("test_db_1.one_pk_no_uk", 4);
+        dst_expected_counts.insert("test_db_1.multi_pk", 4);
+        dst_expected_counts.insert("test_db_1.nullable_composite_unique_key_table", 6);
+        dst_expected_counts.insert("test_db_1.varchar_uk", 6);
+        // with special characters in db && tb && col names
+        dst_expected_counts.insert("test_db_@.resume_table_*$4", 4);
+        dst_expected_counts.insert("test_db_@.finished_table_*$1", 0);
+
+        TestBase::run_snapshot_test_and_check_dst_count(
+            "mysql_to_mysql/snapshot/parallel_test/resume_db_test",
+            &DbType::Mysql,
+            dst_expected_counts,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn snapshot_tb_parallel_test() {
+        // legacy parallel test.
         // [runtime]
         // tb_parallel_size=3
         TestBase::run_snapshot_test("mysql_to_mysql/snapshot/tb_parallel_test").await;
+    }
+
+    // #[tokio::test]
+    // #[serial]
+    // async fn snapshot_deadlock_test() {
+    //     // Unpredictable write orders for unique indices on non-ordering columns (relative to the ORDER BY clause) are
+    //     // prone to causing deadlocks in the destination table.
+    //     let runner = RdbTestRunner::new("mysql_to_mysql/snapshot/deadlock_test")
+    //         .await
+    //         .unwrap();
+    //     runner.run_snapshot_test(false).await.unwrap();
+    //     runner.close().await.unwrap();
+    // }
+
+    // #[tokio::test]
+    // #[serial]
+    // async fn snapshot_mock_test() {
+    //     TestBase::run_snapshot_test("mysql_to_mysql/snapshot/mock_test").await;
+    // }
+
+    #[tokio::test]
+    #[serial]
+    async fn snapshot_big_packet_test() {
+        TestBase::run_snapshot_test("mysql_to_mysql/snapshot/big_packet_test").await;
     }
 }

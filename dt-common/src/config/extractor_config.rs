@@ -1,3 +1,10 @@
+use std::collections::HashMap;
+
+use crate::config::{
+    config_enums::RdbParallelType, connection_auth_config::ConnectionAuthConfig,
+    limiter_config::RateLimiterConfig,
+};
+
 use super::{
     config_enums::{DbType, ExtractType},
     s3_config::S3Config,
@@ -7,6 +14,7 @@ use super::{
 pub enum ExtractorConfig {
     MysqlStruct {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         db: String,
         dbs: Vec<String>,
         db_batch_size: usize,
@@ -14,6 +22,7 @@ pub enum ExtractorConfig {
 
     PgStruct {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         schema: String,
         schemas: Vec<String>,
         do_global_structs: bool,
@@ -22,15 +31,20 @@ pub enum ExtractorConfig {
 
     MysqlSnapshot {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         db: String,
         tb: String,
-        sample_interval: usize,
+        db_tbs: HashMap<String, Vec<String>>,
+        sample_rate: Option<u8>,
         parallel_size: usize,
+        parallel_type: RdbParallelType,
         batch_size: usize,
+        partition_cols: String,
     },
 
     MysqlCdc {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         binlog_filename: String,
         binlog_position: u32,
         server_id: u64,
@@ -42,24 +56,33 @@ pub enum ExtractorConfig {
         heartbeat_tb: String,
         start_time_utc: String,
         end_time_utc: String,
+        keepalive_idle_secs: u64,
+        keepalive_interval_secs: u64,
     },
 
     MysqlCheck {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         check_log_dir: String,
         batch_size: usize,
     },
 
     PgSnapshot {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         schema: String,
         tb: String,
-        sample_interval: usize,
+        schema_tbs: HashMap<String, Vec<String>>,
+        sample_rate: Option<u8>,
+        parallel_size: usize,
+        parallel_type: RdbParallelType,
         batch_size: usize,
+        partition_cols: String,
     },
 
     PgCdc {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         slot_name: String,
         pub_name: String,
         start_lsn: String,
@@ -74,19 +97,26 @@ pub enum ExtractorConfig {
 
     PgCheck {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         check_log_dir: String,
         batch_size: usize,
     },
 
     MongoSnapshot {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         app_name: String,
         db: String,
         tb: String,
+        db_tbs: HashMap<String, Vec<String>>,
+        parallel_size: usize,
+        parallel_type: RdbParallelType,
+        batch_size: u32,
     },
 
     MongoCdc {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         app_name: String,
         resume_token: String,
         start_timestamp: u32,
@@ -98,6 +128,7 @@ pub enum ExtractorConfig {
 
     MongoCheck {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         app_name: String,
         check_log_dir: String,
         batch_size: usize,
@@ -105,11 +136,14 @@ pub enum ExtractorConfig {
 
     RedisSnapshot {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         repl_port: u64,
+        is_cluster: bool,
     },
 
     RedisCdc {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         repl_id: String,
         repl_offset: u64,
         repl_port: u64,
@@ -117,15 +151,18 @@ pub enum ExtractorConfig {
         heartbeat_interval_secs: u64,
         heartbeat_key: String,
         now_db_id: i64,
+        is_cluster: bool,
     },
 
     RedisSnapshotAndCdc {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         repl_id: String,
         repl_port: u64,
         keepalive_interval_secs: u64,
         heartbeat_interval_secs: u64,
         heartbeat_key: String,
+        is_cluster: bool,
     },
 
     RedisSnapshotFile {
@@ -134,12 +171,14 @@ pub enum ExtractorConfig {
 
     RedisScan {
         url: String,
+        connection_auth: ConnectionAuthConfig,
         scan_count: u64,
         statistic_type: String,
     },
 
     RedisReshard {
         url: String,
+        connection_auth: ConnectionAuthConfig,
     },
 
     Kafka {
@@ -155,15 +194,20 @@ pub enum ExtractorConfig {
         url: String,
         schema: String,
         tb: String,
+        schema_tbs: HashMap<String, Vec<String>>,
+        parallel_size: usize,
+        parallel_type: RdbParallelType,
         s3_config: S3Config,
         batch_size: usize,
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct BasicExtractorConfig {
     pub db_type: DbType,
     pub extract_type: ExtractType,
     pub url: String,
+    pub connection_auth: ConnectionAuthConfig,
     pub max_connections: u32,
+    pub rate_limiter: RateLimiterConfig,
 }

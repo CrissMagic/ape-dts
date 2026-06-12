@@ -1,0 +1,837 @@
+use anyhow::Context;
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use super::{
+    BoundedLineBuffer, CheckEntry, CheckInconsistency, Checker, CheckerStoreKey, DataChecker,
+    RecheckKey,
+};
+use crate::checker::check_log::{CheckLog, CheckSummaryLog, CheckTableSummaryLog};
+use crate::checker::state_store::{CheckerCheckpointCommit, CheckerStateRow};
+use dt_common::meta::{position::Position, row_data::RowData, row_type::RowType};
+use dt_common::{log_info, log_warn};
+
+#[derive(Serialize)]
+struct IdentityJsonPayload<'a> {
+    schema: &'a str,
+    tb: &'a str,
+    id_col_values: BTreeMap<&'a str, Option<&'a str>>,
+}
+
+pub(super) fn build_identity_json(entry: &CheckEntry) -> String {
+    serde_json::to_string(&IdentityJsonPayload {
+        schema: &entry.log.schema,
+        tb: &entry.log.tb,
+        id_col_values: entry
+            .log
+            .id_col_values
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_deref()))
+            .collect(),
+    })
+    .expect("identity json serialization should not fail")
+}
+
+pub(super) fn build_identity_key(entry: &CheckEntry) -> String {
+    hex::encode(openssl::sha::sha256(build_identity_json(entry).as_bytes()))
+}
+
+fn build_state_row(
+    store_key: &CheckerStoreKey,
+    entry: &CheckEntry,
+) -> anyhow::Result<CheckerStateRow> {
+    Ok(CheckerStateRow {
+        row_key: store_key.row_key,
+        identity_key: build_identity_key(entry),
+        payload: serde_json::to_string(&entry.key)?,
+    })
+}
+
+enum PreparedCheckpointWrite {
+    PositionOnly { task_id: String, position: Position },
+    Full { commit: CheckerCheckpointCommit },
+}
+
+impl<C: Checker> DataChecker<C> {
+    const DEFAULT_CDC_LOG_MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+    const DEFAULT_CDC_LOG_MAX_ROWS: usize = 1000;
+
+    /// Writes a point-in-time snapshot whose miss/diff counts reflect current unresolved entries rather than cumulative metrics.
+    pub async fn snapshot_and_output(&mut self) -> anyhow::Result<()> {
+        if self.init_failed {
+            log_warn!(
+                "Checker [{}] skipping latest snapshot publish because CDC state initialization failed",
+                self.name
+            );
+            return Ok(());
+        }
+        self.account_dropped_item_skips();
+        let max_file_size = usize::try_from(self.ctx.cdc_check_log_max_file_size)
+            .ok()
+            .filter(|v| *v > 0)
+            .unwrap_or(Self::DEFAULT_CDC_LOG_MAX_FILE_SIZE);
+        let max_rows = if self.ctx.cdc_check_log_max_rows == 0 {
+            Self::DEFAULT_CDC_LOG_MAX_ROWS
+        } else {
+            self.ctx.cdc_check_log_max_rows
+        };
+        let mut miss_buf_builder = BoundedLineBuffer::new(max_file_size, Some(max_rows));
+        let mut diff_buf_builder = BoundedLineBuffer::new(max_file_size, Some(max_rows));
+        let mut sql_buf_builder = BoundedLineBuffer::new(max_file_size, None);
+        let mut total_miss = 0usize;
+        let mut total_diff = 0usize;
+        let mut total_sql = 0usize;
+        let mut tables: HashMap<
+            (String, String, Option<String>, Option<String>),
+            CheckTableSummaryLog,
+        > = HashMap::new();
+        for table in &self.ctx.summary.tables {
+            let mut table = table.clone();
+            table.miss_count = 0;
+            table.diff_count = 0;
+            tables.insert(
+                (
+                    table.schema.clone(),
+                    table.tb.clone(),
+                    table.target_schema.clone(),
+                    table.target_tb.clone(),
+                ),
+                table,
+            );
+        }
+
+        let mut entries = self.store.iter().collect::<Vec<_>>();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (_, entry) in entries {
+            let table_key = (
+                entry.log.schema.clone(),
+                entry.log.tb.clone(),
+                entry.log.target_schema.clone(),
+                entry.log.target_tb.clone(),
+            );
+            let table = tables
+                .entry(table_key)
+                .or_insert_with(|| CheckTableSummaryLog {
+                    schema: entry.log.schema.clone(),
+                    tb: entry.log.tb.clone(),
+                    target_schema: entry.log.target_schema.clone(),
+                    target_tb: entry.log.target_tb.clone(),
+                    ..Default::default()
+                });
+            if entry.is_miss() {
+                if miss_buf_builder.push_json(&entry.log) {
+                    table.miss_count += 1;
+                    total_miss += 1;
+                }
+            } else if diff_buf_builder.push_json(&entry.log) {
+                table.diff_count += 1;
+                total_diff += 1;
+            }
+            if let Some(sql) = &entry.revise_sql {
+                total_sql += 1;
+                sql_buf_builder.push_str(sql);
+            }
+        }
+        let miss_buf = miss_buf_builder.into_bytes();
+        let diff_buf = diff_buf_builder.into_bytes();
+        let sql_buf = sql_buf_builder.into_bytes();
+
+        let summary = CheckSummaryLog {
+            start_time: self.ctx.summary.start_time.clone(),
+            end_time: chrono::Local::now().to_rfc3339(),
+            is_consistent: false,
+            checked_count: self.ctx.summary.checked_count,
+            miss_count: total_miss,
+            diff_count: total_diff,
+            skip_count: self.ctx.summary.skip_count,
+            sql_count: (total_sql > 0).then_some(total_sql),
+            tables: tables.into_values().collect(),
+        };
+        let mut summary = summary;
+        summary.is_consistent = super::is_summary_consistent(&summary, self.init_failed);
+        summary.sort_tables();
+        self.ctx.summary = summary.clone();
+        let summary_buf = serde_json::to_vec(&summary)?;
+        let write_optional_logs = self.optional_logs_dirty;
+
+        Self::write_to_disk(
+            &self.ctx.check_log_dir,
+            write_optional_logs,
+            &miss_buf,
+            &diff_buf,
+            &sql_buf,
+            &summary_buf,
+        )
+        .await?;
+        self.upload_to_s3(
+            write_optional_logs,
+            &miss_buf,
+            &diff_buf,
+            &sql_buf,
+            &summary_buf,
+        )
+        .await?;
+        if write_optional_logs {
+            self.optional_logs_dirty = false;
+        }
+
+        Ok(())
+    }
+
+    async fn write_to_disk(
+        dir: &str,
+        write_optional_logs: bool,
+        miss_buf: &[u8],
+        diff_buf: &[u8],
+        sql_buf: &[u8],
+        summary_buf: &[u8],
+    ) -> anyhow::Result<()> {
+        let path = std::path::Path::new(dir);
+        tokio::fs::create_dir_all(path).await?;
+        let mut summary_with_newline = summary_buf.to_vec();
+        summary_with_newline.push(b'\n');
+        if write_optional_logs {
+            Self::write_optional_log(&path.join("miss.log"), miss_buf).await?;
+            Self::write_optional_log(&path.join("diff.log"), diff_buf).await?;
+            Self::write_optional_log(&path.join("sql.log"), sql_buf).await?;
+        }
+        tokio::fs::write(path.join("summary.log"), summary_with_newline).await?;
+        Ok(())
+    }
+
+    async fn write_optional_log(path: &std::path::Path, buf: &[u8]) -> anyhow::Result<()> {
+        if !buf.is_empty() {
+            tokio::fs::write(path, buf).await?;
+            return Ok(());
+        }
+        if let Err(err) = tokio::fs::remove_file(path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+        Ok(())
+    }
+
+    fn build_dirty_state_rows(&self) -> anyhow::Result<Vec<CheckerStateRow>> {
+        self.dirty_upserts
+            .iter()
+            .filter_map(|store_key| {
+                self.store
+                    .get(store_key)
+                    .map(|entry| build_state_row(store_key, entry))
+            })
+            .collect()
+    }
+
+    pub fn restore_store_from_rows(&mut self, rows: Vec<CheckerStateRow>) -> anyhow::Result<()> {
+        self.store.clear();
+        let mut persisted_identity_keys = BTreeSet::new();
+        for row in rows {
+            persisted_identity_keys.insert(row.identity_key.clone());
+            let key = serde_json::from_str::<RecheckKey>(&row.payload).with_context(|| {
+                format!(
+                    "Checker [{}] failed to parse state row key [{}]",
+                    self.name, row.row_key
+                )
+            })?;
+            let entry = self.build_restored_entry(key.clone());
+            let store_key = CheckerStoreKey::new(&key.schema, &key.tb, row.row_key);
+            self.store.insert(store_key, entry);
+        }
+        self.persisted_identity_keys = Some(persisted_identity_keys);
+        self.update_pending_counter();
+        Ok(())
+    }
+
+    fn build_restored_entry(&self, key: RecheckKey) -> CheckEntry {
+        let lookup_row = key.to_lookup_row();
+        let source_row = if let Some(router) = &self.ctx.router {
+            router.reverse_route_row(lookup_row.clone())
+        } else {
+            lookup_row.clone()
+        };
+        let id_col_values = match source_row.row_type {
+            RowType::Delete => source_row.before.as_ref(),
+            _ => source_row.after.as_ref(),
+        }
+        .map(|values| {
+            values
+                .iter()
+                .map(|(col, value)| (col.clone(), value.to_option_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+        let schema_changed =
+            source_row.schema != lookup_row.schema || source_row.tb != lookup_row.tb;
+
+        CheckEntry {
+            key,
+            log: CheckLog {
+                schema: source_row.schema,
+                tb: source_row.tb,
+                target_schema: schema_changed.then_some(lookup_row.schema),
+                target_tb: schema_changed.then_some(lookup_row.tb),
+                id_col_values,
+                diff_col_values: HashMap::new(),
+                src_row: None,
+                dst_row: None,
+            },
+            revise_sql: None,
+            diff_cols: Some(Vec::new()),
+        }
+    }
+
+    async fn refetch_source_rows(&self, keys: &[RecheckKey]) -> anyhow::Result<Vec<RowData>> {
+        let source_checker = self
+            .ctx
+            .source_checker
+            .clone()
+            .context("missing source_checker for cdc recheck")?;
+        let lookup_rows = keys
+            .iter()
+            .map(RecheckKey::to_lookup_row)
+            .map(|row| {
+                if let Some(router) = &self.ctx.router {
+                    router.reverse_route_row(row)
+                } else {
+                    row
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut grouped = HashMap::<(&str, &str), Vec<&RowData>>::new();
+        for row in &lookup_rows {
+            grouped
+                .entry((row.schema.as_str(), row.tb.as_str()))
+                .or_default()
+                .push(row);
+        }
+
+        let mut checker = source_checker.lock().await;
+        let mut rows = Vec::new();
+        let mut groups = grouped.into_iter().collect::<Vec<_>>();
+        groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (_, group) in groups {
+            let first_row = group.first().context("checker group is empty")?;
+            let tb_meta = checker.load_table_meta(first_row).await?;
+            rows.extend(
+                checker
+                    .fetch_rows_by_keys(tb_meta, &group)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        if let Some(router) = &self.ctx.router {
+                            router.route_row(row)
+                        } else {
+                            row
+                        }
+                    }),
+            );
+        }
+        Ok(rows)
+    }
+
+    pub async fn load_initial_state(&mut self) -> anyhow::Result<bool> {
+        if let Some(state_store) = &self.ctx.state_store {
+            let task_id = &self.task_id;
+            let rows = state_store.load_rows(task_id).await.with_context(|| {
+                format!("failed to load checker state rows for task_id {}", task_id)
+            })?;
+            if !rows.is_empty() {
+                if let Some(expected) = &self.ctx.expected_resume_position {
+                    self.last_checkpoint_position = Some(expected.clone());
+                }
+                self.restore_store_from_rows(rows)?;
+                log_info!(
+                    "Checker [{}] restored {} store entries from state store",
+                    self.name,
+                    self.store.len()
+                );
+                return Ok(!self.store.is_empty());
+            }
+            self.persisted_identity_keys = Some(BTreeSet::new());
+        }
+        Ok(false)
+    }
+
+    pub async fn run_recheck(&mut self) -> anyhow::Result<()> {
+        let keys_for_recheck: Vec<RecheckKey> =
+            self.store.values().map(|entry| entry.key.clone()).collect();
+        if keys_for_recheck.is_empty() {
+            return Ok(());
+        }
+
+        log_info!(
+            "Checker [{}] enters RECHECKING, replay {} unresolved keys",
+            self.name,
+            keys_for_recheck.len()
+        );
+        let batch_size = self.ctx.batch_size.max(1);
+        for chunk in keys_for_recheck.chunks(batch_size) {
+            let mut grouped = HashMap::<(&str, &str), Vec<RecheckKey>>::new();
+            for key in chunk {
+                grouped
+                    .entry((key.schema.as_str(), key.tb.as_str()))
+                    .or_default()
+                    .push(key.clone());
+            }
+            let mut groups = grouped.into_iter().collect::<Vec<_>>();
+            groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (_, keys) in groups {
+                let lookup_rows = keys
+                    .iter()
+                    .map(RecheckKey::to_lookup_row)
+                    .collect::<Vec<_>>();
+                let lookup_refs = lookup_rows.iter().collect::<Vec<_>>();
+                let first_row = lookup_refs.first().context("checker group is empty")?;
+                let tb_meta = self.checker.load_table_meta(first_row).await?;
+                let target_rows = self
+                    .checker
+                    .fetch_rows_by_keys(tb_meta.clone(), &lookup_refs)
+                    .await?;
+                let source_rows = self.refetch_source_rows(&keys).await?;
+                let mut source_map = HashMap::new();
+                for row in source_rows {
+                    if let Some(row_key) = Self::lookup_match_key(&row, tb_meta.basic())? {
+                        source_map.insert(row_key, row);
+                    }
+                }
+                let mut target_map = HashMap::new();
+                for row in target_rows {
+                    if let Some(row_key) = Self::lookup_match_key(&row, tb_meta.basic())? {
+                        target_map.insert(row_key, row);
+                    }
+                }
+
+                for (key, lookup_row) in keys.iter().zip(lookup_rows.iter()) {
+                    let Some(row_key) = Self::lookup_match_key(lookup_row, tb_meta.basic())? else {
+                        continue;
+                    };
+                    match (source_map.remove(&row_key), target_map.remove(&row_key)) {
+                        (Some(source_row), Some(target_row)) => {
+                            if let Some(check_result) = Self::compare_src_dst(
+                                &source_row,
+                                Some(&target_row),
+                                tb_meta.as_ref(),
+                            )? {
+                                let entry = Self::build_check_entry(
+                                    check_result,
+                                    &source_row,
+                                    Some(&target_row),
+                                    &mut self.ctx,
+                                    tb_meta.as_ref(),
+                                )
+                                .await?;
+                                self.store_entry(lookup_row, row_key, entry).await;
+                            } else {
+                                self.remove_store_entry(lookup_row, row_key);
+                            }
+                        }
+                        (Some(source_row), None) => {
+                            let entry = Self::build_check_entry(
+                                CheckInconsistency::Miss,
+                                &source_row,
+                                None,
+                                &mut self.ctx,
+                                tb_meta.as_ref(),
+                            )
+                            .await?;
+                            self.store_entry(lookup_row, row_key, entry).await;
+                        }
+                        (None, Some(_)) => {
+                            let entry = self.build_restored_entry(key.clone());
+                            self.store_entry(lookup_row, row_key, entry).await;
+                        }
+                        (None, None) => {
+                            self.remove_store_entry(lookup_row, row_key);
+                        }
+                    }
+                }
+            }
+            if self.store_dirty {
+                if let Some(position) = self.last_checkpoint_position.clone() {
+                    self.record_checkpoint(position).await.with_context(|| {
+                        format!("Checker [{}] failed to persist recheck progress", self.name)
+                    })?;
+                    self.store_dirty = false;
+                }
+            }
+        }
+        log_info!("Checker [{}] RECHECKING finished", self.name);
+        Ok(())
+    }
+
+    fn prepare_checkpoint_write(
+        &self,
+        position: Position,
+    ) -> anyhow::Result<PreparedCheckpointWrite> {
+        if !self.store_dirty {
+            return Ok(PreparedCheckpointWrite::PositionOnly {
+                task_id: self.task_id.clone(),
+                position,
+            });
+        }
+
+        let rows = self.build_dirty_state_rows()?;
+        let deletes = self.dirty_deletes.values().cloned().collect();
+
+        Ok(PreparedCheckpointWrite::Full {
+            commit: CheckerCheckpointCommit {
+                task_id: self.task_id.clone(),
+                position,
+                upserts: rows,
+                deletes,
+            },
+        })
+    }
+
+    pub async fn record_checkpoint(&mut self, position: Position) -> anyhow::Result<()> {
+        if matches!(position, Position::None) {
+            return Ok(());
+        }
+        self.last_checkpoint_position = Some(position.clone());
+        if self.init_failed {
+            return Ok(());
+        }
+        let Some(state_store) = self.ctx.state_store.clone() else {
+            return Ok(());
+        };
+
+        let checkpoint_write = self.prepare_checkpoint_write(position)?;
+
+        match checkpoint_write {
+            PreparedCheckpointWrite::PositionOnly { task_id, position } => {
+                state_store.commit_position(&task_id, &position).await?;
+            }
+            PreparedCheckpointWrite::Full { commit } => {
+                state_store.commit_checkpoint(&commit).await?;
+                if let Some(persisted_identity_keys) = self.persisted_identity_keys.as_mut() {
+                    for identity_key in &commit.deletes {
+                        persisted_identity_keys.remove(identity_key);
+                    }
+                    for row in &commit.upserts {
+                        persisted_identity_keys.insert(row.identity_key.clone());
+                    }
+                }
+                self.store_dirty = false;
+                self.dirty_upserts.clear();
+                self.dirty_deletes.clear();
+            }
+        }
+        Ok(())
+    }
+
+    async fn upload_to_s3(
+        &mut self,
+        write_optional_logs: bool,
+        miss_buf: &[u8],
+        diff_buf: &[u8],
+        sql_buf: &[u8],
+        summary_buf: &[u8],
+    ) -> anyhow::Result<()> {
+        let Some((s3_client, key_prefix)) = &self.ctx.s3_output else {
+            return Ok(());
+        };
+        let miss_key = format!("{key_prefix}/miss.log");
+        let diff_key = format!("{key_prefix}/diff.log");
+        let summary_key = format!("{key_prefix}/summary.log");
+        let sql_key = format!("{key_prefix}/sql.log");
+        s3_client.write(&summary_key, summary_buf.to_vec()).await?;
+        if write_optional_logs {
+            Self::upload_optional_log(s3_client, &miss_key, miss_buf).await?;
+            Self::upload_optional_log(s3_client, &diff_key, diff_buf).await?;
+            Self::upload_optional_log(s3_client, &sql_key, sql_buf).await?;
+        }
+        Ok(())
+    }
+
+    async fn upload_optional_log(
+        s3_client: &opendal::Operator,
+        key: &str,
+        buf: &[u8],
+    ) -> anyhow::Result<()> {
+        if buf.is_empty() {
+            s3_client.delete(key).await?;
+        } else {
+            s3_client.write(key, buf.to_vec()).await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{CheckContext, Checker, CheckerIo, CheckerTbMeta, DataChecker};
+    use super::*;
+    use crate::checker::check_log::{CheckTableSummaryLog, DiffColValue};
+    use async_trait::async_trait;
+    use dt_common::{meta::col_value::ColValue, utils::limit_queue::LimitedQueue};
+    use opendal::{services::Memory, Operator};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
+
+    struct NoopChecker;
+
+    #[async_trait]
+    impl Checker for NoopChecker {
+        async fn load_table_meta(
+            &mut self,
+            _lookup_row: &RowData,
+        ) -> anyhow::Result<Arc<CheckerTbMeta>> {
+            unreachable!("snapshot_and_output tests should not load table meta")
+        }
+
+        async fn fetch_rows_by_keys(
+            &mut self,
+            _table_meta: Arc<CheckerTbMeta>,
+            _lookup_rows: &[&RowData],
+        ) -> anyhow::Result<Vec<RowData>> {
+            unreachable!("snapshot_and_output tests should not fetch rows")
+        }
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ape-dts-{name}-{nanos}"))
+    }
+
+    fn read_file(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    async fn read_s3(op: &Operator, key: &str) -> String {
+        String::from_utf8(op.read(key).await.unwrap().to_vec()).unwrap()
+    }
+
+    fn build_memory_operator() -> Operator {
+        Operator::new(Memory::default()).unwrap().finish()
+    }
+
+    fn build_cdc_checker(
+        check_log_dir: PathBuf,
+        s3_output: Option<(Operator, String)>,
+    ) -> DataChecker<NoopChecker> {
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        DataChecker::new(
+            NoopChecker,
+            "task-1".to_string(),
+            CheckContext {
+                is_cdc: true,
+                check_log_dir: check_log_dir.display().to_string(),
+                cdc_check_log_max_file_size: 1024,
+                cdc_check_log_max_rows: 100,
+                s3_output,
+                ..Default::default()
+            },
+            CheckerIo {
+                batch_queue: Arc::new(std::sync::Mutex::new(LimitedQueue::new(1))),
+                batch_notify: Arc::new(tokio::sync::Notify::new()),
+                dropped_items: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                control_rx,
+            },
+            "unit-test",
+        )
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_output_removes_stale_optional_logs_locally_and_on_s3_when_empty() {
+        let dir = unique_temp_dir("checker-empty-sql-local");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("miss.log"), "").unwrap();
+        fs::write(dir.join("diff.log"), "").unwrap();
+        fs::write(dir.join("sql.log"), "stale sql;\n").unwrap();
+        let op = build_memory_operator();
+        op.write("prefix/miss.log", "stale miss\n").await.unwrap();
+        op.write("prefix/diff.log", "stale diff\n").await.unwrap();
+        op.write("prefix/sql.log", "stale sql;\n").await.unwrap();
+        let mut checker = build_cdc_checker(dir.clone(), Some((op.clone(), "prefix".to_string())));
+
+        checker.snapshot_and_output().await.unwrap();
+
+        assert!(!dir.join("miss.log").exists());
+        assert!(!dir.join("diff.log").exists());
+        assert!(!dir.join("sql.log").exists());
+        assert!(op.stat("prefix/miss.log").await.is_err());
+        assert!(op.stat("prefix/diff.log").await.is_err());
+        assert!(op.stat("prefix/sql.log").await.is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_output_uploads_summary_only_when_optional_logs_are_clean() {
+        let dir = unique_temp_dir("checker-summary-only");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("miss.log"), "old miss\n").unwrap();
+        fs::write(dir.join("diff.log"), "old diff\n").unwrap();
+        fs::write(dir.join("sql.log"), "old sql;\n").unwrap();
+        let op = build_memory_operator();
+        op.write("prefix/miss.log", "old miss\n").await.unwrap();
+        op.write("prefix/diff.log", "old diff\n").await.unwrap();
+        op.write("prefix/sql.log", "old sql;\n").await.unwrap();
+        let mut checker = build_cdc_checker(dir.clone(), Some((op.clone(), "prefix".to_string())));
+        checker.optional_logs_dirty = false;
+        checker.ctx.summary.checked_count = 7;
+
+        checker.snapshot_and_output().await.unwrap();
+        assert_eq!(read_s3(&op, "prefix/miss.log").await, "old miss\n");
+        assert_eq!(read_s3(&op, "prefix/diff.log").await, "old diff\n");
+        assert_eq!(read_s3(&op, "prefix/sql.log").await, "old sql;\n");
+
+        op.write("prefix/miss.log", "remote miss\n").await.unwrap();
+        op.write("prefix/diff.log", "remote diff\n").await.unwrap();
+        op.write("prefix/sql.log", "remote sql;\n").await.unwrap();
+        checker.ctx.summary.checked_count = 8;
+        checker.snapshot_and_output().await.unwrap();
+
+        let summary: CheckSummaryLog =
+            serde_json::from_str(&read_file(&dir.join("summary.log"))).unwrap();
+        assert_eq!(summary.checked_count, 8);
+        assert_eq!(read_file(&dir.join("miss.log")), "old miss\n");
+        assert_eq!(read_file(&dir.join("diff.log")), "old diff\n");
+        assert_eq!(read_file(&dir.join("sql.log")), "old sql;\n");
+        assert_eq!(read_s3(&op, "prefix/miss.log").await, "remote miss\n");
+        assert_eq!(read_s3(&op, "prefix/diff.log").await, "remote diff\n");
+        assert_eq!(read_s3(&op, "prefix/sql.log").await, "remote sql;\n");
+        let s3_summary: CheckSummaryLog =
+            serde_json::from_str(&read_s3(&op, "prefix/summary.log").await).unwrap();
+        assert_eq!(s3_summary.checked_count, 8);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_output_uploads_dirty_s3_logs_when_counts_are_unchanged() {
+        let dir = unique_temp_dir("checker-same-count-s3");
+        let op = build_memory_operator();
+        let mut checker = build_cdc_checker(dir.clone(), Some((op.clone(), "prefix".to_string())));
+
+        let first_key = CheckerStoreKey::new("s1", "t1", 1);
+        checker.store.insert(
+            first_key,
+            CheckEntry {
+                key: RecheckKey {
+                    schema: "s1".to_string(),
+                    tb: "t1".to_string(),
+                    is_delete: false,
+                    pk: BTreeMap::from([("id".to_string(), ColValue::Long(1))]),
+                },
+                log: CheckLog {
+                    schema: "s1".to_string(),
+                    tb: "t1".to_string(),
+                    target_schema: None,
+                    target_tb: None,
+                    id_col_values: HashMap::from([("id".to_string(), Some("1".to_string()))]),
+                    diff_col_values: HashMap::new(),
+                    src_row: None,
+                    dst_row: None,
+                },
+                revise_sql: None,
+                diff_cols: None,
+            },
+        );
+
+        checker.snapshot_and_output().await.unwrap();
+        assert!(read_s3(&op, "prefix/miss.log").await.contains("\"1\""));
+
+        checker.store.clear();
+        checker.store.insert(
+            CheckerStoreKey::new("s1", "t1", 2),
+            CheckEntry {
+                key: RecheckKey {
+                    schema: "s1".to_string(),
+                    tb: "t1".to_string(),
+                    is_delete: false,
+                    pk: BTreeMap::from([("id".to_string(), ColValue::Long(2))]),
+                },
+                log: CheckLog {
+                    schema: "s1".to_string(),
+                    tb: "t1".to_string(),
+                    target_schema: None,
+                    target_tb: None,
+                    id_col_values: HashMap::from([("id".to_string(), Some("2".to_string()))]),
+                    diff_col_values: HashMap::new(),
+                    src_row: None,
+                    dst_row: None,
+                },
+                revise_sql: None,
+                diff_cols: None,
+            },
+        );
+        checker.optional_logs_dirty = true;
+
+        checker.snapshot_and_output().await.unwrap();
+
+        let miss_log = read_s3(&op, "prefix/miss.log").await;
+        assert!(miss_log.contains("\"2\""));
+        assert!(!miss_log.contains("\"1\""));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_output_recalculates_unresolved_table_counts() {
+        let dir = unique_temp_dir("checker-table-summary");
+        let mut checker = build_cdc_checker(dir.clone(), None);
+        checker.ctx.summary.tables.push(CheckTableSummaryLog {
+            schema: "s1".to_string(),
+            tb: "t1".to_string(),
+            checked_count: 3,
+            miss_count: 7,
+            diff_count: 9,
+            skip_count: 1,
+            ..Default::default()
+        });
+        checker.store.insert(
+            CheckerStoreKey::new("s1", "t1", 1),
+            CheckEntry {
+                key: RecheckKey {
+                    schema: "s1".to_string(),
+                    tb: "t1".to_string(),
+                    is_delete: false,
+                    pk: BTreeMap::from([("id".to_string(), ColValue::Long(1))]),
+                },
+                log: CheckLog {
+                    schema: "s1".to_string(),
+                    tb: "t1".to_string(),
+                    target_schema: None,
+                    target_tb: None,
+                    id_col_values: HashMap::from([("id".to_string(), Some("1".to_string()))]),
+                    diff_col_values: HashMap::from([(
+                        "name".to_string(),
+                        DiffColValue {
+                            src: Some("src".to_string()),
+                            dst: Some("dst".to_string()),
+                            src_type: None,
+                            dst_type: None,
+                        },
+                    )]),
+                    src_row: None,
+                    dst_row: None,
+                },
+                revise_sql: Some("UPDATE t1 SET name='src' WHERE id = 1;".to_string()),
+                diff_cols: Some(vec!["name".to_string()]),
+            },
+        );
+
+        checker.snapshot_and_output().await.unwrap();
+
+        let summary: CheckSummaryLog =
+            serde_json::from_str(&read_file(&dir.join("summary.log"))).unwrap();
+        assert_eq!(summary.miss_count, 0);
+        assert_eq!(summary.diff_count, 1);
+        assert_eq!(summary.sql_count, Some(1));
+        assert_eq!(summary.tables.len(), 1);
+        assert_eq!(summary.tables[0].checked_count, 3);
+        assert_eq!(summary.tables[0].miss_count, 0);
+        assert_eq!(summary.tables[0].diff_count, 1);
+        assert_eq!(summary.tables[0].skip_count, 1);
+        assert!(!dir.join("miss.log").exists());
+        assert_eq!(read_file(&dir.join("diff.log")).lines().count(), 1);
+        assert_eq!(read_file(&dir.join("sql.log")).lines().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

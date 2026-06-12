@@ -9,11 +9,6 @@ macro_rules! log_diff {
 }
 
 #[macro_export(local_inner_macros)]
-macro_rules! log_extra {
-    ($($arg:tt)+) => (log::log!(target: "extra_logger", log::Level::Info, $($arg)+));
-}
-
-#[macro_export(local_inner_macros)]
 macro_rules! log_position {
     ($($arg:tt)+) => (log::log!(target: "position_logger", log::Level::Info, $($arg)+));
 }
@@ -36,6 +31,11 @@ macro_rules! log_finished {
 #[macro_export(local_inner_macros)]
 macro_rules! log_sql {
     ($($arg:tt)+) => (log::log!(target: "sql_logger", log::Level::Info, $($arg)+));
+}
+
+#[macro_export(local_inner_macros)]
+macro_rules! log_summary {
+    ($($arg:tt)+) => (log::log!(target: "summary_logger", log::Level::Info, $($arg)+));
 }
 
 #[macro_export(local_inner_macros)]

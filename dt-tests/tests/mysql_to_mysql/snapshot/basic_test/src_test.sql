@@ -51,6 +51,12 @@ INSERT INTO test_db_1.one_pk_multi_uk VALUES (9, NULL, NULL, NULL, NULL, NULL, N
 INSERT INTO test_db_1.col_has_special_character_table VALUES(1, 'col:1:value', 'col&2:value', 'col\3:value');
 INSERT INTO test_db_1.col_has_special_character_table VALUES(2, NULL, NULL, NULL);
 
+INSERT INTO test_db_1.longtext_bin_collation_table VALUES(1, 'abc');
+INSERT INTO test_db_1.longtext_bin_collation_table VALUES(2, 'CaseSensitiveContent');
+
+INSERT INTO test_db_1.enum_set_bin_collation_table VALUES(1, 'small', 'a,b');
+INSERT INTO test_db_1.enum_set_bin_collation_table VALUES(2, 'large', '');
+
 -- min for each col
 INSERT INTO test_db_1.numeric_table VALUES(-128, 0, -32768, 0, -8388608, 0, -2147483648, 0, -9223372036854775808, 0);
 -- max for each col
@@ -89,3 +95,15 @@ INSERT INTO test_db_1.where_condition_3 VALUES(1, 1),(2, 2),(3, 3),(4, 4),(5, 5)
 -- test foreign key
 insert into test_db_1.fk_tb_2 VALUES(1,1,1,1),(2,2,2,2);
 insert into test_db_1.fk_tb_1 VALUES(1,1,1,1),(2,2,2,2);
+
+-- test composite primary key
+INSERT INTO test_db_1.composite_pk_table VALUES(1, '1', 1),(2, '2', 2),(3, '3', 3),(4, '4', 4),(5, '5', 5),(6, '6', 6),(7, '7', 7),(8, '8', 8),(9, '9', 9),(10, '10', 10);
+
+-- test non-nullable composite unique key
+INSERT INTO test_db_1.composite_unique_key_table VALUES(1, '1', 1),(2, '2', 2),(3, '3', 3),(4, '4', 4),(5, '5', 5),(6, '6', 6),(7, '7', 7),(8, '8', 8),(9, '9', 9),(10, '10', 10);
+
+--test nullable composite unique key
+INSERT INTO test_db_1.composite_unique_key_table_2 VALUES(1, '1', 1),(2, '2', 2),(3, '3', 3),(4, '4', 4),(5, '5', 5),(6, '6', 6),(7, NULL, 7),(8, '8', NULL),(9, 'null', NULL),(10, NULL, NULL),(NULL, NULL, NULL),(NULL, NULL, NULL);
+
+--test multi primary and single unique key
+INSERT INTO test_db_1.multi_primary_and_single_unique_table VALUES(1, '1', 1, '1', 1),(2, '2', 2, '2', 2),(3, '3', 3, '3', 3),(4, '4', 4, '4', 4),(5, '5', 5, '5', 5),(6, '6', 6, '6', 6),(7, '7', 7, '7', 7),(8, '8', 8, '8', 8),(9, '9', 9, '9', 9),(10, '10', 10, '10', 10);

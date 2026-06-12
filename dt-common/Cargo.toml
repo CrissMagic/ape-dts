@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 kafka = { workspace = true }
 apache-avro = {workspace = true}
 log = { workspace = true }
+log4rs = { workspace = true }
 redis = { workspace = true }
 mlua = { workspace = true }
 anyhow = { workspace = true }
@@ -48,3 +49,5 @@ dashmap = {workspace = true}
 actix-web = {workspace = true}
 prometheus = {version = "0.14.0", optional = true}
 base64 = {workspace = true}
+urlencoding= {workspace = true}
+governor = { workspace = true }

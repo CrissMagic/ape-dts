@@ -1,21 +1,17 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use kafka::producer::{Producer, Record};
 use tokio::time::Instant;
 
-use crate::{call_batch_fn, rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker};
 use dt_common::{
     config::message_format::MessageFormat,
     meta::{
-        avro::avro_converter::AvroConverter, 
-        json::json_converter::JsonConverter,
-        ddl_meta::ddl_data::DdlData, 
-        row_data::RowData
+        avro::avro_converter::AvroConverter, ddl_meta::ddl_data::DdlData,
+        json::json_converter::JsonConverter, row_data::RowData,
     },
-    monitor::monitor::Monitor,
     utils::limit_queue::LimitedQueue,
 };
+
+use crate::{call_batch_fn, rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker};
 
 pub struct KafkaSinker {
     pub batch_size: usize,
@@ -24,7 +20,7 @@ pub struct KafkaSinker {
     pub avro_converter: AvroConverter,
     pub json_converter: JsonConverter,
     pub message_format: MessageFormat,
-    pub monitor: Arc<Monitor>,
+    pub base_sinker: BaseSinker,
 }
 
 #[async_trait]
@@ -34,17 +30,14 @@ impl Sinker for KafkaSinker {
             return Ok(());
         }
 
-        match self.message_format {
+        match &self.message_format {
             MessageFormat::Avro => {
                 call_batch_fn!(self, data, Self::send_avro);
             }
-            MessageFormat::Json => {
+            MessageFormat::Json | MessageFormat::JsonTemplate(_) => {
                 call_batch_fn!(self, data, Self::send_json);
             }
-            MessageFormat::JsonTemplate(_) => {
-                call_batch_fn!(self, data, Self::send_json_template);
-            }
-        }
+        };
         Ok(())
     }
 
@@ -54,11 +47,11 @@ impl Sinker for KafkaSinker {
             let topic = self.router.get_topic(&ddl_data.default_schema, "");
             let payload = match &self.message_format {
                 MessageFormat::Avro => self.avro_converter.ddl_data_to_avro_value(ddl_data).await?,
-                MessageFormat::Json => self.json_converter.ddl_data_to_json_value(ddl_data).await?.into_bytes(),
-                MessageFormat::JsonTemplate(_template_type) => {
-                    // 对于 DDL 数据，暂时使用标准 JSON 格式
-                    self.json_converter.ddl_data_to_json_value(ddl_data).await?.into_bytes()
-                }
+                MessageFormat::Json | MessageFormat::JsonTemplate(_) => self
+                    .json_converter
+                    .ddl_data_to_json_value(ddl_data)
+                    .await?
+                    .into_bytes(),
             };
             messages.push(Record {
                 key: String::new(),
@@ -85,19 +78,19 @@ impl KafkaSinker {
         sinked_count: usize,
         batch_size: usize,
     ) -> anyhow::Result<()> {
+        let task_id = self
+            .base_sinker
+            .task_id_for_rows(&data[sinked_count..sinked_count + batch_size]);
+        self.base_sinker.ensure_monitor_for(&task_id);
         let mut data_size = 0;
 
         let mut messages = Vec::new();
         for row_data in data.iter_mut().skip(sinked_count).take(batch_size) {
-            data_size += row_data.data_size;
-
+            data_size += row_data.get_data_size();
             row_data.convert_raw_string();
             let topic = self.router.get_topic(&row_data.schema, &row_data.tb);
             let key = self.avro_converter.row_data_to_avro_key(row_data).await?;
-            let payload = self
-                .avro_converter
-                .row_data_to_avro_value(row_data.clone())
-                .await?;
+            let payload = self.avro_converter.row_data_to_avro_value(row_data).await?;
             messages.push(Record {
                 key,
                 value: payload,
@@ -106,20 +99,21 @@ impl KafkaSinker {
             });
         }
 
-        let start_time = Instant::now();
-        let mut rts = LimitedQueue::new(1);
-        self.producer.send_all(&messages)?;
         // TODO: Currently measuring RT for the entire message batch,
         //       as kafka producer involves internal per-broker merging logic,
         //       making it impossible to see individual broker RT. This can be optimized in the future.
+        let start_time = Instant::now();
+        let mut rts = LimitedQueue::new(1);
+        self.producer.send_all(&messages)?;
         rts.push((
             start_time.elapsed().as_millis() as u64,
             messages.len() as u64,
         ));
 
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, data_size as u64)
+        self.base_sinker
+            .update_batch_monitor_for(&task_id, batch_size as u64, data_size)
             .await?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await
+        self.base_sinker.update_monitor_rt_for(&task_id, &rts).await
     }
 
     async fn send_json(
@@ -128,12 +122,15 @@ impl KafkaSinker {
         sinked_count: usize,
         batch_size: usize,
     ) -> anyhow::Result<()> {
+        let task_id = self
+            .base_sinker
+            .task_id_for_rows(&data[sinked_count..sinked_count + batch_size]);
+        self.base_sinker.ensure_monitor_for(&task_id);
         let mut data_size = 0;
 
         let mut messages = Vec::new();
         for row_data in data.iter_mut().skip(sinked_count).take(batch_size) {
-            data_size += row_data.data_size;
-
+            data_size += row_data.get_data_size();
             row_data.convert_raw_string();
             let topic = self.router.get_topic(&row_data.schema, &row_data.tb);
             let key = self.json_converter.row_data_to_json_key(row_data).await?;
@@ -158,53 +155,9 @@ impl KafkaSinker {
             messages.len() as u64,
         ));
 
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, data_size as u64)
+        self.base_sinker
+            .update_batch_monitor_for(&task_id, batch_size as u64, data_size)
             .await?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await
-    }
-
-    async fn send_json_template(
-        &mut self,
-        data: &mut [RowData],
-        sinked_count: usize,
-        batch_size: usize,
-    ) -> anyhow::Result<()> {
-        let mut data_size = 0;
-
-        let mut messages = Vec::new();
-        for row_data in data.iter_mut().skip(sinked_count).take(batch_size) {
-            data_size += row_data.data_size;
-
-            row_data.convert_raw_string();
-            let topic = self.router.get_topic(&row_data.schema, &row_data.tb);
-            let key = self.json_converter.row_data_to_json_key(row_data).await?;
-            
-            // 根据消息格式选择相应的转换器
-            let payload = match &self.message_format {
-                MessageFormat::JsonTemplate(_template_type) => {
-                    self.json_converter.row_data_to_json_value(row_data.clone()).await?.into_bytes()
-                }
-                _ => unreachable!("This method should only be called for JsonTemplate format"),
-            };
-            
-            messages.push(Record {
-                key,
-                value: payload,
-                topic,
-                partition: -1,
-            });
-        }
-
-        let start_time = Instant::now();
-        let mut rts = LimitedQueue::new(1);
-        self.producer.send_all(&messages)?;
-        rts.push((
-            start_time.elapsed().as_millis() as u64,
-            messages.len() as u64,
-        ));
-
-        BaseSinker::update_batch_monitor(&self.monitor, batch_size as u64, data_size as u64)
-            .await?;
-        BaseSinker::update_monitor_rt(&self.monitor, &rts).await
+        self.base_sinker.update_monitor_rt_for(&task_id, &rts).await
     }
 }

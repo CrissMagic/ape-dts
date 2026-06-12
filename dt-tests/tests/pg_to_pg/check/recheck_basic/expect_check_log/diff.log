@@ -1,0 +1,1 @@
+{"schema":"public","tb":"recheck_table","id_col_values":{"id":"2"},"diff_col_values":{"name":{"src":"Bob","dst":"Eve"}}}

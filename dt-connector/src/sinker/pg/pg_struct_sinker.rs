@@ -1,24 +1,26 @@
+use async_trait::async_trait;
+use sqlx::{Pool, Postgres};
+
 use crate::{
-    close_conn_pool,
     rdb_router::RdbRouter,
-    sinker::base_struct_sinker::{BaseStructSinker, DBConnPool},
+    sinker::{
+        base_sinker::BaseSinker,
+        base_struct_sinker::{BaseStructSinker, DBConnPool},
+    },
     Sinker,
 };
-
 use dt_common::{
     config::config_enums::ConflictPolicyEnum, meta::struct_meta::struct_data::StructData,
     rdb_filter::RdbFilter,
 };
-
-use async_trait::async_trait;
-use sqlx::{Pool, Postgres};
 
 #[derive(Clone)]
 pub struct PgStructSinker {
     pub conn_pool: Pool<Postgres>,
     pub conflict_policy: ConflictPolicyEnum,
     pub filter: RdbFilter,
-    pub router: RdbRouter,
+    pub router: Option<RdbRouter>,
+    pub base_sinker: BaseSinker,
 }
 
 #[async_trait]
@@ -29,12 +31,13 @@ impl Sinker for PgStructSinker {
             &self.conflict_policy,
             data,
             &self.filter,
+            &self.base_sinker,
         )
         .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
-        return close_conn_pool!(self);
+        Ok(())
     }
 }
 

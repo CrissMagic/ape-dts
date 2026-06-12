@@ -7,7 +7,7 @@ use dt_common::{
 
 use crate::test_runner::redis_test_util::RedisTestUtil;
 
-use super::base_test_runner::BaseTestRunner;
+use super::base_test_runner::{BaseTestRunner, SqlLoadStrategy};
 
 pub struct RedisStatisticTestRunner {
     pub base: BaseTestRunner,
@@ -15,7 +15,10 @@ pub struct RedisStatisticTestRunner {
 
 impl RedisStatisticTestRunner {
     pub async fn new(relative_test_dir: &str) -> anyhow::Result<Self> {
-        let base = BaseTestRunner::new(relative_test_dir).await.unwrap();
+        let base =
+            BaseTestRunner::new_with_sql_load_strategy(relative_test_dir, SqlLoadStrategy::Line)
+                .await
+                .unwrap();
         Ok(Self { base })
     }
 
@@ -31,8 +34,15 @@ impl RedisStatisticTestRunner {
         let expect_statistic_file =
             format!("{}/expect_statistic_log/statistic.log", self.base.test_dir);
 
-        if let ExtractorConfig::RedisScan { url, .. } = self.base.get_config().extractor {
-            let mut src_conn = RedisUtil::create_redis_conn(&url).await.unwrap();
+        if let ExtractorConfig::RedisScan {
+            url,
+            connection_auth,
+            ..
+        } = self.base.get_config().extractor
+        {
+            let mut src_conn = RedisUtil::create_redis_conn(&url, &connection_auth)
+                .await
+                .unwrap();
             let redis_util = RedisTestUtil::new(vec![('"', '"')]);
             redis_util.execute_cmds(&mut src_conn, &self.base.src_prepare_sqls.clone());
             redis_util.execute_cmds(&mut src_conn, &self.base.src_test_sqls.clone());

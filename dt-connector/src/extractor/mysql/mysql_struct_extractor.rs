@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use sqlx::{MySql, Pool};
 
-use crate::close_conn_pool;
 use crate::{
-    extractor::base_extractor::BaseExtractor,
-    meta_fetcher::mysql::mysql_struct_fetcher::MysqlStructFetcher, Extractor,
+    extractor::base_extractor::{BaseExtractor, ExtractState},
+    meta_fetcher::mysql::mysql_struct_fetcher::MysqlStructFetcher,
+    Extractor,
 };
 use dt_common::{
     config::task_config::DEFAULT_DB_BATCH_SIZE,
@@ -20,6 +20,7 @@ use dt_common::{
 
 pub struct MysqlStructExtractor {
     pub base_extractor: BaseExtractor,
+    pub extract_state: ExtractState,
     pub conn_pool: Pool<MySql>,
     pub dbs: Vec<String>,
     pub filter: RdbFilter,
@@ -40,11 +41,13 @@ impl Extractor for MysqlStructExtractor {
             self.extract_internal(db_chunk.into_iter().collect())
                 .await?;
         }
-        self.base_extractor.wait_task_finish().await
+        self.base_extractor
+            .wait_task_finish(&mut self.extract_state)
+            .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
-        close_conn_pool!(self)
+        Ok(())
     }
 }
 
@@ -78,7 +81,9 @@ impl MysqlStructExtractor {
             schema: "".to_string(),
             statement,
         };
-        self.base_extractor.push_struct(struct_data).await
+        self.base_extractor
+            .push_struct(&mut self.extract_state, struct_data)
+            .await
     }
 
     pub fn validate_db_batch_size(db_batch_size: usize) -> anyhow::Result<usize> {
