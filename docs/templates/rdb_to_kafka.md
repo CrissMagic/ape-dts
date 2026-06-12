@@ -48,7 +48,12 @@ log4rs_file=./log4rs.yaml
 | :-------- | :-------- | :-------- | :-------- |
 | url | url of Kafka servers | 127.0.0.1:9093 | - |
 | with_field_defs | when sending data to Kafka in avro format, include the definitions of data fields or not | true | true |
-| message_format | message format for Kafka producer, supports "avro" and "json" | avro | avro |
+| message_format | message format for Kafka producer. Supports `avro`, `json`, `cloudcanal`, and `json_template:<type>` | avro | avro |
+| json_template | JSON template used when `message_format=json`. Supports `standard` and `cloudcanal` | cloudcanal | standard |
+
+CloudCanal JSON can be configured either as `message_format=cloudcanal`,
+`message_format=json_template:cloudcanal`, or `message_format=json` with
+`json_template=cloudcanal`.
 
 # MySQL CDC
 ```

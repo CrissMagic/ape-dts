@@ -1571,9 +1571,13 @@ dependencies = [
 name = "dt-main"
 version = "2.0.26"
 dependencies = [
+ "anyhow",
  "clap",
+ "configparser",
  "dt-precheck",
  "dt-task",
+ "percent-encoding",
+ "reqwest 0.11.22",
  "tokio",
 ]
 

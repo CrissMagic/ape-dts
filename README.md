@@ -49,6 +49,45 @@ The dt-main crate provides several optional components which can be enabled via 
 
 - TBD
 
+## Config source and startup arguments
+
+`dt-main` can load task configuration from a local INI file or from Nacos. Both
+sources are parsed into the same task configuration structures and support normal
+tasks and precheck flows.
+
+Arguments:
+
+- `--config-source`: config source, `local|nacos`, default `local`
+- `--config-path`: local INI file path; `--config` and one positional argument remain compatible
+- `--nacos-address`: required when the source is `nacos`, for example `http://nacos-host:8848`
+- `--nacos-dataid`: required when the source is `nacos`, mapped to the Nacos `dataId`
+- `--nacos-group`: optional when the source is `nacos`, default `DEFAULT_GROUP`
+
+Nacos filtering and cache behavior:
+
+- Only task configuration sections are loaded: `global`, `extractor`, `sinker`, `pipeline`, `parallelizer`, `runtime`, `filter`, `router`, `resumer`, `data_marker`, `processor`, `checker`, `metacenter`, `metrics`, `precheck`
+- Default cache directory: `.nacos_cache`, override with `NACOS_CACHE_DIR`
+- Default cache TTL: `300` seconds, override with `NACOS_CACHE_TTL_SECS`
+- Default Nacos request timeout: `10` seconds, override with `NACOS_REQUEST_TIMEOUT_SECS`
+- When fetching fails, or the fetched content cannot be parsed as a valid task config, an existing cache is used. Expired cache is still used and a warning is printed
+- When fetching fails and no usable cache exists, startup fails
+
+Examples:
+
+```bash
+# Local file, compatible with the legacy positional argument
+/ape-dts ./configs/task_mysql.ini
+
+# Local file, explicit argument
+/ape-dts --config-source local --config-path ./configs/task_mysql.ini
+
+# Load from Nacos
+/ape-dts --config-source nacos \
+  --nacos-address http://nacos-host:8848 \
+  --nacos-dataid task_pg.ini \
+  --nacos-group DEFAULT_GROUP
+```
+
 # Quick starts
 
 ## CLI

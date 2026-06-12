@@ -60,6 +60,21 @@ url=mysql://user1:abc%25%24%23%3F%40@127.0.0.1:3307?ssl-mode=disabled
 | replace         | 插入数据时，如果已存在于目标库，是否强行替换，适用于 mysql/pg 的全量/增量任务 | false                                                          | true                          |
 | is_cluster      | Redis 目标端是否为 Redis Cluster，仅在 `db_type=redis` 时有效                 | true                                                           | false                         |
 
+## Kafka 消息格式
+
+以下配置仅在 `[sinker].db_type=kafka` 时生效。
+
+| 配置            | 作用                                                                                  | 示例       | 默认     |
+| :-------------- | :------------------------------------------------------------------------------------ | :--------- | :------- |
+| with_field_defs | Avro 消息是否包含字段定义                                                             | true       | true     |
+| message_format  | Kafka 生产消息格式。支持：`avro`、`json`、`cloudcanal`、`json_template:<type>`         | cloudcanal | avro     |
+| json_template   | `message_format=json` 时使用的 JSON 模板。支持：`standard`、`cloudcanal`              | cloudcanal | standard |
+
+`message_format=cloudcanal` 等价于 `message_format=json_template:cloudcanal`。
+也可以使用 `message_format=json` 搭配 `json_template=cloudcanal`。`json_template`
+不影响 Avro 输出。CloudCanal 输出是 JSON payload，包含 `action`、`before`、`data`、
+`db`、`schema`、`table` 等字段。
+
 ## Redis 目标端集群模式
 
 - Redis 目标端为 Redis Cluster 时，设置 `[sinker].is_cluster=true`。

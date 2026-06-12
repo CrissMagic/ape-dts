@@ -12,7 +12,14 @@ pub struct PrecheckTaskConfig {
 
 impl PrecheckTaskConfig {
     pub fn new(task_config_file: &str) -> anyhow::Result<Self> {
-        let ini = IniLoader::new(task_config_file).ini;
+        Self::new_with_ini(IniLoader::new(task_config_file).ini)
+    }
+
+    pub fn new_from_str(config_str: &str) -> anyhow::Result<Self> {
+        Self::new_with_ini(IniLoader::new_from_str(config_str).ini)
+    }
+
+    fn new_with_ini(ini: Ini) -> anyhow::Result<Self> {
         let precheck_config = Self::load_precheck_config(&ini)?;
         Ok(Self {
             precheck: precheck_config,

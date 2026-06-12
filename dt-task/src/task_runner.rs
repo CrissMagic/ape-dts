@@ -128,6 +128,16 @@ impl TaskRunner {
     pub fn new(task_config_file: &str) -> anyhow::Result<Self> {
         let config = TaskConfig::new(task_config_file)
             .with_context(|| format!("invalid configs in [{}]", task_config_file))?;
+        Self::new_with_config(config)
+    }
+
+    pub fn new_from_str(config_str: &str) -> anyhow::Result<Self> {
+        let config =
+            TaskConfig::new_from_str(config_str).context("invalid configs from config string")?;
+        Self::new_with_config(config)
+    }
+
+    fn new_with_config(config: TaskConfig) -> anyhow::Result<Self> {
         let task_type = config.task_type();
         #[cfg(not(feature = "metrics"))]
         let task_monitor = Arc::new(TaskMonitor::new(task_type));

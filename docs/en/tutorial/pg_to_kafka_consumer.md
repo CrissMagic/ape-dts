@@ -9,13 +9,18 @@ Refer to [Send data to Kafka](/docs/en/consumer/kafka_consumer.md) for consumers
 
 # Message Format Support
 
-APE DTS supports two message formats when sending data to Kafka:
-- **Avro format** (default): Binary format with schema registry support
-- **JSON format**: Human-readable JSON format
+APE DTS supports these message formats when sending data to Kafka:
+- **Avro format** (default): binary payload.
+- **Standard JSON format**: human-readable JSON payload.
+- **CloudCanal JSON format**: JSON payload with fields such as `action`, `before`, `data`, `db`, `schema`, and `table`.
 
 You can configure the message format using the `message_format` parameter in the `[sinker]` section:
 - `message_format=avro` (default)
 - `message_format=json`
+- `message_format=cloudcanal`
+- `message_format=json_template:cloudcanal`
+
+You can also use `message_format=json` with `json_template=cloudcanal`.
 
 # Prepare Postgres instance
 Refer to [pg to pg](./pg_to_pg.md)
@@ -46,7 +51,6 @@ db_type=kafka
 sink_type=write
 url=127.0.0.1:9093
 with_field_defs=true
-message_format=avro
 message_format=avro
 
 [filter]

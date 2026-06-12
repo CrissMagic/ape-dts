@@ -60,6 +60,21 @@ url=mysql://user1:abc%25%24%23%3F%40@127.0.0.1:3307?ssl-mode=disabled
 | replace         | when inserting data, whether to force replacement if data already exists in target database, used in snapshot/cdc tasks for MySQL/PG | false                                                          | true                                                    |
 | is_cluster      | whether the Redis target is a Redis Cluster, only valid when `db_type=redis`                                                         | true                                                           | false                                                   |
 
+## Kafka message format
+
+The following options are valid only when `[sinker].db_type=kafka`.
+
+| Config          | Description                                                                                           | Example               | Default  |
+| :-------------- | :---------------------------------------------------------------------------------------------------- | :-------------------- | :------- |
+| with_field_defs | whether Avro messages include field definitions                                                       | true                  | true     |
+| message_format  | Kafka producer message format. Supported values: `avro`, `json`, `cloudcanal`, `json_template:<type>` | cloudcanal            | avro     |
+| json_template   | JSON template used when `message_format=json`. Supported values: `standard`, `cloudcanal`             | cloudcanal            | standard |
+
+`message_format=cloudcanal` is a shorthand for `message_format=json_template:cloudcanal`.
+You can also use `message_format=json` with `json_template=cloudcanal`. `json_template`
+does not affect Avro output. CloudCanal output is a JSON payload with fields such as
+`action`, `before`, `data`, `db`, `schema`, and `table`.
+
 ## Redis target cluster mode
 
 - When the Redis target is a Redis Cluster, set `[sinker].is_cluster=true`.

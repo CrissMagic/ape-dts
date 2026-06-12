@@ -129,8 +129,14 @@ const RESUMER_CONNECTION_LIMIT_DEFAULT: usize = 5;
 
 impl TaskConfig {
     pub fn new(task_config_file: &str) -> anyhow::Result<Self> {
-        let loader = IniLoader::new(task_config_file);
+        Self::new_with_loader(IniLoader::new(task_config_file))
+    }
 
+    pub fn new_from_str(config_str: &str) -> anyhow::Result<Self> {
+        Self::new_with_loader(IniLoader::new_from_str(config_str))
+    }
+
+    fn new_with_loader(loader: IniLoader) -> anyhow::Result<Self> {
         let pipeline = Self::load_pipeline_config(&loader);
         let runtime = Self::load_runtime_config(&loader)?;
         let (sinker_basic, sinker) = Self::load_sinker_config(&loader)?;
