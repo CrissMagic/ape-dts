@@ -1687,6 +1687,7 @@ dependencies = [
  "anyhow",
  "clap",
  "configparser",
+ "dt-common",
  "dt-precheck",
  "dt-task",
  "percent-encoding",

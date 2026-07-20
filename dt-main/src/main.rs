@@ -3,6 +3,7 @@ use std::env;
 use clap::Parser;
 
 use config_source::{ConfigSourceKind, NacosConfig};
+use dt_common::config::task_config::TaskConfig;
 use dt_precheck::{
     config::task_config::PrecheckTaskConfig, do_precheck, do_precheck_with_config_str,
 };
@@ -95,7 +96,7 @@ impl Args {
 
 fn validate_config_str(config: &str) -> anyhow::Result<()> {
     if PrecheckTaskConfig::new_from_str(config).is_ok() {
-        return Ok(());
+        return TaskConfig::new_from_str(config).map(|_| ());
     }
     TaskRunner::new_from_str(config).map(|_| ())
 }
@@ -250,5 +251,13 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rejects_precheck_config_without_complete_task_config() {
+        let config = "[precheck]\ndo_struct_init=false\ndo_cdc=false\n";
+
+        assert!(PrecheckTaskConfig::new_from_str(config).is_ok());
+        assert!(validate_config_str(config).is_err());
     }
 }
