@@ -60,6 +60,7 @@ pub enum SinkerConfig {
         with_field_defs: bool,
         message_format: MessageFormat,
         json_template: JsonTemplateType,
+        skip_confirmed_noop_updates: bool,
     },
 
     Redis {

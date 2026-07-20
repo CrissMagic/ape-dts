@@ -201,6 +201,7 @@ impl SinkerUtil {
                 with_field_defs,
                 message_format,
                 json_template,
+                skip_confirmed_noop_updates,
             } => {
                 let router = RdbRouter::from_config_for_topic(
                     &config.router,
@@ -279,6 +280,8 @@ impl SinkerUtil {
                         avro_converter: avro_converter.clone(),
                         json_converter: json_converter.clone(),
                         message_format: message_format.clone(),
+                        source_db_type: config.extractor_basic.db_type.clone(),
+                        skip_confirmed_noop_updates,
                         base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
                     };
                     Self::push_sinker(&mut sub_sinkers, sinker);

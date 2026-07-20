@@ -1,0 +1,21 @@
+# CentOS 7 compatible build image with glibc 2.17.
+# Keep this separate from the Debian-based root Cross.toml because its pre-build
+# commands use apt-get and cannot run in the CentOS image.
+[build]
+default-target = "x86_64-unknown-linux-gnu"
+# CentOS 7 repositories are archived, and vendored OpenSSL requires IPC::Cmd.
+# The repository Cargo config also expects Debian-style prefixed binutils, so
+# expose aliases for the native CentOS x86_64 tools.
+pre-build = [
+    "sed -i /etc/yum.repos.d/*.repo -e 's!^mirrorlist!#mirrorlist!' -e 's!^#baseurl=http://mirror.centos.org/!baseurl=https://vault.centos.org/!'",
+    "sed -i 's/enabled=1/enabled=0/' /etc/yum/pluginconf.d/fastestmirror.conf",
+    "yum install -y perl-IPC-Cmd",
+    "yum clean all",
+    "ln -sf /usr/bin/gcc /usr/local/bin/x86_64-linux-gnu-gcc",
+    "ln -sf /usr/bin/g++ /usr/local/bin/x86_64-linux-gnu-g++",
+    "ln -sf /usr/bin/ar /usr/local/bin/x86_64-linux-gnu-ar",
+    "ln -sf /usr/bin/ranlib /usr/local/bin/x86_64-linux-gnu-ranlib",
+]
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5-centos@sha256:ab74248a187c565196542415b501e661f67635a3bebd20f9b80d5f186cb93e82"

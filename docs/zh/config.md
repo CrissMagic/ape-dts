@@ -79,12 +79,17 @@ Kafka extractor 使用显式 topic/partition assignment，不使用 consumer gro
 
 以下配置在 `[sinker].db_type=kafka` 时生效。
 
-| 配置             | 作用                                                                                                      | 示例 | 默认 |
-| :--------------- | :-------------------------------------------------------------------------------------------------------- | :--- | :--- |
-| ack_timeout_secs | producer 入队和等待交付结果的超时时间（秒）                                                              | 5    | 5    |
-| required_acks    | broker 确认模式：`none`、`one`、`all`；Kafka 原始转发只接受 `one` 和 `all`                                | all  | one  |
+| 配置                        | 作用                                                                                                      | 示例  | 默认 |
+| :-------------------------- | :-------------------------------------------------------------------------------------------------------- | :---- | :--- |
+| ack_timeout_secs            | producer 入队和等待交付结果的超时时间（秒）                                                              | 5     | 5    |
+| required_acks               | broker 确认模式：`none`、`one`、`all`；Kafka 原始转发只接受 `one` 和 `all`                                | all   | one  |
+| skip_confirmed_noop_updates | PG -> Kafka 时，是否跳过可确认没有实际字段变化的 UPDATE                                                  | false | true |
 
 `one` 等待分区 leader 确认；`all` 等待当前所有 ISR 副本确认，broker 的 `min.insync.replicas` 配置决定写入是否可以成功。生产环境对持久性要求更高时应使用 `all`。
+
+`skip_confirmed_noop_updates` 仅影响 PG -> Kafka，不影响 PG -> RDB、MySQL -> Kafka 或 Kafka -> Kafka 原始转发。默认值 `true` 只会跳过包含 `UnchangedToast`，且 `before` / `after` 中可比较的信息足以确认其余字段均未变化的 UPDATE；`before` 未覆盖 `after` 中某个非标记字段等无法确认的情况仍会发送。对于实际发送到 Kafka 的 PG 事件，`after` 中的 `UnchangedToast` 字段会被省略；配置为 `false` 时不跳过事件，但仍会省略这些标记字段。
+
+如果任务启用了 Lua processor，现有 Lua 转换会在事件到达 Kafka sinker 前将 `UnchangedToast` 转换为普通 `NULL`。此时 sinker 无法再识别该标记，因此不会按本配置跳过事件，输出也遵循 Lua 转换后的 `NULL` 值；本配置不改变 Lua 处理逻辑。
 
 ## Kafka 消息格式
 

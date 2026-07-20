@@ -50,6 +50,7 @@ log4rs_file=./log4rs.yaml
 | with_field_defs | when sending data to Kafka in avro format, include the definitions of data fields or not | true | true |
 | message_format | message format for Kafka producer. Supports `avro`, `json`, `cloudcanal`, and `json_template:<type>` | avro | avro |
 | json_template | JSON template used when `message_format=json`. Supports `standard` and `cloudcanal` | cloudcanal | standard |
+| skip_confirmed_noop_updates | for PG -> Kafka, skip UPDATE events confirmed to have no actual field changes | false | true |
 
 CloudCanal JSON can be configured either as `message_format=cloudcanal`,
 `message_format=json_template:cloudcanal`, or `message_format=json` with
@@ -136,6 +137,11 @@ topic_fanout_map=source.topic:target.a|target_b|target-c
 [parallelizer]
 parallel_type=serial
 parallel_size=1
+
+[runtime]
+log_dir=./logs/kafka-raw-partition-0
+log_level=info
+log4rs_file=./log4rs.yaml
 ```
 
 Kafka raw forwarding preserves the source key, payload, and headers, including a null key, null payload, or header with a null value. It does not decode or re-encode the payload. The source and target `url` values may point to the same or different Kafka clusters.
@@ -152,6 +158,8 @@ For each source message, every mapped target send is awaited. After all sends in
 Delivery is at-least-once. Restart resumes at the latest successfully committed group offset, so messages sent since that periodic commit may be duplicated. A new group without a committed offset starts from `latest` and does not automatically read historical messages. A shorter `ack_interval_secs` reduces the replay window but increases group-offset commit frequency.
 
 The first version supports only letters, digits, `.`, `_`, and `-` in Kafka topic names. It does not preserve the source partition or timestamp and does not support key/header rewriting, transactional producers, or exactly-once delivery.
+
+When using the binary package, follow [Linux binary packaging and deployment](../en/linux_binary_package.md). Keep the control-script log directory equal to `[runtime].log_dir`, and use a different log directory for each partition task.
 
 # Posgres Snapshot
 
@@ -177,3 +185,7 @@ url=postgres://postgres:postgres@127.0.0.1:5433/postgres?options[statement_timeo
 start_lsn=0/406DE430
 slot_name=ape_test
 ```
+
+For PG -> Kafka, `[sinker].skip_confirmed_noop_updates` defaults to `true`. It skips only UPDATE events containing `UnchangedToast` when the comparable `before` / `after` values are sufficient to confirm that all other fields are unchanged. Events that cannot be confirmed as no-ops are still sent. Sent PG events omit `UnchangedToast` fields from `after`; set the option to `false` to send confirmed no-op events as well. This option does not affect PG -> RDB.
+
+If the Lua processor is enabled, its existing conversion changes `UnchangedToast` to an ordinary `NULL` before the Kafka sinker sees the event. In that case this filter cannot identify or skip the event, and the emitted value follows the Lua output. The option does not change Lua behavior.

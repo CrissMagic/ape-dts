@@ -8,7 +8,7 @@ use rdkafka::{
 use tokio::time::{Duration, Instant};
 
 use dt_common::{
-    config::message_format::MessageFormat,
+    config::{config_enums::DbType, message_format::MessageFormat},
     meta::{
         avro::avro_converter::AvroConverter,
         ddl_meta::ddl_data::DdlData,
@@ -16,6 +16,7 @@ use dt_common::{
         json::json_converter::JsonConverter,
         kafka::kafka_message::KafkaMessage,
         row_data::RowData,
+        row_type::RowType,
     },
     utils::limit_queue::LimitedQueue,
 };
@@ -31,6 +32,8 @@ pub struct KafkaSinker {
     pub avro_converter: AvroConverter,
     pub json_converter: JsonConverter,
     pub message_format: MessageFormat,
+    pub source_db_type: DbType,
+    pub skip_confirmed_noop_updates: bool,
     pub base_sinker: BaseSinker,
 }
 
@@ -43,6 +46,13 @@ struct KafkaSinkMessage {
 #[async_trait]
 impl Sinker for KafkaSinker {
     async fn sink_dml(&mut self, mut data: Vec<RowData>, _batch: bool) -> anyhow::Result<()> {
+        data.retain_mut(|row_data| {
+            Self::prepare_row_for_send(
+                row_data,
+                &self.source_db_type,
+                self.skip_confirmed_noop_updates,
+            )
+        });
         if data.is_empty() {
             return Ok(());
         }
@@ -118,6 +128,40 @@ impl Sinker for KafkaSinker {
 }
 
 impl KafkaSinker {
+    fn prepare_row_for_send(
+        row_data: &mut RowData,
+        source_db_type: &DbType,
+        skip_confirmed_noop_updates: bool,
+    ) -> bool {
+        if source_db_type != &DbType::Pg {
+            return true;
+        }
+
+        let should_skip = skip_confirmed_noop_updates
+            && row_data.row_type == RowType::Update
+            && row_data.contains_unchanged_toast()
+            && match (&row_data.before, &row_data.after) {
+                (Some(before), Some(after)) => {
+                    before.keys().all(|col| after.contains_key(col))
+                        && after.iter().all(|(col, value)| {
+                            value.is_unchanged_toast()
+                                || before
+                                    .get(col)
+                                    .is_some_and(|before_value| before_value.is_same_value(value))
+                        })
+                }
+                _ => false,
+            };
+        if should_skip {
+            return false;
+        }
+
+        if let Some(after) = &mut row_data.after {
+            after.retain(|_, value| !value.is_unchanged_toast());
+        }
+        true
+    }
+
     async fn send_avro(
         &mut self,
         data: &mut [RowData],
@@ -284,5 +328,182 @@ impl KafkaSinker {
                 })
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use dt_common::{
+        config::config_enums::DbType,
+        meta::{col_value::ColValue, row_type::RowType},
+    };
+
+    use super::*;
+
+    #[test]
+    fn confirmed_unchanged_toast_update_is_not_sent() {
+        let before = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("name".to_string(), ColValue::String("same".to_string())),
+        ]);
+        let after = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("name".to_string(), ColValue::String("same".to_string())),
+            ("content".to_string(), ColValue::UnchangedToast),
+        ]);
+        let mut row_data = RowData::new(
+            "public".to_string(),
+            "items".to_string(),
+            0,
+            RowType::Update,
+            Some(before),
+            Some(after),
+        );
+
+        assert!(!KafkaSinker::prepare_row_for_send(
+            &mut row_data,
+            &DbType::Pg,
+            true
+        ));
+    }
+
+    #[test]
+    fn key_only_before_can_confirm_update_with_only_unchanged_toast_fields() {
+        let before = HashMap::from([("id".to_string(), ColValue::Long(1))]);
+        let after = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("content".to_string(), ColValue::UnchangedToast),
+        ]);
+        let mut row_data = RowData::new(
+            "public".to_string(),
+            "items".to_string(),
+            0,
+            RowType::Update,
+            Some(before),
+            Some(after),
+        );
+
+        assert!(!KafkaSinker::prepare_row_for_send(
+            &mut row_data,
+            &DbType::Pg,
+            true
+        ));
+    }
+
+    #[test]
+    fn changed_update_is_sent_without_unchanged_toast_fields() {
+        let before = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("name".to_string(), ColValue::String("before".to_string())),
+        ]);
+        let after = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("name".to_string(), ColValue::String("after".to_string())),
+            ("content".to_string(), ColValue::UnchangedToast),
+        ]);
+        let mut row_data = RowData::new(
+            "public".to_string(),
+            "items".to_string(),
+            0,
+            RowType::Update,
+            Some(before),
+            Some(after),
+        );
+
+        assert!(KafkaSinker::prepare_row_for_send(
+            &mut row_data,
+            &DbType::Pg,
+            true
+        ));
+        let after = row_data.require_after().unwrap();
+        assert_eq!(
+            after.get("name"),
+            Some(&ColValue::String("after".to_string()))
+        );
+        assert!(!after.contains_key("content"));
+    }
+
+    #[test]
+    fn update_with_incomplete_before_is_sent_without_unchanged_toast_fields() {
+        let before = HashMap::from([("id".to_string(), ColValue::Long(1))]);
+        let after = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("name".to_string(), ColValue::String("same".to_string())),
+            ("content".to_string(), ColValue::UnchangedToast),
+        ]);
+        let mut row_data = RowData::new(
+            "public".to_string(),
+            "items".to_string(),
+            0,
+            RowType::Update,
+            Some(before),
+            Some(after),
+        );
+
+        assert!(KafkaSinker::prepare_row_for_send(
+            &mut row_data,
+            &DbType::Pg,
+            true
+        ));
+        let after = row_data.require_after().unwrap();
+        assert_eq!(
+            after.get("name"),
+            Some(&ColValue::String("same".to_string()))
+        );
+        assert!(!after.contains_key("content"));
+    }
+
+    #[test]
+    fn filtering_disabled_sends_update_without_unchanged_toast_fields() {
+        let before = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("name".to_string(), ColValue::String("same".to_string())),
+        ]);
+        let after = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("name".to_string(), ColValue::String("same".to_string())),
+            ("content".to_string(), ColValue::UnchangedToast),
+        ]);
+        let mut row_data = RowData::new(
+            "public".to_string(),
+            "items".to_string(),
+            0,
+            RowType::Update,
+            Some(before),
+            Some(after),
+        );
+
+        assert!(KafkaSinker::prepare_row_for_send(
+            &mut row_data,
+            &DbType::Pg,
+            false
+        ));
+        assert!(!row_data.require_after().unwrap().contains_key("content"));
+    }
+
+    #[test]
+    fn non_pg_row_is_unchanged_by_pg_kafka_filter() {
+        let before = HashMap::from([("id".to_string(), ColValue::Long(1))]);
+        let after = HashMap::from([
+            ("id".to_string(), ColValue::Long(1)),
+            ("content".to_string(), ColValue::UnchangedToast),
+        ]);
+        let mut row_data = RowData::new(
+            "test_db".to_string(),
+            "items".to_string(),
+            0,
+            RowType::Update,
+            Some(before),
+            Some(after),
+        );
+
+        assert!(KafkaSinker::prepare_row_for_send(
+            &mut row_data,
+            &DbType::Mysql,
+            true
+        ));
+        assert!(row_data.require_after().unwrap().contains_key("content"));
     }
 }

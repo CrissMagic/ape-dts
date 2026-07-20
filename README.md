@@ -218,6 +218,10 @@ Refer to [test docs](./dt-tests/README.md) for details.
 - cargo build
 - [build images](./docs/en/build_images.md)
 
+### Linux binary packages
+
+See [Linux binary packaging and deployment](./docs/en/linux_binary_package.md) for build targets, package verification, and `ape-dts.sh` task management.
+
 ## Checklist
 
 - run `cargo clippy --all-targets --all-features --workspace` fix all clippy issues.

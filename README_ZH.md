@@ -215,6 +215,10 @@ Nacos 配置过滤与缓存：
 - cargo build
 - [生成镜像](./docs/en/build_images.md)
 
+### Linux 二进制打包
+
+构建目标、安装包校验及 `ape-dts.sh` 任务管理见 [Linux 二进制打包与部署](./docs/zh/linux_binary_package.md)。
+
 ## 检查列表
 
 - 执行 `cargo clippy --all-targets --all-features --workspace` 并修复所有警告

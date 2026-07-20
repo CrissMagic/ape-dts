@@ -79,12 +79,17 @@ Kafka extraction uses explicit topic/partition assignment rather than consumer g
 
 The following options are valid when `[sinker].db_type=kafka`.
 
-| Config           | Description                                                                                                                                    | Example | Default |
-| :--------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- | :------ | :------ |
-| ack_timeout_secs | producer enqueue/delivery timeout in seconds                                                                                                   | 5       | 5       |
-| required_acks    | broker acknowledgement mode: `none`, `one`, or `all`; Kafka raw forwarding accepts only `one` and `all`                                       | all     | one     |
+| Config                      | Description                                                                                                                                    | Example | Default |
+| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- | :------ | :------ |
+| ack_timeout_secs            | producer enqueue/delivery timeout in seconds                                                                                                   | 5       | 5       |
+| required_acks               | broker acknowledgement mode: `none`, `one`, or `all`; Kafka raw forwarding accepts only `one` and `all`                                       | all     | one     |
+| skip_confirmed_noop_updates | whether PG -> Kafka skips UPDATE events that can be confirmed to contain no actual field changes                                               | false   | true    |
 
 `one` waits for the partition leader. `all` waits for all current in-sync replicas; the broker's `min.insync.replicas` setting determines whether the write can succeed. `all` is the stronger production durability option.
+
+`skip_confirmed_noop_updates` affects only PG -> Kafka; it does not change PG -> RDB, MySQL -> Kafka, or Kafka -> Kafka raw forwarding. With the default `true`, an UPDATE is skipped only when it contains `UnchangedToast` and the comparable `before` / `after` values are sufficient to confirm that every other field is unchanged. An event is still sent when this cannot be confirmed, such as when `before` does not cover a non-marker field in `after`. For PG events that are sent to Kafka, `UnchangedToast` fields are omitted from `after`; setting this option to `false` disables event skipping but still omits those marker fields.
+
+When a task enables the Lua processor, the existing Lua conversion turns `UnchangedToast` into an ordinary `NULL` before the event reaches the Kafka sinker. The sinker can no longer identify the marker, so this option does not skip that event and the output follows the Lua-converted `NULL` value. This option does not change Lua processing behavior.
 
 ## Kafka message format
 

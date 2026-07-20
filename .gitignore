@@ -33,6 +33,7 @@ Session.vim
 /**/pkg/*
 
 /release
+/dist
 
 ## AI
 .cursor

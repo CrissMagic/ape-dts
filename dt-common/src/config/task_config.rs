@@ -1004,6 +1004,11 @@ impl TaskConfig {
                 with_field_defs: loader.get_with_default(SINKER, "with_field_defs", true),
                 message_format: loader.get_optional(SINKER, "message_format"),
                 json_template: loader.get_optional(SINKER, "json_template"),
+                skip_confirmed_noop_updates: loader.get_with_default(
+                    SINKER,
+                    "skip_confirmed_noop_updates",
+                    true,
+                ),
             },
 
             DbType::Redis => match sink_type {
@@ -1550,6 +1555,7 @@ mod tests {
     use crate::config::parallelizer_config::{
         ChunkPartitionerRebalanceCost, ChunkPartitionerRebalanceStrategy,
     };
+    use crate::config::sinker_config::SinkerConfig;
 
     use super::{CheckMode, ParallelType, TaskConfig, TaskKind, TaskType};
 
@@ -1961,6 +1967,62 @@ topic_fanout_map=source.topic:target.a|target_b
 parallel_type={parallel_type}
 "#
         )
+    }
+
+    fn pg_cdc_to_kafka_config(extra_sinker: &str) -> String {
+        format!(
+            r#"[extractor]
+db_type=pg
+extract_type=cdc
+url=postgres://postgres:postgres@127.0.0.1:5432/postgres
+start_lsn=0/406DE430
+slot_name=ape_test
+
+[sinker]
+db_type=kafka
+sink_type=write
+url=127.0.0.1:9092
+{extra_sinker}
+
+[router]
+topic_map=*.*:test
+
+[parallelizer]
+parallel_type=serial
+parallel_size=1
+"#
+        )
+    }
+
+    #[test]
+    fn pg_to_kafka_noop_update_filter_defaults_to_enabled() {
+        let config = TaskConfig::new_from_str(&pg_cdc_to_kafka_config(""))
+            .expect("PG to Kafka config should be valid");
+        let SinkerConfig::Kafka {
+            skip_confirmed_noop_updates,
+            ..
+        } = config.sinker
+        else {
+            panic!("expected Kafka sinker config");
+        };
+
+        assert!(skip_confirmed_noop_updates);
+    }
+
+    #[test]
+    fn pg_to_kafka_noop_update_filter_can_be_disabled() {
+        let config =
+            TaskConfig::new_from_str(&pg_cdc_to_kafka_config("skip_confirmed_noop_updates=false"))
+                .expect("PG to Kafka config should be valid");
+        let SinkerConfig::Kafka {
+            skip_confirmed_noop_updates,
+            ..
+        } = config.sinker
+        else {
+            panic!("expected Kafka sinker config");
+        };
+
+        assert!(!skip_confirmed_noop_updates);
     }
 
     fn kafka_raw_forward_config_with_required_acks(required_acks: &str) -> String {
