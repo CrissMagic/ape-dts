@@ -143,7 +143,7 @@ Nacos 配置过滤与缓存：
   - [增量数据转 sql](./docs/zh/cdc/to_sql.md)
   - [断点续传](./docs/zh/cdc/resume.md)
 - 自主消费任务
-  - [mysql/pg -> kafka -> 消费者](./docs/zh/consumer/kafka_consumer.md)
+  - [mysql/pg -> kafka 消费者与 kafka -> kafka 原始转发](./docs/zh/consumer/kafka_consumer.md)
 - 数据加工
   - [使用 Lua 加工数据](./docs/zh/etl/lua.md)
 - 监控
@@ -154,7 +154,7 @@ Nacos 配置过滤与缓存：
   - [pg -> pg](./docs/templates/pg_to_pg.md)
   - [mongo -> mongo](./docs/templates/mongo_to_mongo.md)
   - [redis -> redis](./docs/templates/redis_to_redis.md)
-  - [mysql/pg -> kafka](./docs/templates/rdb_to_kafka.md)
+  - [mysql/pg/kafka -> kafka](./docs/templates/rdb_to_kafka.md)
   - [mysql -> starrocks](./docs/templates/mysql_to_starrocks.md)
   - [mysql -> doris](./docs/templates/mysql_to_doris.md)
   - [mysql -> clickhouse](./docs/templates/mysql_to_clickhouse.md)

@@ -80,6 +80,7 @@ mod tests {
             tb_map: "".to_string(),
             col_map: "".to_string(),
             topic_map: "".to_string(),
+            topic_fanout_map: "".to_string(),
         };
         let mut generate_task_id = "".to_string();
         for _i in 0..10 {

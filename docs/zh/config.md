@@ -46,6 +46,21 @@ url=mysql://user1:abc%25%24%23%3F%40@127.0.0.1:3307?ssl-mode=disabled
 - `[extractor].url` 可以指向源端集群中任意可访问的节点。DTS 会通过 `CLUSTER NODES` 发现所有源端 master 节点，并为每个 master 启动一个 PSYNC extractor。
 - Redis 源端为单机实例时，省略 `is_cluster` 或设置为 `false`。
 
+## Kafka 源端
+
+以下配置在 `[extractor].db_type=kafka` 时生效。
+
+| 配置              | 作用                                                                                                                 | 示例                  | 默认 |
+| :---------------- | :------------------------------------------------------------------------------------------------------------------- | :-------------------- | :--- |
+| url               | 源 Kafka bootstrap servers                                                                                           | 127.0.0.1:9092        | -    |
+| group             | 消费源消息并持久化源 offset 的 consumer group                                                                        | ape_dts_raw_forward   | -    |
+| topic             | 源 Kafka topic                                                                                                       | source.topic          | -    |
+| partition         | 源分区；一个任务只消费一个明确分区                                                                                   | 0                     | 0    |
+| offset            | 起始 offset；原始转发必须为 `-1`，表示读取该 group 已提交的 offset；group 没有已提交 offset 时从 `latest` 开始       | -1                    | 0    |
+| ack_interval_secs | 同步提交最新已成功写入源 offset 的周期（秒）；原始转发必须显式配置为大于 `0`                                         | 5                     | 0    |
+
+Kafka extractor 使用显式 topic/partition assignment，不使用 consumer group rebalance。同一 `group`/`topic`/`partition` 不要同时运行多个任务实例。消费多个分区时，应为每个 partition 配置一个任务，并确保每个分区只有一个任务实例负责。
+
 # [sinker]
 
 | 配置            | 作用                                                                          | 示例                                                           | 默认                          |
@@ -59,6 +74,17 @@ url=mysql://user1:abc%25%24%23%3F%40@127.0.0.1:3307?ssl-mode=disabled
 | max_connections | 最大连接数                                                                    | 10                                                             | 目前是 10，未来可能会动态适配 |
 | replace         | 插入数据时，如果已存在于目标库，是否强行替换，适用于 mysql/pg 的全量/增量任务 | false                                                          | true                          |
 | is_cluster      | Redis 目标端是否为 Redis Cluster，仅在 `db_type=redis` 时有效                 | true                                                           | false                         |
+
+## Kafka producer 交付配置
+
+以下配置在 `[sinker].db_type=kafka` 时生效。
+
+| 配置             | 作用                                                                                                      | 示例 | 默认 |
+| :--------------- | :-------------------------------------------------------------------------------------------------------- | :--- | :--- |
+| ack_timeout_secs | producer 入队和等待交付结果的超时时间（秒）                                                              | 5    | 5    |
+| required_acks    | broker 确认模式：`none`、`one`、`all`；Kafka 原始转发只接受 `one` 和 `all`                                | all  | one  |
+
+`one` 等待分区 leader 确认；`all` 等待当前所有 ISR 副本确认，broker 的 `min.insync.replicas` 配置决定写入是否可以成功。生产环境对持久性要求更高时应使用 `all`。
 
 ## Kafka 消息格式
 
@@ -74,6 +100,8 @@ url=mysql://user1:abc%25%24%23%3F%40@127.0.0.1:3307?ssl-mode=disabled
 也可以使用 `message_format=json` 搭配 `json_template=cloudcanal`。`json_template`
 不影响 Avro 输出。CloudCanal 输出是 JSON payload，包含 `action`、`before`、`data`、
 `db`、`schema`、`table` 等字段。
+
+Kafka -> Kafka 原始转发不解码、不重新编码 payload，因此 `with_field_defs`、`message_format` 和 `json_template` 不影响原始转发消息。
 
 ## Redis 目标端集群模式
 
@@ -231,18 +259,21 @@ struct check 仅支持 standalone MySQL/PostgreSQL checker target。
 
 # [router]
 
-| 配置      | 作用                                                    | 示例                                                                         | 默认 |
-| :-------- | :------------------------------------------------------ | :--------------------------------------------------------------------------- | :--- |
-| db_map    | 库级映射                                                | db_1:dst_db_1,db_2:dst_db_2                                                  | -    |
-| tb_map    | 表级映射                                                | db_1.tb_1:dst_db_1.dst_tb_1,db_1.tb_2:dst_db_1.dst_tb_2                      | -    |
-| col_map   | 列级映射                                                | json:[{"db":"db_1","tb":"tb_1","col_map":{"f_0":"dst_f_0","f_1":"dst_f_1"}}] | -    |
-| topic_map | 表名 -> kafka topic 映射，适用于 mysql/pg -> kafka 任务 | \*.\*:default_topic,test_db_2.\*:topic2,test_db_2.tb_1:topic3                | \*   |
+| 配置             | 作用                                                                 | 示例                                                                         | 默认 |
+| :--------------- | :------------------------------------------------------------------- | :--------------------------------------------------------------------------- | :--- |
+| db_map           | 库级映射                                                             | db_1:dst_db_1,db_2:dst_db_2                                                  | -    |
+| tb_map           | 表级映射                                                             | db_1.tb_1:dst_db_1.dst_tb_1,db_1.tb_2:dst_db_1.dst_tb_2                      | -    |
+| col_map          | 列级映射                                                             | json:[{"db":"db_1","tb":"tb_1","col_map":{"f_0":"dst_f_0","f_1":"dst_f_1"}}] | -    |
+| topic_map        | 表名 -> kafka topic 映射，适用于 mysql/pg -> kafka 任务              | \*.\*:default_topic,test_db_2.\*:topic2,test_db_2.tb_1:topic3                | -    |
+| topic_fanout_map | 源 -> 多个 Kafka 目标 topic，适用于 mysql/pg -> kafka fanout 或 kafka -> kafka 原始转发 | \*.\*:topic_a\|topic_b,source.topic:target.a\|target_b                       | -    |
 
 ## 取值范围
 
 - 一个映射规则包括源和目标， 以 : 分隔。
 - 所有配置项均支持配置多条，如 db_map 可包含多个库映射，以 , 分隔。
 - col_map 是 JSON 格式，应包含 "json:" 前缀。
+- topic_fanout_map 使用 `source:target_topic_1|target_topic_2`。RDB -> Kafka fanout 时，source 是 `schema.table`、`schema.*` 或 `*.*`。Kafka -> Kafka 原始转发时，source 是完整 Kafka 源 topic；`.` 是 topic 名的一部分，不按库表分隔。
+- topic_fanout_map 的目标 topic 名第一版只支持字母、数字、`.`、`_`、`-`。包含 `:`、`,`、`|`、空白、空 target，或同一 source 下重复 target，都会配置失败。
 - 如果不配置，则默认 **源库/表/列** 与 **目标库/表/列** 一致，这也是大多数情况。
 
 ## 优先级
@@ -250,6 +281,19 @@ struct check 仅支持 standalone MySQL/PostgreSQL checker target。
 - tb_map > db_map。
 - col_map 只专注于 **列** 映射，而不做 **库/表** 映射。也就是说，如果某张表需要 **库 + 表 + 列** 映射，需先配置好 tb_map 或 db_map。
 - topic_map，test_db_2.tb_1:topic3 > test_db_2.\*:topic2 > \*.\*:default_topic。
+- topic_fanout_map 在 RDB -> Kafka fanout 中使用相同优先级：test_db_2.tb_1:topic3|topic4 > test_db_2.\*:topic2|topic3 > \*.\*:default_topic|topic_b。
+
+## Kafka fanout 和原始转发
+
+- RDB -> Kafka fanout 会对每条消息编码一次，然后把相同 key/value 发送到所有目标 topic。DML 使用 `schema.table > schema.* > *.*`，DDL 通过 `schema.*` 或 `*.*` 做 schema 级匹配。该路径第一版不生成 Kafka headers。
+- Kafka -> Kafka 原始转发会保留源消息的 key、value、headers，包括 null key 或 null payload，只改变目标 topic。
+- Kafka -> Kafka 原始转发的触发条件是 extractor 和 sinker 都配置 `db_type=kafka`，并且设置了 `topic_fanout_map`。该模式第一版要求 `[parallelizer].parallel_type=serial`、`[extractor].offset=-1` 和显式的 `[extractor].ack_interval_secs>0`，且不能配置 `[resumer]` section。
+- 原始转发的 `[sinker].required_acks` 只允许 `one` 或 `all`，未配置时沿用默认值 `one`；`none` 和其他值会配置失败，以避免在目标 broker 未确认消息时推进源 offset。
+- 每条源消息会逐个发送到所有映射的目标 topic，并等待每次交付结果。只有当前 pipeline 批次的全部目标发送成功后，源 offset `N` 才能成为最新可提交位点。
+- consumer 每隔 `ack_interval_secs` 将最新可提交源位点同步提交为 Kafka group offset `N+1`。任一目标发送、位点不匹配或 group offset 提交失败，任务都会报错退出。
+- 交付语义为 at-least-once。失败重启会从最近一次成功的周期性 group offset 提交位置继续，因此其后的消息可能重放，包括已经被部分或全部目标 topic 接收的消息。新 group 没有已提交 offset 时从 `latest` 开始消费。
+- `topic_fanout_map` 必须包含与 `[extractor].topic` 完全一致的 source。当前缺少该映射时，会在第一条源消息发送阶段报错。
+- 第一版每个任务只消费一个配置的源 partition，不支持 consumer group rebalance、key/header override、源 partition 保留、timestamp 保留、事务 producer 或 exactly-once。
 
 ## 通配符
 

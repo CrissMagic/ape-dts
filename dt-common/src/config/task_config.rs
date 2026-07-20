@@ -237,6 +237,15 @@ impl TaskConfig {
         }
         let resumer =
             Self::load_resumer_config(&loader, &runtime, &sinker_basic, checker.as_ref())?;
+        Self::validate_kafka_raw_forwarding(
+            &extractor_basic,
+            &extractor,
+            &sinker_basic,
+            &sinker,
+            &router,
+            &parallelizer,
+            &resumer,
+        )?;
         Ok(Self {
             global: Self::load_global_config(
                 &loader,
@@ -311,6 +320,90 @@ impl TaskConfig {
             target_db_type,
             self.checker.is_some(),
         )
+    }
+
+    pub fn is_kafka_raw_forwarding(&self) -> bool {
+        Self::is_kafka_raw_forwarding_config(
+            &self.extractor_basic,
+            &self.sinker_basic,
+            &self.router,
+        )
+    }
+
+    fn is_kafka_raw_forwarding_config(
+        extractor_basic: &BasicExtractorConfig,
+        sinker_basic: &BasicSinkerConfig,
+        router: &RouterConfig,
+    ) -> bool {
+        matches!(extractor_basic.db_type, DbType::Kafka)
+            && matches!(sinker_basic.db_type, DbType::Kafka)
+            && Self::router_topic_fanout_map_is_set(router)
+    }
+
+    fn router_topic_fanout_map_is_set(router: &RouterConfig) -> bool {
+        match router {
+            RouterConfig::Rdb {
+                topic_fanout_map, ..
+            } => !topic_fanout_map.trim().is_empty(),
+        }
+    }
+
+    fn validate_kafka_raw_forwarding(
+        extractor_basic: &BasicExtractorConfig,
+        extractor: &ExtractorConfig,
+        sinker_basic: &BasicSinkerConfig,
+        sinker: &SinkerConfig,
+        router: &RouterConfig,
+        parallelizer: &ParallelizerConfig,
+        resumer: &ResumerConfig,
+    ) -> anyhow::Result<()> {
+        if !Self::is_kafka_raw_forwarding_config(extractor_basic, sinker_basic, router) {
+            return Ok(());
+        }
+
+        let ExtractorConfig::Kafka {
+            offset,
+            ack_interval_secs,
+            ..
+        } = extractor
+        else {
+            bail!(Error::ConfigError(
+                "kafka->kafka raw forwarding requires a Kafka extractor configuration".into(),
+            ));
+        };
+        if *offset != -1 {
+            bail!(Error::ConfigError(
+                "kafka->kafka raw forwarding requires [extractor].offset=-1".into(),
+            ));
+        }
+        if *ack_interval_secs == 0 {
+            bail!(Error::ConfigError(
+                "kafka->kafka raw forwarding requires [extractor].ack_interval_secs>0".into(),
+            ));
+        }
+        let SinkerConfig::Kafka { required_acks, .. } = sinker else {
+            bail!(Error::ConfigError(
+                "kafka->kafka raw forwarding requires a Kafka sinker configuration".into(),
+            ));
+        };
+        if !matches!(required_acks.as_str(), "one" | "all") {
+            bail!(Error::ConfigError(
+                "kafka->kafka raw forwarding requires [sinker].required_acks=one or all".into(),
+            ));
+        }
+        if !matches!(resumer, ResumerConfig::Dummy) {
+            bail!(Error::ConfigError(
+                "kafka->kafka raw forwarding uses Kafka consumer group offsets and does not support [resumer]"
+                    .into(),
+            ));
+        }
+        if !matches!(parallelizer.parallel_type(), ParallelType::Serial) {
+            bail!(Error::ConfigError(
+                "config [router].topic_fanout_map for kafka->kafka raw forwarding requires [parallelizer].parallel_type=serial"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn checker_uses_inline_target(extract_type: &ExtractType, sink_type: &SinkType) -> bool {
@@ -1287,6 +1380,7 @@ impl TaskConfig {
             tb_map: loader.get_optional(ROUTER, "tb_map"),
             col_map: loader.get_optional(ROUTER, "col_map"),
             topic_map: loader.get_optional(ROUTER, "topic_map"),
+            topic_fanout_map: loader.get_optional(ROUTER, "topic_fanout_map"),
         })
     }
 
@@ -1841,6 +1935,118 @@ rebalance_strategy=auto_split
         ));
         assert_eq!(config.parallelizer.parallel_size(), 4);
         assert!(config.parallelizer.chunk_partitioner_rebalance().is_none());
+    }
+
+    fn kafka_raw_forward_config(parallel_type: &str) -> String {
+        format!(
+            r#"[extractor]
+db_type=kafka
+extract_type=cdc
+url=127.0.0.1:9092
+group=test_group
+topic=source.topic
+partition=0
+offset=-1
+ack_interval_secs=5
+
+[sinker]
+db_type=kafka
+sink_type=write
+url=127.0.0.1:9092
+
+[router]
+topic_fanout_map=source.topic:target.a|target_b
+
+[parallelizer]
+parallel_type={parallel_type}
+"#
+        )
+    }
+
+    fn kafka_raw_forward_config_with_required_acks(required_acks: &str) -> String {
+        kafka_raw_forward_config("serial").replace(
+            "[sinker]\ndb_type=kafka\nsink_type=write\nurl=127.0.0.1:9092",
+            &format!(
+                "[sinker]\ndb_type=kafka\nsink_type=write\nurl=127.0.0.1:9092\nrequired_acks={required_acks}"
+            ),
+        )
+    }
+
+    #[test]
+    fn kafka_raw_forwarding_requires_serial_parallelizer() {
+        let serial_config = load_temp_task_config(&kafka_raw_forward_config("serial"))
+            .expect("serial kafka raw forwarding config should be valid");
+        assert!(serial_config.is_kafka_raw_forwarding());
+        assert!(matches!(
+            serial_config.parallelizer.parallel_type(),
+            ParallelType::Serial
+        ));
+
+        let err = load_temp_task_config(&kafka_raw_forward_config("rdb_merge"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            err,
+            "config error: config [router].topic_fanout_map for kafka->kafka raw forwarding requires [parallelizer].parallel_type=serial"
+        );
+    }
+
+    #[test]
+    fn kafka_raw_forwarding_requires_group_offset_and_positive_ack_interval() {
+        let explicit_offset = kafka_raw_forward_config("serial").replace("offset=-1", "offset=0");
+        let err = load_temp_task_config(&explicit_offset)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            err,
+            "config error: kafka->kafka raw forwarding requires [extractor].offset=-1"
+        );
+
+        let zero_ack = kafka_raw_forward_config("serial")
+            .replace("ack_interval_secs=5", "ack_interval_secs=0");
+        let err = load_temp_task_config(&zero_ack).err().unwrap().to_string();
+        assert_eq!(
+            err,
+            "config error: kafka->kafka raw forwarding requires [extractor].ack_interval_secs>0"
+        );
+    }
+
+    #[test]
+    fn kafka_raw_forwarding_rejects_ape_dts_resumer() {
+        let config = format!(
+            "{}\n[resumer]\nresume_type=from_log\n",
+            kafka_raw_forward_config("serial")
+        );
+        let err = load_temp_task_config(&config).err().unwrap().to_string();
+
+        assert_eq!(
+            err,
+            "config error: kafka->kafka raw forwarding uses Kafka consumer group offsets and does not support [resumer]"
+        );
+    }
+
+    #[test]
+    fn kafka_raw_forwarding_requires_broker_acknowledgement() {
+        for required_acks in ["one", "all"] {
+            load_temp_task_config(&kafka_raw_forward_config_with_required_acks(required_acks))
+                .unwrap_or_else(|err| {
+                    panic!("required_acks={required_acks} should be valid: {err}")
+                });
+        }
+
+        for required_acks in ["none", "invalid"] {
+            let err =
+                load_temp_task_config(&kafka_raw_forward_config_with_required_acks(required_acks))
+                    .err()
+                    .unwrap()
+                    .to_string();
+            assert_eq!(
+                err,
+                "config error: kafka->kafka raw forwarding requires [sinker].required_acks=one or all"
+            );
+        }
     }
 
     #[test]

@@ -5,13 +5,10 @@ use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 
 use crate::{
-    config::{json_template_type::JsonTemplateType},
+    config::json_template_type::JsonTemplateType,
     meta::{
-        col_value::ColValue,
-        ddl_meta::ddl_data::DdlData,
-        rdb_meta_manager::RdbMetaManager,
-        row_data::RowData,
-        row_type::RowType,
+        col_value::ColValue, ddl_meta::ddl_data::DdlData, rdb_meta_manager::RdbMetaManager,
+        row_data::RowData, row_type::RowType,
     },
 };
 
@@ -40,7 +37,10 @@ impl JsonConverter {
         database_name: Option<String>,
     ) -> Self {
         let cloudcanal_converter = match template_type {
-            JsonTemplateType::CloudCanal => Some(CloudCanalConverter::new(meta_manager.clone(), database_name)),
+            JsonTemplateType::CloudCanal => Some(CloudCanalConverter::new(
+                meta_manager.clone(),
+                database_name,
+            )),
             _ => None,
         };
 
@@ -105,11 +105,16 @@ impl JsonConverter {
 
     async fn standard_row_data_to_json_key(&mut self, row_data: &RowData) -> Result<String> {
         if let Some(meta_manager) = &mut self.meta_manager {
-            if let Ok(tb_meta) = meta_manager.get_tb_meta(&row_data.schema, &row_data.tb).await {
+            if let Ok(tb_meta) = meta_manager
+                .get_tb_meta(&row_data.schema, &row_data.tb)
+                .await
+            {
                 if let Some(primary_key) = tb_meta.key_map.get("primary") {
                     let mut key_values = Vec::new();
                     for pk_col in primary_key {
-                        if let Some(col_value) = row_data.after.as_ref().and_then(|after| after.get(pk_col)) {
+                        if let Some(col_value) =
+                            row_data.after.as_ref().and_then(|after| after.get(pk_col))
+                        {
                             key_values.push(col_value_to_json_value(col_value));
                         }
                     }
@@ -214,12 +219,13 @@ fn col_value_to_json_value(value: &ColValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::config_enums::DbType, meta::ddl_meta::ddl_type::DdlType};
     use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_row_data_to_json() {
         let mut json_converter = JsonConverter::new(None);
-        
+
         let mut after = HashMap::new();
         after.insert("id".to_string(), ColValue::Long(123));
         after.insert("name".to_string(), ColValue::String("test".to_string()));
@@ -228,18 +234,20 @@ mod tests {
         let row_data = RowData {
             schema: "test_schema".to_string(),
             tb: "test_table".to_string(),
+            chunk_id: 0,
             row_type: RowType::Insert,
             before: None,
             after: Some(after),
             data_size: 100,
+            is_not_origin: false,
         };
 
         let result = json_converter.row_data_to_json_value(row_data).await;
         assert!(result.is_ok());
-        
+
         let json_str = result.unwrap();
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
-        
+
         assert_eq!(parsed["operation"], "insert");
         assert_eq!(parsed["schema"], "test_schema");
         assert_eq!(parsed["tb"], "test_table");
@@ -249,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn test_ddl_data_to_json() {
         let mut json_converter = JsonConverter::new(None);
-        
+
         let ddl_data = DdlData {
             default_schema: "test_schema".to_string(),
             query: "CREATE TABLE test (id INT)".to_string(),
@@ -260,10 +268,10 @@ mod tests {
 
         let result = json_converter.ddl_data_to_json_value(ddl_data).await;
         assert!(result.is_ok());
-        
+
         let json_str = result.unwrap();
         let parsed: Value = serde_json::from_str(&json_str).unwrap();
-        
+
         assert_eq!(parsed["ddl"], true);
         assert_eq!(parsed["db_type"], "mysql");
         assert_eq!(parsed["schema"], "test_schema");

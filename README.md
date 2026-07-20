@@ -145,7 +145,7 @@ Refer to [test docs](./dt-tests/README.md) for details.
   - [generate sqls from CDC](./docs/en/cdc/to_sql.md)
   - [resume at breakpoint](./docs/en/cdc/resume.md)
 - Custom consumers
-  - [mysql/pg -> kafka -> consumer](./docs/en/consumer/kafka_consumer.md)
+  - [mysql/pg -> kafka consumer and kafka -> kafka raw forwarding](./docs/en/consumer/kafka_consumer.md)
 - Data processing
   - [modify data by lua](./docs/en/etl/lua.md)
 - Monitor
@@ -156,7 +156,7 @@ Refer to [test docs](./dt-tests/README.md) for details.
   - [pg -> pg](./docs/templates/pg_to_pg.md)
   - [mongo -> mongo](./docs/templates/mongo_to_mongo.md)
   - [redis -> redis](./docs/templates/redis_to_redis.md)
-  - [mysql/pg -> kafka](./docs/templates/rdb_to_kafka.md)
+  - [mysql/pg/kafka -> kafka](./docs/templates/rdb_to_kafka.md)
   - [mysql -> starrocks](./docs/templates/mysql_to_starrocks.md)
   - [mysql -> doris](./docs/templates/mysql_to_doris.md)
   - [mysql -> clickhouse](./docs/templates/mysql_to_clickhouse.md)

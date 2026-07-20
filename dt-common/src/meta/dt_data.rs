@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    ddl_meta::ddl_data::DdlData, foxlake::s3_file_meta::S3FileMeta, row_data::RowData,
-    struct_meta::struct_data::StructData,
+    ddl_meta::ddl_data::DdlData, foxlake::s3_file_meta::S3FileMeta,
+    kafka::kafka_message::KafkaMessage, row_data::RowData, struct_meta::struct_data::StructData,
 };
 use crate::meta::dcl_meta::dcl_data::DclData;
 use crate::meta::row_type::RowSqlType;
@@ -64,6 +64,10 @@ pub enum DtData {
     Foxlake {
         file_meta: S3FileMeta,
     },
+    #[serde(skip)]
+    KafkaRaw {
+        message: KafkaMessage,
+    },
 }
 
 impl DtData {
@@ -90,6 +94,7 @@ impl DtData {
             DtData::Ddl { ddl_data } => ddl_data.get_malloc_size(),
             DtData::Redis { entry } => entry.get_data_malloc_size() as u64,
             DtData::Foxlake { file_meta } => file_meta.data_size as u64,
+            DtData::KafkaRaw { message } => message.get_data_size(),
             // ignore other item types
             _ => 0,
         }
@@ -107,5 +112,28 @@ impl DtData {
 impl std::fmt::Display for DtData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", json!(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DtData, KafkaMessage};
+
+    #[test]
+    fn kafka_raw_data_has_one_count_and_message_size() {
+        let dt_data = DtData::KafkaRaw {
+            message: KafkaMessage {
+                topic: "source".to_string(),
+                partition: 0,
+                offset: 1,
+                key: Some(vec![1]),
+                payload: None,
+                headers: vec![("h".to_string(), Some(vec![2, 3]))],
+                position: String::new(),
+            },
+        };
+
+        assert_eq!(dt_data.get_data_count(), 1);
+        assert_eq!(dt_data.get_data_size(), 4);
     }
 }

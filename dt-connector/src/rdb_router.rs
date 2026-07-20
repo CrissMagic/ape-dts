@@ -9,7 +9,7 @@ use dt_common::{
     },
     utils::sql_util::SqlUtil,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dt_common::meta::{col_value::ColValue, row_data::RowData};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,10 @@ struct RdbRouterInner {
 struct RdbTopicRouterInner {
     // HashMap<(src_schema, src_tb), String>
     topic_map: HashMap<(String, String), String>,
+    // PG fanout: HashMap<(src_schema, src_tb), Vec<String>>
+    topic_fanout_map: HashMap<(String, String), Vec<String>>,
+    // Kafka raw fanout: HashMap<source_topic, Vec<String>>
+    kafka_topic_fanout_map: HashMap<String, Vec<String>>,
 }
 
 impl RdbRouter {
@@ -95,6 +99,14 @@ impl RdbRouter {
 
     pub fn get_topic<'a>(&'a self, schema: &str, tb: &str) -> &'a str {
         self.topic.get_topic(schema, tb)
+    }
+
+    pub fn get_fanout_topics(&self, schema: &str, tb: &str) -> &[String] {
+        self.topic.get_fanout_topics(schema, tb)
+    }
+
+    pub fn get_fanout_topics_for_kafka_topic(&self, source_topic: &str) -> &[String] {
+        self.topic.get_fanout_topics_for_kafka_topic(source_topic)
     }
 
     pub fn route_row(&self, row_data: RowData) -> RowData {
@@ -166,7 +178,11 @@ impl RdbRouter {
         Self {
             forward: inner,
             reverse,
-            topic: RdbTopicRouterInner { topic_map },
+            topic: RdbTopicRouterInner {
+                topic_map,
+                topic_fanout_map: HashMap::new(),
+                kafka_topic_fanout_map: HashMap::new(),
+            },
         }
     }
 }
@@ -450,9 +466,23 @@ impl RdbRouterInner {
 impl RdbTopicRouterInner {
     fn from_config(config: &RouterConfig, db_type: &DbType) -> anyhow::Result<Self> {
         match config {
-            RouterConfig::Rdb { topic_map, .. } => Ok(Self {
-                topic_map: Self::parse_topic_map(topic_map, db_type)?,
-            }),
+            RouterConfig::Rdb {
+                topic_map,
+                topic_fanout_map,
+                ..
+            } => {
+                let parsed_topic_map = Self::parse_topic_map(topic_map, db_type)?;
+                let (pg_fanout, kafka_fanout) = if topic_fanout_map.trim().is_empty() {
+                    (HashMap::new(), HashMap::new())
+                } else {
+                    Self::parse_topic_fanout_map(topic_fanout_map, db_type)?
+                };
+                Ok(Self {
+                    topic_map: parsed_topic_map,
+                    topic_fanout_map: pg_fanout,
+                    kafka_topic_fanout_map: kafka_fanout,
+                })
+            }
         }
     }
 
@@ -466,6 +496,26 @@ impl RdbTopicRouterInner {
         }
         // should always has a default topic map
         self.topic_map.get(&("*".into(), "*".into())).unwrap()
+    }
+
+    fn get_fanout_topics(&self, schema: &str, tb: &str) -> &[String] {
+        if let Some(topics) = self.topic_fanout_map.get(&(schema.into(), tb.into())) {
+            return topics;
+        }
+        if let Some(topics) = self.topic_fanout_map.get(&(schema.into(), "*".into())) {
+            return topics;
+        }
+        if let Some(topics) = self.topic_fanout_map.get(&("*".into(), "*".into())) {
+            return topics;
+        }
+        &[]
+    }
+
+    fn get_fanout_topics_for_kafka_topic(&self, source_topic: &str) -> &[String] {
+        self.kafka_topic_fanout_map
+            .get(source_topic)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     fn parse_topic_map(
@@ -484,6 +534,180 @@ impl RdbTopicRouterInner {
             i += 3;
         }
         Ok(topic_map)
+    }
+
+    fn parse_topic_fanout_map(
+        config_str: &str,
+        db_type: &DbType,
+    ) -> anyhow::Result<(
+        HashMap<(String, String), Vec<String>>,
+        HashMap<String, Vec<String>>,
+    )> {
+        let mut pg_fanout = HashMap::new();
+        let mut kafka_fanout = HashMap::new();
+
+        if config_str.trim().is_empty() {
+            return Ok((pg_fanout, kafka_fanout));
+        }
+
+        for mapping in config_str.split(',') {
+            let mapping = mapping.trim();
+            if mapping.is_empty() {
+                bail!("invalid topic_fanout_map entry: empty mapping");
+            }
+
+            let colon_pos = mapping
+                .find(':')
+                .ok_or_else(|| anyhow::anyhow!(
+                    "invalid topic_fanout_map entry '{}': missing ':' separator between source and targets",
+                    mapping
+                ))?;
+
+            let raw_source = &mapping[..colon_pos];
+            let source = raw_source.trim();
+            let targets_str = &mapping[colon_pos + 1..];
+
+            if source.is_empty() {
+                bail!(
+                    "invalid topic_fanout_map entry '{}': empty source topic",
+                    mapping
+                );
+            }
+            if raw_source != source || source.chars().any(char::is_whitespace) {
+                bail!(
+                    "invalid topic_fanout_map source '{}': whitespace is not supported",
+                    source
+                );
+            }
+
+            let targets = Self::parse_fanout_targets(targets_str, source)?;
+            match db_type {
+                DbType::Kafka => {
+                    let Some(kafka_key) = Self::parse_kafka_fanout_source(source)? else {
+                        bail!(
+                            "invalid topic_fanout_map source '{}': expected Kafka topic using [A-Za-z0-9._-]",
+                            source
+                        );
+                    };
+                    if kafka_fanout.contains_key(&kafka_key) {
+                        bail!(
+                            "invalid topic_fanout_map source '{}': duplicate source mapping",
+                            source
+                        );
+                    }
+                    kafka_fanout.insert(kafka_key, targets);
+                }
+                _ => {
+                    let Some(pg_key) = Self::parse_pg_fanout_source(source, db_type)? else {
+                        bail!(
+                            "invalid topic_fanout_map source '{}': expected RDB source schema.table/schema.*/*.*",
+                            source
+                        );
+                    };
+                    if pg_fanout.contains_key(&pg_key) {
+                        bail!(
+                            "invalid topic_fanout_map source '{}': duplicate source mapping",
+                            source
+                        );
+                    }
+                    pg_fanout.insert(pg_key, targets);
+                }
+            }
+        }
+
+        Ok((pg_fanout, kafka_fanout))
+    }
+
+    fn parse_pg_fanout_source(
+        source: &str,
+        db_type: &DbType,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let tokens = RdbRouterInner::parse_config(source, db_type)?;
+        if tokens.len() != 2 {
+            return Ok(None);
+        }
+        if !Self::is_valid_rdb_fanout_token(&tokens[0])
+            || !Self::is_valid_rdb_fanout_token(&tokens[1])
+        {
+            bail!(
+                "invalid topic_fanout_map RDB source '{}': wildcard must be exactly '*' and delimiters/whitespace are not supported",
+                source
+            );
+        }
+        Ok(Some((tokens[0].clone(), tokens[1].clone())))
+    }
+
+    fn parse_kafka_fanout_source(source: &str) -> anyhow::Result<Option<String>> {
+        if source.contains('*') {
+            return Ok(None);
+        }
+        if !Self::is_valid_kafka_topic_name(source) {
+            bail!(
+                "invalid topic_fanout_map Kafka source topic '{}': only [A-Za-z0-9._-] are allowed",
+                source
+            );
+        }
+        Ok(Some(source.to_string()))
+    }
+
+    fn parse_fanout_targets(targets_str: &str, source: &str) -> anyhow::Result<Vec<String>> {
+        if targets_str.is_empty() {
+            bail!(
+                "invalid topic_fanout_map for source '{}': empty target list",
+                source
+            );
+        }
+
+        let targets: Vec<&str> = targets_str.split('|').collect();
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+
+        for raw_target in targets {
+            let target = raw_target.trim();
+            if target.is_empty() {
+                bail!(
+                    "invalid topic_fanout_map for source '{}': empty target topic in list",
+                    source
+                );
+            }
+            if raw_target != target || target.chars().any(char::is_whitespace) {
+                bail!(
+                    "invalid topic_fanout_map target topic '{}': whitespace is not supported",
+                    target
+                );
+            }
+            if !Self::is_valid_kafka_topic_name(target) {
+                bail!(
+                    "invalid topic_fanout_map target topic '{}': only [A-Za-z0-9._-] are allowed",
+                    target
+                );
+            }
+            if !seen.insert(target.to_string()) {
+                bail!(
+                    "invalid topic_fanout_map for source '{}': duplicate target topic '{}'",
+                    source,
+                    target
+                );
+            }
+            result.push(target.to_string());
+        }
+
+        Ok(result)
+    }
+
+    fn is_valid_kafka_topic_name(topic: &str) -> bool {
+        !topic.is_empty()
+            && topic
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    }
+
+    fn is_valid_rdb_fanout_token(token: &str) -> bool {
+        !token.is_empty()
+            && (token == "*"
+                || !token.chars().any(|ch| {
+                    ch == '*' || ch == ':' || ch == ',' || ch == '|' || ch.is_whitespace()
+                }))
     }
 }
 
@@ -612,6 +836,7 @@ mod tests {
             tb_map: tb_map_str.into(),
             col_map: col_map_str.into(),
             topic_map: topic_map.into(),
+            topic_fanout_map: String::new(),
         };
         let router = RdbRouter::from_config(&config, &DbType::Mysql)
             .unwrap()
@@ -657,6 +882,7 @@ mod tests {
             tb_map: String::new(),
             col_map: String::new(),
             topic_map: "*.*:test".into(),
+            topic_fanout_map: String::new(),
         };
         let router = RdbRouter::from_config(&config, &DbType::Mysql).unwrap();
 
@@ -673,6 +899,179 @@ mod tests {
         assert_eq!(topic_router.get_col_map("src_db", "src_tb"), None);
         assert_eq!(topic_router.reverse_get_col_map("dst_db", "dst_tb"), None);
         assert_eq!(topic_router.get_topic("src_db", "src_tb"), "test");
+    }
+
+    #[test]
+    fn test_topic_fanout_map_keeps_topic_map_unchanged() {
+        let config = RouterConfig::Rdb {
+            schema_map: String::new(),
+            tb_map: String::new(),
+            col_map: String::new(),
+            topic_map: "*.*:default,db.*:schema_topic,db.tb:table_topic".into(),
+            topic_fanout_map:
+                "*.*:fanout_a|fanout_b,db.*:fanout_c|fanout_d,db.tb:fanout_e|fanout_f".into(),
+        };
+        let router = RdbRouter::from_config_for_topic(&config, &DbType::Pg).unwrap();
+
+        assert_eq!(router.get_topic("db", "tb"), "table_topic");
+        assert_eq!(router.get_topic("db", "other"), "schema_topic");
+        assert_eq!(router.get_topic("other", "tb"), "default");
+
+        assert_eq!(
+            router.get_fanout_topics("db", "tb"),
+            &["fanout_e".to_string(), "fanout_f".to_string()]
+        );
+        assert_eq!(
+            router.get_fanout_topics("db", "other"),
+            &["fanout_c".to_string(), "fanout_d".to_string()]
+        );
+        assert_eq!(
+            router.get_fanout_topics("other", "tb"),
+            &["fanout_a".to_string(), "fanout_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_pg_topic_fanout_targets_allow_dotted_kafka_topics() {
+        let config = RouterConfig::Rdb {
+            schema_map: String::new(),
+            tb_map: String::new(),
+            col_map: String::new(),
+            topic_map: "*.*:default".into(),
+            topic_fanout_map: "db.tb:target.a|target_b|target-c".into(),
+        };
+        let router = RdbRouter::from_config_for_topic(&config, &DbType::Pg).unwrap();
+
+        assert_eq!(
+            router.get_fanout_topics("db", "tb"),
+            &[
+                "target.a".to_string(),
+                "target_b".to_string(),
+                "target-c".to_string()
+            ]
+        );
+        assert!(router.get_fanout_topics_for_kafka_topic("db.tb").is_empty());
+    }
+
+    #[test]
+    fn test_kafka_topic_fanout_uses_full_dotted_source_topic() {
+        let config = RouterConfig::Rdb {
+            schema_map: String::new(),
+            tb_map: String::new(),
+            col_map: String::new(),
+            topic_map: "*.*:default".into(),
+            topic_fanout_map: "source.topic:target.a|target_b|target-c".into(),
+        };
+        let router = RdbRouter::from_config_for_topic(&config, &DbType::Kafka).unwrap();
+
+        assert_eq!(
+            router.get_fanout_topics_for_kafka_topic("source.topic"),
+            &[
+                "target.a".to_string(),
+                "target_b".to_string(),
+                "target-c".to_string()
+            ]
+        );
+        assert!(router
+            .get_fanout_topics_for_kafka_topic("source.topic.raw")
+            .is_empty());
+        assert!(router.get_fanout_topics("source", "topic").is_empty());
+    }
+
+    #[test]
+    fn test_kafka_source_topic_without_dot_does_not_become_pg_wildcard() {
+        let config = RouterConfig::Rdb {
+            schema_map: String::new(),
+            tb_map: String::new(),
+            col_map: String::new(),
+            topic_map: "*.*:default".into(),
+            topic_fanout_map: "source_topic:target_a|target_b".into(),
+        };
+        let router = RdbRouter::from_config_for_topic(&config, &DbType::Kafka).unwrap();
+
+        assert_eq!(
+            router.get_fanout_topics_for_kafka_topic("source_topic"),
+            &["target_a".to_string(), "target_b".to_string()]
+        );
+        assert!(router
+            .get_fanout_topics("any_schema", "any_table")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_topic_fanout_map_rejects_invalid_targets() {
+        for topic_fanout_map in [
+            "db.tb:",
+            "db.tb:target_a|",
+            "db.tb:target_a|target_a",
+            "db.tb:target a",
+            "db.tb:target:a",
+            "db.tb:target,a",
+        ] {
+            let config = RouterConfig::Rdb {
+                schema_map: String::new(),
+                tb_map: String::new(),
+                col_map: String::new(),
+                topic_map: "*.*:default".into(),
+                topic_fanout_map: topic_fanout_map.into(),
+            };
+
+            let err = RdbRouter::from_config_for_topic(&config, &DbType::Pg)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                err.contains("topic_fanout_map"),
+                "unexpected error for {topic_fanout_map}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_topic_fanout_map_rejects_empty_mapping_and_duplicate_source() {
+        for topic_fanout_map in [
+            ",",
+            "db.tb:target_a,",
+            "db.tb:target_a,,db.other:target_b",
+            "db.tb:target_a,db.tb:target_b",
+        ] {
+            let config = RouterConfig::Rdb {
+                schema_map: String::new(),
+                tb_map: String::new(),
+                col_map: String::new(),
+                topic_map: "*.*:default".into(),
+                topic_fanout_map: topic_fanout_map.into(),
+            };
+
+            let err = RdbRouter::from_config_for_topic(&config, &DbType::Pg)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                err.contains("topic_fanout_map"),
+                "unexpected error for {topic_fanout_map}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kafka_topic_fanout_map_rejects_duplicate_source() {
+        let config = RouterConfig::Rdb {
+            schema_map: String::new(),
+            tb_map: String::new(),
+            col_map: String::new(),
+            topic_map: "*.*:default".into(),
+            topic_fanout_map: "source.topic:target_a,source.topic:target_b".into(),
+        };
+
+        let err = RdbRouter::from_config_for_topic(&config, &DbType::Kafka)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("topic_fanout_map") && err.contains("duplicate source"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

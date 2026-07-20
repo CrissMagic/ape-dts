@@ -46,6 +46,21 @@ url=mysql://user1:abc%25%24%23%3F%40@127.0.0.1:3307?ssl-mode=disabled
 - `[extractor].url` can point to any reachable node in the source cluster. DTS discovers all source master nodes through `CLUSTER NODES` and starts one PSYNC extractor for each master.
 - For standalone Redis sources, omit `is_cluster` or set it to `false`.
 
+## Kafka source
+
+The following options are valid when `[extractor].db_type=kafka`.
+
+| Config            | Description                                                                                                                                                    | Example               | Default  |
+| :---------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------- | :------- |
+| url               | source Kafka bootstrap servers                                                                                                                                 | 127.0.0.1:9092        | -        |
+| group             | consumer group used to read and persist source offsets                                                                                                         | ape_dts_raw_forward   | -        |
+| topic             | source Kafka topic                                                                                                                                             | source.topic          | -        |
+| partition         | source partition; one task consumes exactly one partition                                                                                                      | 0                     | 0        |
+| offset            | start offset; raw forwarding requires `-1` so the committed group offset is used, or `latest` when the group has no committed offset                           | -1                    | 0        |
+| ack_interval_secs | interval in seconds for synchronously committing the latest successfully sunk source offset; raw forwarding requires a value greater than `0`                 | 5                     | 0        |
+
+Kafka extraction uses explicit topic/partition assignment rather than consumer group rebalancing. Do not run more than one task instance for the same `group`/`topic`/`partition`. To consume multiple partitions, configure one task for each partition and ensure each partition has only one owner.
+
 # [sinker]
 
 | Config          | Description                                                                                                                          | Example                                                        | Default                                                 |
@@ -59,6 +74,17 @@ url=mysql://user1:abc%25%24%23%3F%40@127.0.0.1:3307?ssl-mode=disabled
 | batch_size      | number of records written in a batch, 1 for serial                                                                                   | 200                                                            | 200                                                     |
 | replace         | when inserting data, whether to force replacement if data already exists in target database, used in snapshot/cdc tasks for MySQL/PG | false                                                          | true                                                    |
 | is_cluster      | whether the Redis target is a Redis Cluster, only valid when `db_type=redis`                                                         | true                                                           | false                                                   |
+
+## Kafka producer delivery
+
+The following options are valid when `[sinker].db_type=kafka`.
+
+| Config           | Description                                                                                                                                    | Example | Default |
+| :--------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- | :------ | :------ |
+| ack_timeout_secs | producer enqueue/delivery timeout in seconds                                                                                                   | 5       | 5       |
+| required_acks    | broker acknowledgement mode: `none`, `one`, or `all`; Kafka raw forwarding accepts only `one` and `all`                                       | all     | one     |
+
+`one` waits for the partition leader. `all` waits for all current in-sync replicas; the broker's `min.insync.replicas` setting determines whether the write can succeed. `all` is the stronger production durability option.
 
 ## Kafka message format
 
@@ -74,6 +100,8 @@ The following options are valid only when `[sinker].db_type=kafka`.
 You can also use `message_format=json` with `json_template=cloudcanal`. `json_template`
 does not affect Avro output. CloudCanal output is a JSON payload with fields such as
 `action`, `before`, `data`, `db`, `schema`, and `table`.
+
+Kafka -> Kafka raw forwarding does not decode or encode the payload, so `with_field_defs`, `message_format`, and `json_template` do not affect raw-forwarded messages.
 
 ## Redis target cluster mode
 
@@ -239,18 +267,21 @@ Used in: do_dbs, ignore_dbs, do_tbs and ignore_tbs.
 
 # [router]
 
-| Config    | Description                                                         | Example                                                                      | Default |
-| :-------- | :------------------------------------------------------------------ | :--------------------------------------------------------------------------- | :------ |
-| db_map    | database mapping                                                    | db_1:dst_db_1,db_2:dst_db_2                                                  | -       |
-| tb_map    | table mapping                                                       | db_1.tb_1:dst_db_1.dst_tb_1,db_1.tb_2:dst_db_1.dst_tb_2                      | -       |
-| col_map   | column mapping                                                      | json:[{"db":"db_1","tb":"tb_1","col_map":{"f_0":"dst_f_0","f_1":"dst_f_1"}}] | -       |
-| topic_map | table -> kafka topic mapping, for mysql/pg -> kafka tasks. required | \*.\*:default_topic,test_db_2.\*:topic2,test_db_2.tb_1:topic3                | -       |
+| Config           | Description                                                                  | Example                                                                      | Default |
+| :--------------- | :--------------------------------------------------------------------------- | :--------------------------------------------------------------------------- | :------ |
+| db_map           | database mapping                                                             | db_1:dst_db_1,db_2:dst_db_2                                                  | -       |
+| tb_map           | table mapping                                                                | db_1.tb_1:dst_db_1.dst_tb_1,db_1.tb_2:dst_db_1.dst_tb_2                      | -       |
+| col_map          | column mapping                                                               | json:[{"db":"db_1","tb":"tb_1","col_map":{"f_0":"dst_f_0","f_1":"dst_f_1"}}] | -       |
+| topic_map        | table -> kafka topic mapping, for mysql/pg -> kafka tasks                    | \*.\*:default_topic,test_db_2.\*:topic2,test_db_2.tb_1:topic3                | -       |
+| topic_fanout_map | source -> multiple Kafka target topics, for mysql/pg -> kafka fanout or kafka -> kafka raw forwarding | \*.\*:topic_a\|topic_b,source.topic:target.a\|target_b                       | -       |
 
 ## Values
 
 - A mapping rule consists of the source and target, which are separated by ":".
 - All configurations support multiple items, which are separated by ",". Example: db_map=db_1:dst_db_1,db_2:dst_db_2.
 - col_map value is in JSON format, it should starts with "json:".
+- topic_fanout_map uses `source:target_topic_1|target_topic_2`. For RDB -> Kafka fanout, source is `schema.table`, `schema.*`, or `*.*`. For Kafka -> Kafka raw forwarding, source is the full Kafka source topic; `.` is part of the topic name, not a separator.
+- topic_fanout_map target topic names support only letters, digits, `.`, `_`, and `-`. `:`, `,`, `|`, whitespace, empty targets, and duplicate targets under the same source are rejected.
 - If not set, data will be routed to the same databases/tables/columns with the source database.
 
 ## Priority
@@ -258,6 +289,19 @@ Used in: do_dbs, ignore_dbs, do_tbs and ignore_tbs.
 - tb_map > db_map.
 - col_map only works for column mapping. If a table needs database + table + column mapping, tb_map/db_map must be set.
 - topic_map: test_db_2.tb_1:topic3 > test_db_2.\*:topic2 > \*.\*:default_topic.
+- topic_fanout_map uses the same RDB priority for RDB -> Kafka fanout: test_db_2.tb_1:topic3|topic4 > test_db_2.\*:topic2|topic3 > \*.\*:default_topic|topic_b.
+
+## Kafka fanout and raw forwarding
+
+- RDB -> Kafka fanout encodes the message once and sends the same key/value to every target topic. DML uses `schema.table > schema.* > *.*`; DDL uses schema-level matching through `schema.*` or `*.*`. This path does not create Kafka headers.
+- Kafka -> Kafka raw forwarding preserves the source message key, value, and headers, including null key or null payload. It only changes the target topic.
+- Kafka -> Kafka raw forwarding is enabled when both extractor and sinker use `db_type=kafka` and `topic_fanout_map` is set. It requires `[parallelizer].parallel_type=serial`, `[extractor].offset=-1`, an explicit `[extractor].ack_interval_secs>0`, and no `[resumer]` section.
+- Raw forwarding allows `[sinker].required_acks` values `one` and `all` only, using the existing default `one` when omitted; `none` and other values are rejected so the source offset cannot advance before a target broker acknowledges the message.
+- Each source message is sent to every mapped target topic and each delivery result is awaited. Only after every target send in the completed pipeline batch succeeds can source offset `N` become the latest committable position.
+- Every `ack_interval_secs`, the consumer synchronously commits the latest committable source position as Kafka group offset `N+1`. A target send, position mismatch, or group-offset commit failure stops the task.
+- Delivery is at-least-once. Restart after a failure can replay all messages after the last successful periodic group-offset commit, including messages already accepted by some or all targets. A new group without a committed offset starts from `latest`.
+- `topic_fanout_map` must contain an exact source entry matching `[extractor].topic`. A missing entry currently fails when the first source message is sent.
+- The first version consumes one configured source partition per task and does not support consumer group rebalancing, key/header override, source partition preservation, timestamp preservation, transactions, or exactly-once semantics.
 
 ## Wildcard
 

@@ -675,6 +675,7 @@ impl ExtractorUtil {
             } => {
                 let meta_manager = TaskUtil::create_rdb_meta_manager(config).await?;
                 let avro_converter = AvroConverter::new(meta_manager, false);
+                let raw_forward = config.is_kafka_raw_forwarding();
                 let extractor = KafkaExtractor {
                     url,
                     group,
@@ -683,6 +684,7 @@ impl ExtractorUtil {
                     offset,
                     ack_interval_secs,
                     avro_converter,
+                    raw_forward,
                     syncer,
                     base_extractor,
                     extract_state,

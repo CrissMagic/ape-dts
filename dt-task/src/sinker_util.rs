@@ -2,6 +2,7 @@ use std::{str::FromStr, sync::Arc};
 
 use anyhow::{bail, Context};
 use kafka::producer::{Producer, RequiredAcks};
+use rdkafka::ClientConfig as KafkaClientConfig;
 use reqwest::{redirect::Policy, Url};
 use sqlx::types::chrono::Utc;
 use tokio::sync::{Mutex, RwLock};
@@ -217,12 +218,17 @@ impl SinkerUtil {
                     | ExtractorConfig::PgCdc { url, .. }
                     | ExtractorConfig::PgStruct { url, .. }
                     | ExtractorConfig::MysqlCdc { url, .. }
-                    | ExtractorConfig::MysqlCheck { url, .. } => Url::parse(&url)
-                        .ok()
-                        .and_then(|u| {
-                            let db = u.path().trim_start_matches('/').split('/').next().unwrap_or("");
+                    | ExtractorConfig::MysqlCheck { url, .. } => {
+                        Url::parse(&url).ok().and_then(|u| {
+                            let db = u
+                                .path()
+                                .trim_start_matches('/')
+                                .split('/')
+                                .next()
+                                .unwrap_or("");
                             (!db.is_empty()).then(|| db.to_string())
-                        }),
+                        })
+                    }
                     _ => None,
                 };
                 let template_type = match &message_format {
@@ -248,11 +254,28 @@ impl SinkerUtil {
                         .with_context(|| {
                             format!("failed to create kafka producer, url: [{}]", url)
                         })?;
+                    let mut raw_producer_config = KafkaClientConfig::new();
+                    let message_timeout_ms = (ack_timeout_secs * 1000).to_string();
+                    raw_producer_config.set("bootstrap.servers", url.as_str());
+                    raw_producer_config.set("message.timeout.ms", message_timeout_ms);
+                    raw_producer_config.set(
+                        "acks",
+                        match required_acks.as_str() {
+                            "all" => "all",
+                            "none" => "0",
+                            _ => "1",
+                        },
+                    );
+                    let raw_producer = raw_producer_config.create().with_context(|| {
+                        format!("failed to create rdkafka producer, url: [{}]", url)
+                    })?;
                     // the sending performance of RdkafkaSinker is much worse than KafkaSinker
                     let sinker = KafkaSinker {
                         batch_size,
                         router: router.clone(),
                         producer,
+                        raw_producer,
+                        raw_queue_timeout_secs: ack_timeout_secs,
                         avro_converter: avro_converter.clone(),
                         json_converter: json_converter.clone(),
                         message_format: message_format.clone(),

@@ -5,5 +5,6 @@ pub enum RouterConfig {
         tb_map: String,
         col_map: String,
         topic_map: String,
+        topic_fanout_map: String,
     },
 }

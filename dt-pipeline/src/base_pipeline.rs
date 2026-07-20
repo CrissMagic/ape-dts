@@ -347,7 +347,7 @@ impl BasePipeline {
                     continue;
                 }
 
-                DtData::Redis { .. } => {
+                DtData::Redis { .. } | DtData::KafkaRaw { .. } => {
                     last_received_position = Some(i.position.clone());
                     Self::collect_commit_position(&mut commit_positions, &i.position);
                     data_count += 1;
@@ -503,7 +503,9 @@ impl BasePipeline {
                     | SinkerConfig::Foxlake { .. } => return SinkMethod::Raw,
                     _ => return SinkMethod::Dml,
                 },
-                DtData::Redis { .. } | DtData::Foxlake { .. } => return SinkMethod::Raw,
+                DtData::Redis { .. } | DtData::Foxlake { .. } | DtData::KafkaRaw { .. } => {
+                    return SinkMethod::Raw
+                }
                 DtData::Begin {} | DtData::Commit { .. } | DtData::Heartbeat {} => continue,
             }
         }
@@ -659,6 +661,7 @@ mod tests {
 
     use dt_common::meta::{
         dt_data::{DtData, DtItem},
+        kafka::kafka_message::KafkaMessage,
         position::Position,
         redis::redis_entry::RedisEntry,
     };
@@ -688,6 +691,24 @@ mod tests {
         }
     }
 
+    fn kafka_raw_item(position: Position) -> DtItem {
+        DtItem {
+            dt_data: DtData::KafkaRaw {
+                message: KafkaMessage {
+                    topic: "source.topic".to_string(),
+                    partition: 0,
+                    offset: 42,
+                    key: None,
+                    payload: Some(vec![1, 2, 3]),
+                    headers: Vec::new(),
+                    position: position.to_string(),
+                },
+            },
+            position,
+            data_origin_node: String::new(),
+        }
+    }
+
     #[test]
     fn fetch_raw_collects_latest_position_per_redis_node() {
         let mut pending_snapshot_finished = HashMap::new();
@@ -710,5 +731,23 @@ mod tests {
             .collect();
         assert_eq!(by_key.get("redis-node-node-1"), Some(&node_1_new));
         assert_eq!(by_key.get("redis-node-node-2"), Some(&node_2));
+    }
+
+    #[test]
+    fn fetch_raw_collects_kafka_raw_position() {
+        let mut pending_snapshot_finished = HashMap::new();
+        let position = Position::Kafka {
+            topic: "source.topic".to_string(),
+            partition: 0,
+            offset: 42,
+        };
+        let data = vec![kafka_raw_item(position.clone())];
+
+        let (data_count, last_received_position, commit_positions) =
+            BasePipeline::fetch_raw(&data, &mut pending_snapshot_finished);
+
+        assert_eq!(data_count, 1);
+        assert_eq!(last_received_position, Some(position.clone()));
+        assert_eq!(commit_positions, vec![position]);
     }
 }
