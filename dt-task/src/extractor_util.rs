@@ -4,7 +4,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -16,9 +16,9 @@ use dt_common::{
     },
     meta::{
         avro::avro_converter::AvroConverter, dt_queue::DtQueue,
-        mongo::mongo_cdc_source::MongoCdcSource, mysql::mysql_meta_manager::MysqlMetaManager,
-        pg::pg_meta_manager::PgMetaManager, rdb_meta_manager::RdbMetaManager,
-        redis::redis_statistic_type::RedisStatisticType, syncer::Syncer,
+        mysql::mysql_meta_manager::MysqlMetaManager, pg::pg_meta_manager::PgMetaManager,
+        rdb_meta_manager::RdbMetaManager, redis::redis_statistic_type::RedisStatisticType,
+        syncer::Syncer,
     },
     monitor::task_monitor_handle::TaskMonitorHandle,
     rdb_filter::RdbFilter,
@@ -30,11 +30,11 @@ use dt_connector::{
     extractor::{
         base_extractor::{BaseExtractor, ExtractState},
         extractor_monitor::ExtractorMonitor,
-        foxlake::foxlake_s3_extractor::FoxlakeS3Extractor,
         kafka::kafka_extractor::KafkaExtractor,
         mongo::{
             mongo_cdc_extractor::MongoCdcExtractor, mongo_check_extractor::MongoCheckExtractor,
             mongo_snapshot_extractor::MongoSnapshotExtractor,
+            mongo_struct_extractor::MongoStructExtractor,
         },
         mysql::{
             mysql_cdc_extractor::MysqlCdcExtractor,
@@ -377,6 +377,7 @@ impl ExtractorUtil {
                     base_extractor,
                     extract_state,
                     recovery,
+                    filter: filter.clone(),
                 };
                 Box::new(extractor)
             }
@@ -398,7 +399,7 @@ impl ExtractorUtil {
                     filter,
                     resume_token,
                     start_timestamp,
-                    source: MongoCdcSource::from_str(&source)?,
+                    source,
                     mongo_client,
                     app_name,
                     base_extractor,
@@ -426,6 +427,26 @@ impl ExtractorUtil {
                     batch_size,
                     base_extractor,
                     extract_state,
+                };
+                Box::new(extractor)
+            }
+
+            ExtractorConfig::MongoStruct {
+                dbs, db_batch_size, ..
+            } => {
+                let mongo_client = match extractor_client {
+                    ConnClient::MongoDB(mongo_client) => mongo_client,
+                    _ => bail!("connection pool not found"),
+                };
+                let db_batch_size_validated =
+                    MongoStructExtractor::validate_db_batch_size(db_batch_size)?;
+                let extractor = MongoStructExtractor {
+                    mongo_client,
+                    dbs,
+                    filter,
+                    base_extractor,
+                    extract_state,
+                    db_batch_size: db_batch_size_validated,
                 };
                 Box::new(extractor)
             }
@@ -484,6 +505,10 @@ impl ExtractorUtil {
                 repl_port,
                 is_cluster,
             } => {
+                let mut conn = RedisUtil::create_redis_conn(&url, &connection_auth)
+                    .await
+                    .context("failed to create Redis extractor connection")?;
+                let is_cluster = RedisUtil::is_redis_cluster(&mut conn, is_cluster);
                 if is_cluster {
                     let extractor = RedisClusterPsyncExtractor {
                         url,
@@ -538,6 +563,7 @@ impl ExtractorUtil {
                 connection_auth,
                 scan_count,
                 statistic_type,
+                ..
             } => {
                 let conn = RedisUtil::create_redis_conn(&url, &connection_auth).await?;
                 let statistic_type = RedisStatisticType::from_str(&statistic_type)?;
@@ -564,6 +590,10 @@ impl ExtractorUtil {
                 heartbeat_key,
                 is_cluster,
             } => {
+                let mut conn = RedisUtil::create_redis_conn(&url, &connection_auth)
+                    .await
+                    .context("failed to create Redis extractor connection")?;
+                let is_cluster = RedisUtil::is_redis_cluster(&mut conn, is_cluster);
                 if is_cluster {
                     let extractor = RedisClusterPsyncExtractor {
                         url,
@@ -613,6 +643,10 @@ impl ExtractorUtil {
                 heartbeat_key,
                 is_cluster,
             } => {
+                let mut conn = RedisUtil::create_redis_conn(&url, &connection_auth)
+                    .await
+                    .context("failed to create Redis extractor connection")?;
+                let is_cluster = RedisUtil::is_redis_cluster(&mut conn, is_cluster);
                 if is_cluster {
                     let extractor = RedisClusterPsyncExtractor {
                         url,
@@ -688,29 +722,6 @@ impl ExtractorUtil {
                     syncer,
                     base_extractor,
                     extract_state,
-                    recovery,
-                };
-                Box::new(extractor)
-            }
-
-            ExtractorConfig::FoxlakeS3 {
-                schema_tbs,
-                parallel_size,
-                s3_config,
-                batch_size,
-                parallel_type,
-                ..
-            } => {
-                let s3_client = TaskUtil::create_s3_client(&s3_config)?;
-                let extractor = FoxlakeS3Extractor {
-                    schema_tbs,
-                    s3_config,
-                    s3_client,
-                    base_extractor,
-                    extract_state,
-                    batch_size,
-                    parallel_size,
-                    parallel_type,
                     recovery,
                 };
                 Box::new(extractor)

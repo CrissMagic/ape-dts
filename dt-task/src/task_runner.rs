@@ -8,10 +8,13 @@ use std::{
     },
 };
 
+use crate::task_util::{ConnClient, TaskUtil};
 use anyhow::{bail, Context};
+use async_mutex::Mutex as AsyncMutex;
 use chrono::Local;
 use log4rs::config::{Config, Deserializers, RawConfig};
 use opendal::Operator;
+use std::sync::Mutex as StdMutex;
 use tokio::{
     fs::{self as tokio_fs, metadata, File},
     io::AsyncReadExt,
@@ -19,32 +22,24 @@ use tokio::{
     sync::{Mutex, RwLock},
     task::JoinSet,
 };
+use tokio_util::sync::CancellationToken;
 
-use super::{
-    extractor_util::ExtractorUtil, parallelizer_util::ParallelizerUtil, sinker_util::SinkerUtil,
-};
-use crate::task_util::{ConnClient, TaskUtil};
-use async_mutex::Mutex as AsyncMutex;
-use std::sync::Mutex as StdMutex;
-
-static LOG_HANDLE: StdMutex<Option<log4rs::Handle>> = StdMutex::new(None);
-use dt_common::log_filter::{parse_size_limit, SizeLimitFilterDeserializer};
 use dt_common::{
     config::{
         checker_config::CheckerConfig,
         config_enums::{DbType, ExtractType, PipelineType, SinkType, TaskKind, TaskType},
         config_token_parser::{ConfigTokenParser, TokenEscapePair},
         extractor_config::ExtractorConfig,
+        limiter_config::CapacityLimiterConfig,
         sinker_config::SinkerConfig,
         task_config::{TaskConfig, DEFAULT_CHECK_LOG_FILE_SIZE},
     },
     error::Error,
     limiter::buffer_limiter::BufferLimiter,
-    log_error, log_finished, log_info, log_warn,
-    meta::{
-        avro::avro_converter::AvroConverter, dt_queue::DtQueue, position::Position,
-        row_type::RowType, syncer::Syncer,
-    },
+    log_error,
+    log_filter::{parse_size_limit, SizeLimitFilterDeserializer},
+    log_finished, log_info, log_runtime_trace, log_warn,
+    meta::{dt_queue::DtQueue, position::Position, row_type::RowType, syncer::Syncer},
     monitor::{
         task_metrics::TaskMetricsType,
         task_monitor::{MonitorType, TaskMonitor},
@@ -52,6 +47,7 @@ use dt_common::{
         FlushableMonitor,
     },
     rdb_filter::RdbFilter,
+    runtime_trace,
     utils::sql_util::SqlUtil,
 };
 use dt_connector::{
@@ -67,13 +63,16 @@ use dt_connector::{
     sinker::base_sinker::BaseSinker,
     Extractor, Sinker,
 };
-use dt_pipeline::{
-    base_pipeline::BasePipeline, http_server_pipeline::HttpServerPipeline,
-    lua_processor::LuaProcessor, Pipeline,
+use dt_pipeline::{base_pipeline::BasePipeline, lua_processor::LuaProcessor, Pipeline};
+
+use super::{
+    extractor_util::ExtractorUtil, parallelizer_util::ParallelizerUtil, sinker_util::SinkerUtil,
 };
 
 #[cfg(feature = "metrics")]
 use dt_common::monitor::prometheus_metrics::PrometheusMetrics;
+
+static LOG_HANDLE: StdMutex<Option<log4rs::Handle>> = StdMutex::new(None);
 
 #[derive(Clone)]
 pub struct TaskInfo {
@@ -162,6 +161,9 @@ impl TaskRunner {
     pub async fn start_task(&self, is_init: bool) -> anyhow::Result<()> {
         self.clear_check_logs().await?;
         self.init_log4rs().await?;
+        runtime_trace::init_tracing();
+        runtime_trace::set_task_summary_mode(self.config.tracing.task_summary_mode);
+        runtime_trace::set_output_format(self.config.tracing.output_format);
 
         let worker_thread_cnt = Handle::current().metrics().num_workers();
         log_info!(
@@ -267,6 +269,9 @@ impl TaskRunner {
         self.remove_empty_check_logs().await?;
         self.upload_check_logs_to_s3().await?;
         log_finished!("task finished");
+        if let Some(summary) = runtime_trace::dump_global_summary() {
+            log_runtime_trace!("{}", summary.trim_end());
+        }
         log::logger().flush();
         Ok(())
     }
@@ -479,14 +484,18 @@ impl TaskRunner {
         check_summary: Option<Arc<AsyncMutex<CheckSummaryLog>>>,
         checker_state_store: Option<Arc<CheckerStateStore>>,
     ) -> anyhow::Result<()> {
+        // DtQueue is already bounded by buffer_size. Keep only byte capacity in
+        // the enqueue limiter to avoid a duplicate records semaphore.
+        let enqueue_capacity_limiter = CapacityLimiterConfig {
+            buffer_size: 0,
+            buffer_memory_mb: self.config.pipeline.capacity_limiter.buffer_memory_mb,
+        };
         let enqueue_limiter = BufferLimiter::from_config(
             Some(&self.config.extractor_basic.rate_limiter),
-            Some(&self.config.pipeline.capacity_limiter),
-        )
-        .map(Arc::new);
+            Some(&enqueue_capacity_limiter),
+        );
         let dequeue_limiter =
-            BufferLimiter::from_config(Some(&self.config.sinker_basic.rate_limiter), None)
-                .map(Arc::new);
+            BufferLimiter::from_config(Some(&self.config.sinker_basic.rate_limiter), None);
         let max_bytes = self.config.pipeline.capacity_limiter.buffer_memory_mb * 1024 * 1024;
         let buffer = Arc::new(DtQueue::new(
             self.config.pipeline.capacity_limiter.buffer_size,
@@ -586,10 +595,8 @@ impl TaskRunner {
         let sinker_monitor = sinker_monitor_handle.build_monitor("sinker", &task_id);
         let sinkers = SinkerUtil::create_sinkers(
             &self.config,
-            &extractor_config,
             sinker_client.clone(),
             sinker_monitor_handle,
-            task_id.clone(),
             rw_sinker_data_marker.clone(),
             checker.as_ref().and_then(|handle| match handle {
                 CheckerHandle::Data(handle) => Some(handle.clone()),
@@ -642,8 +649,8 @@ impl TaskRunner {
         let interval_secs = self.config.pipeline.checkpoint_interval_secs;
         let task_flush_monitors: Vec<Arc<dyn FlushableMonitor + Send + Sync>> =
             vec![self.task_monitor.clone()];
-        let monitor_shut_down = Arc::new(AtomicBool::new(false));
-        let monitor_task_shutdown = monitor_shut_down.clone();
+        let monitor_shutdown = CancellationToken::new();
+        let monitor_task_shutdown = monitor_shutdown.clone();
         let monitor_task = tokio::spawn(async move {
             TaskUtil::flush_monitors(interval_secs, monitor_task_shutdown, &task_flush_monitors)
                 .await;
@@ -653,7 +660,7 @@ impl TaskRunner {
         let worker_result =
             Self::run_task_workers(extractor.clone(), pipeline.clone(), shut_down.clone()).await;
 
-        monitor_shut_down.store(true, Ordering::Release);
+        monitor_shutdown.cancel();
         let monitor_result = monitor_task
             .await
             .context("monitor task exit error")
@@ -678,20 +685,26 @@ impl TaskRunner {
         let mut join_set = JoinSet::new();
 
         let extractor_worker = extractor.clone();
-        join_set.spawn(async move {
-            (
-                SingleTaskWorker::Extractor,
-                Self::run_extractor_worker(extractor_worker).await,
-            )
-        });
+        join_set.spawn(runtime_trace::trace_task_future(
+            "task.extractor_worker",
+            async move {
+                (
+                    SingleTaskWorker::Extractor,
+                    Self::run_extractor_worker(extractor_worker).await,
+                )
+            },
+        ));
 
         let pipeline_worker = pipeline.clone();
-        join_set.spawn(async move {
-            (
-                SingleTaskWorker::Pipeline,
-                Self::run_pipeline_worker(pipeline_worker).await,
-            )
-        });
+        join_set.spawn(runtime_trace::trace_task_future(
+            "task.pipeline_worker",
+            async move {
+                (
+                    SingleTaskWorker::Pipeline,
+                    Self::run_pipeline_worker(pipeline_worker).await,
+                )
+            },
+        ));
         let mut extractor_done = false;
         let mut pipeline_done = false;
         let mut failure = None;
@@ -857,23 +870,6 @@ impl TaskRunner {
                 };
                 Ok(Box::new(pipeline) as Box<dyn Pipeline + Send>)
             }
-
-            PipelineType::HttpServer => {
-                let meta_manager = ExtractorUtil::get_extractor_meta_manager(&self.config).await?;
-                let avro_converter =
-                    AvroConverter::new(meta_manager, self.config.pipeline.with_field_defs);
-                let pipeline = HttpServerPipeline::new(
-                    buffer,
-                    syncer,
-                    monitor,
-                    avro_converter,
-                    self.config.pipeline.checkpoint_interval_secs,
-                    self.config.pipeline.batch_sink_interval_secs,
-                    &self.config.pipeline.http_host,
-                    self.config.pipeline.http_port,
-                );
-                Ok(Box::new(pipeline) as Box<dyn Pipeline + Send>)
-            }
         }
     }
 
@@ -948,10 +944,6 @@ impl TaskRunner {
         let checker_db_type = checker_target.db_type.clone();
         let checker_url = checker_target.url.clone();
         let checker_auth = checker_target.connection_auth.clone();
-        let inline_check = self
-            .config
-            .task_type()
-            .is_some_and(|task_type| task_type.is_inline_check());
         let standalone_snapshot_check = self
             .task_type
             .is_some_and(|task_type| task_type.is_standalone_snapshot_check());
@@ -963,7 +955,9 @@ impl TaskRunner {
 
         let is_struct_task = matches!(
             extractor_config,
-            ExtractorConfig::MysqlStruct { .. } | ExtractorConfig::PgStruct { .. }
+            ExtractorConfig::MysqlStruct { .. }
+                | ExtractorConfig::PgStruct { .. }
+                | ExtractorConfig::MongoStruct { .. }
         );
 
         if is_struct_task {
@@ -1137,14 +1131,11 @@ impl TaskRunner {
                 let source_checker = self
                     .create_source_checker(is_cdc_task, enable_sqlx_log)
                     .await?;
-                let app_name = match (&self.config.sinker, inline_check) {
-                    (SinkerConfig::Mongo { app_name, .. }, true) => app_name.as_str(),
-                    _ => "checker",
-                };
                 let mongo_client = TaskUtil::create_mongo_client(
                     &checker_url,
                     &checker_auth,
-                    app_name,
+                    checker_target.is_direct_connection,
+                    checker_target.app_name,
                     Some(max_connections),
                 )
                 .await?;
@@ -1203,7 +1194,8 @@ impl TaskRunner {
                 let client = TaskUtil::create_mongo_client(
                     &self.config.extractor_basic.url,
                     &self.config.extractor_basic.connection_auth,
-                    "checker-source",
+                    self.config.extractor_basic.is_direct_connection,
+                    self.config.extractor_basic.app_name.to_owned(),
                     Some(1),
                 )
                 .await?;
@@ -1458,7 +1450,6 @@ impl TaskRunner {
             ExtractorConfig::MysqlSnapshot { .. }
                 | ExtractorConfig::PgSnapshot { .. }
                 | ExtractorConfig::MongoSnapshot { .. }
-                | ExtractorConfig::FoxlakeS3 { .. }
         );
 
         let mut schema_tbs = HashMap::new();
@@ -1527,6 +1518,28 @@ impl TaskRunner {
                         schema: schema.clone(),
                         schemas,
                         do_global_structs: true,
+                        db_batch_size: *db_batch_size,
+                    },
+                    no_snapshot_data: false,
+                })
+            }
+            ExtractorConfig::MongoStruct {
+                url,
+                connection_auth,
+                is_direct_connection,
+                app_name,
+                db,
+                db_batch_size,
+                ..
+            } => {
+                return Ok(TaskInfo {
+                    extractor_config: ExtractorConfig::MongoStruct {
+                        url: url.clone(),
+                        connection_auth: connection_auth.clone(),
+                        is_direct_connection: *is_direct_connection,
+                        app_name: app_name.clone(),
+                        db: db.clone(),
+                        dbs: schemas,
                         db_batch_size: *db_batch_size,
                     },
                     no_snapshot_data: false,
@@ -1609,6 +1622,7 @@ impl TaskRunner {
             ExtractorConfig::MongoSnapshot {
                 url,
                 connection_auth,
+                is_direct_connection,
                 app_name,
                 parallel_size,
                 parallel_type,
@@ -1617,6 +1631,7 @@ impl TaskRunner {
             } => ExtractorConfig::MongoSnapshot {
                 url: url.clone(),
                 connection_auth: connection_auth.clone(),
+                is_direct_connection: *is_direct_connection,
                 app_name: app_name.clone(),
                 db: String::new(),
                 tb: String::new(),
@@ -1625,25 +1640,6 @@ impl TaskRunner {
                 parallel_type: parallel_type.clone(),
                 batch_size: *batch_size,
             },
-
-            ExtractorConfig::FoxlakeS3 {
-                url,
-                s3_config,
-                parallel_size,
-                parallel_type,
-                batch_size,
-                ..
-            } => ExtractorConfig::FoxlakeS3 {
-                url: url.clone(),
-                schema: String::new(),
-                tb: String::new(),
-                schema_tbs,
-                parallel_size: *parallel_size,
-                parallel_type: parallel_type.clone(),
-                s3_config: s3_config.clone(),
-                batch_size: *batch_size,
-            },
-
             _ => self.config.extractor.clone(),
         };
         Ok(TaskInfo {

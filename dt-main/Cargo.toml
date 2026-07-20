@@ -8,6 +8,7 @@ workspace = true
 
 [features]
 metrics = ["dt-task/metrics"]
+tracing = ["dt-task/tracing"]
 
 [dependencies]
 dt-task = {path = "../dt-task", version = "0.1.0"}

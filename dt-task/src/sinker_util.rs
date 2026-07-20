@@ -1,21 +1,17 @@
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use anyhow::{bail, Context};
 use kafka::producer::{Producer, RequiredAcks};
 use rdkafka::ClientConfig as KafkaClientConfig;
 use reqwest::{redirect::Policy, Url};
 use sqlx::types::chrono::Utc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use dt_common::{
-    config::{
-        config_enums::DbType, connection_auth_config::ConnectionAuthConfig,
-        extractor_config::ExtractorConfig, message_format::MessageFormat,
-        sinker_config::SinkerConfig, task_config::TaskConfig,
-    },
+    config::{config_enums::DbType, sinker_config::SinkerConfig, task_config::TaskConfig},
     meta::{
         avro::avro_converter::AvroConverter,
-        json::json_converter::JsonConverter,
+        mongo::mongo_shard::{is_mongos, list_shard_collections},
         mysql::mysql_meta_manager::MysqlMetaManager,
         pg::pg_meta_manager::PgMetaManager,
         redis::{
@@ -41,13 +37,8 @@ use dt_connector::{
             clickhouse_sinker::ClickhouseSinker, clickhouse_struct_sinker::ClickhouseStructSinker,
         },
         dummy_sinker::DummySinker,
-        foxlake::{
-            foxlake_merger::FoxlakeMerger, foxlake_pusher::FoxlakePusher,
-            foxlake_sinker::FoxlakeSinker, foxlake_struct_sinker::FoxlakeStructSinker,
-            orc_sequencer::OrcSequencer,
-        },
         kafka::kafka_sinker::KafkaSinker,
-        mongo::mongo_sinker::MongoSinker,
+        mongo::{mongo_sinker::MongoSinker, mongo_struct_sinker::MongoStructSinker},
         mysql::{mysql_sinker::MysqlSinker, mysql_struct_sinker::MysqlStructSinker},
         pg::{pg_sinker::PgSinker, pg_struct_sinker::PgStructSinker},
         redis::{redis_sinker::RedisSinker, redis_statistic_sinker::RedisStatisticSinker},
@@ -88,10 +79,8 @@ impl SinkerUtil {
 
     pub async fn create_sinkers(
         config: &TaskConfig,
-        extractor_config: &ExtractorConfig,
         client: ConnClient,
         monitor: TaskMonitorHandle,
-        _monitor_task_id: String,
         data_marker: Option<Arc<RwLock<DataMarker>>>,
         checker: Option<DataCheckerHandle>,
     ) -> anyhow::Result<Sinkers> {
@@ -174,7 +163,11 @@ impl SinkerUtil {
                 }
             }
 
-            SinkerConfig::Mongo { batch_size, .. } => {
+            SinkerConfig::Mongo {
+                batch_size,
+                require_shard_key_filter,
+                ..
+            } => {
                 let router = RdbRouter::from_config(&config.router, &DbType::Mongo)?;
                 let mongo_client = match client {
                     ConnClient::MongoDB(mongo_client) => mongo_client,
@@ -182,15 +175,42 @@ impl SinkerUtil {
                         bail!("connection pool not found");
                     }
                 };
+                let is_target_mongos = is_mongos(&mongo_client).await?;
                 for _ in 0..parallel_size {
                     let sinker = MongoSinker {
                         batch_size,
                         router: router.clone(),
                         mongo_client: mongo_client.clone(),
                         base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
+                        target_shard_collections: HashMap::new(),
+                        require_shard_key_filter,
+                        is_target_mongos,
                     };
                     Self::push_checkable_sinker(&mut sub_sinkers, sinker, &checker);
                 }
+            }
+
+            SinkerConfig::MongoStruct {
+                conflict_policy, ..
+            } => {
+                let filter = create_filter!(config, Mongo);
+                let mongo_client = match client {
+                    ConnClient::MongoDB(mongo_client) => mongo_client,
+                    _ => {
+                        bail!("connection pool not found");
+                    }
+                };
+                let (is_target_mongos, target_shard_collections) =
+                    list_shard_collections(&mongo_client).await?;
+                let sinker = MongoStructSinker {
+                    mongo_client,
+                    conflict_policy,
+                    filter,
+                    base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
+                    target_shard_collections,
+                    is_target_mongos,
+                };
+                Self::push_sinker(&mut sub_sinkers, sinker);
             }
 
             SinkerConfig::Kafka {
@@ -199,8 +219,6 @@ impl SinkerUtil {
                 ack_timeout_secs,
                 required_acks,
                 with_field_defs,
-                message_format,
-                json_template,
                 skip_confirmed_noop_updates,
             } => {
                 let router = RdbRouter::from_config_for_topic(
@@ -210,34 +228,7 @@ impl SinkerUtil {
                 )?;
                 // kafka sinker may need meta data from RDB extractor
                 let meta_manager = ExtractorUtil::get_extractor_meta_manager(config).await?;
-                let avro_converter = AvroConverter::new(meta_manager.clone(), with_field_defs);
-                let database_name = match extractor_config.to_owned() {
-                    ExtractorConfig::MysqlStruct { db, .. }
-                    | ExtractorConfig::MysqlSnapshot { db, .. }
-                    | ExtractorConfig::MongoSnapshot { db, .. } => Some(db),
-                    ExtractorConfig::PgSnapshot { url, .. }
-                    | ExtractorConfig::PgCdc { url, .. }
-                    | ExtractorConfig::PgStruct { url, .. }
-                    | ExtractorConfig::MysqlCdc { url, .. }
-                    | ExtractorConfig::MysqlCheck { url, .. } => {
-                        Url::parse(&url).ok().and_then(|u| {
-                            let db = u
-                                .path()
-                                .trim_start_matches('/')
-                                .split('/')
-                                .next()
-                                .unwrap_or("");
-                            (!db.is_empty()).then(|| db.to_string())
-                        })
-                    }
-                    _ => None,
-                };
-                let template_type = match &message_format {
-                    MessageFormat::JsonTemplate(template_type) => template_type.clone(),
-                    _ => json_template,
-                };
-                let json_converter =
-                    JsonConverter::new_with_template(meta_manager, template_type, database_name);
+                let avro_converter = AvroConverter::new(meta_manager, with_field_defs);
 
                 let brokers = vec![url.to_string()];
                 let acks = match required_acks.as_str() {
@@ -278,8 +269,6 @@ impl SinkerUtil {
                         raw_producer,
                         raw_queue_timeout_secs: ack_timeout_secs,
                         avro_converter: avro_converter.clone(),
-                        json_converter: json_converter.clone(),
-                        message_format: message_format.clone(),
                         source_db_type: config.extractor_basic.db_type.clone(),
                         skip_confirmed_noop_updates,
                         base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
@@ -341,7 +330,10 @@ impl SinkerUtil {
             } => {
                 // redis sinker may need meta data from RDB extractor
                 let meta_manager = ExtractorUtil::get_extractor_meta_manager(config).await?;
-                let mut conn = RedisUtil::create_redis_conn(&url, &connection_auth).await?;
+                let mut conn = RedisUtil::create_redis_conn(&url, &connection_auth)
+                    .await
+                    .context("failed to create Redis sinker connection")?;
+                let is_cluster = RedisUtil::is_redis_cluster(&mut conn, is_cluster);
                 let version = RedisUtil::get_redis_version(&mut conn)?;
                 let method = RedisWriteMethod::from_str(&method)?;
                 let router = RdbRouter::from_config(&config.router, &DbType::Redis)?;
@@ -582,178 +574,6 @@ impl SinkerUtil {
                     };
                     Self::push_sinker(&mut sub_sinkers, sinker);
                 }
-            }
-
-            SinkerConfig::Foxlake {
-                url,
-                batch_size,
-                batch_memory_mb,
-                s3_config,
-                engine,
-            } => {
-                let router = RdbRouter::from_config(&config.router, &DbType::Mysql)?;
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    &DbType::Foxlake,
-                    &ConnectionAuthConfig::NoAuth,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    None,
-                )
-                .await?;
-                let s3_client = TaskUtil::create_s3_client(&s3_config)?;
-                let orc_sequencer = Arc::new(Mutex::new(OrcSequencer::new()));
-
-                for _ in 0..parallel_size {
-                    let meta_manager =
-                        MysqlMetaManager::new_mysql_compatible(conn_pool.clone(), DbType::Foxlake)
-                            .await?;
-                    let (schema, tb) = match extractor_config.to_owned() {
-                        ExtractorConfig::MysqlSnapshot { db, tb, .. } => (Some(db), Some(tb)),
-                        ExtractorConfig::PgSnapshot { schema, tb, .. } => (Some(schema), Some(tb)),
-                        _ => (None, None),
-                    };
-
-                    let pusher = FoxlakePusher {
-                        url: url.to_string(),
-                        extract_type: config.extractor_basic.extract_type.clone(),
-                        meta_manager: meta_manager.clone(),
-                        batch_size,
-                        batch_memory_bytes: batch_memory_mb * 1024 * 1024,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
-                        schema,
-                        tb,
-                        router: router.clone(),
-                        orc_sequencer: orc_sequencer.clone(),
-                    };
-
-                    let merger = FoxlakeMerger {
-                        batch_size,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
-                        conn_pool: conn_pool.clone(),
-                        extract_type: config.extractor_basic.extract_type.clone(),
-                    };
-
-                    let sinker = FoxlakeSinker {
-                        url: url.to_string(),
-                        meta_manager,
-                        batch_size,
-                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
-                        conn_pool: conn_pool.clone(),
-                        router: router.clone(),
-                        pusher,
-                        merger,
-                        engine: engine.clone(),
-                    };
-                    Self::push_sinker(&mut sub_sinkers, sinker);
-                }
-            }
-
-            SinkerConfig::FoxlakePush {
-                url,
-                batch_size,
-                batch_memory_mb,
-                s3_config,
-            } => {
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    &DbType::Foxlake,
-                    &ConnectionAuthConfig::NoAuth,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    None,
-                )
-                .await?;
-                let s3_client = TaskUtil::create_s3_client(&s3_config)?;
-                let router = RdbRouter::from_config(&config.router, &DbType::Mysql)?;
-                let orc_sequencer = Arc::new(Mutex::new(OrcSequencer::new()));
-
-                for _ in 0..parallel_size {
-                    let meta_manager =
-                        MysqlMetaManager::new_mysql_compatible(conn_pool.clone(), DbType::Foxlake)
-                            .await?;
-                    let (schema, tb) = match extractor_config.to_owned() {
-                        ExtractorConfig::MysqlSnapshot { db, tb, .. } => (Some(db), Some(tb)),
-                        ExtractorConfig::PgSnapshot { schema, tb, .. } => (Some(schema), Some(tb)),
-                        _ => (None, None),
-                    };
-
-                    let sinker = FoxlakePusher {
-                        url: url.to_string(),
-                        extract_type: config.extractor_basic.extract_type.clone(),
-                        meta_manager,
-                        batch_size,
-                        batch_memory_bytes: batch_memory_mb * 1024 * 1024,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
-                        schema,
-                        tb,
-                        router: router.clone(),
-                        orc_sequencer: orc_sequencer.clone(),
-                    };
-                    Self::push_sinker(&mut sub_sinkers, sinker);
-                }
-            }
-
-            SinkerConfig::FoxlakeMerge {
-                url,
-                batch_size,
-                s3_config,
-            } => {
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    &DbType::Foxlake,
-                    &ConnectionAuthConfig::NoAuth,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    None,
-                )
-                .await?;
-                let s3_client = TaskUtil::create_s3_client(&s3_config)?;
-
-                for _ in 0..parallel_size {
-                    let sinker = FoxlakeMerger {
-                        batch_size,
-                        s3_config: s3_config.clone(),
-                        s3_client: s3_client.clone(),
-                        base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
-                        conn_pool: conn_pool.clone(),
-                        extract_type: config.extractor_basic.extract_type.clone(),
-                    };
-                    Self::push_sinker(&mut sub_sinkers, sinker);
-                }
-            }
-
-            SinkerConfig::FoxlakeStruct {
-                url,
-                conflict_policy,
-                engine,
-            } => {
-                let filter = create_filter!(config, Mysql);
-                let router = RdbRouter::from_config(&config.router, &DbType::Mysql)?;
-                let conn_pool = TaskUtil::create_mysql_conn_pool(
-                    &url,
-                    &DbType::Foxlake,
-                    &ConnectionAuthConfig::NoAuth,
-                    parallel_size * 2,
-                    enable_sqlx_log,
-                    None,
-                )
-                .await?;
-                let sinker = FoxlakeStructSinker {
-                    conn_pool: conn_pool.clone(),
-                    conflict_policy: conflict_policy.clone(),
-                    filter,
-                    router,
-                    engine,
-                    base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),
-                };
-                Self::push_sinker(&mut sub_sinkers, sinker);
             }
         };
         Ok(sub_sinkers)

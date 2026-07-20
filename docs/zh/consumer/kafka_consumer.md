@@ -4,13 +4,13 @@ APE DTS 支持两类 Kafka 输出：RDB 数据编码后写入 Kafka，以及 Kaf
 
 ## RDB -> Kafka fanout
 
-- MySQL/PostgreSQL 的 snapshot 或 CDC 数据仍按 `message_format` 编码；配置 `[router].topic_fanout_map` 后，同一份编码结果会写入多个目标 topic。
+- MySQL/PostgreSQL 的 snapshot 或 CDC 数据使用 Avro 编码；配置 `[router].topic_fanout_map` 后，同一份编码结果会写入多个目标 topic。
 - DML 路由优先级为 `schema.table > schema.* > *.*`；DDL 使用 `schema.*` 或 `*.*`。
 - 该路径发送相同的 key/value，不生成 Kafka headers。
 
 ## Kafka -> Kafka 原始转发
 
-原始转发保留源消息的 key、payload 和 headers，包括 null key、null payload 以及值为 null 的 header，只替换目标 topic。`message_format`、`json_template` 和 `with_field_defs` 不参与该路径。
+原始转发保留源消息的 key、payload 和 headers，包括 null key、null payload 以及值为 null 的 header，只替换目标 topic。`with_field_defs` 不参与该路径。
 
 ### 必要配置
 

@@ -8,6 +8,12 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use mongodb::{
+    bson::{doc, Bson, Document, Timestamp},
+    change_stream::event::ResumeToken,
+    options::{FullDocumentBeforeChangeType, FullDocumentType},
+    Client,
+};
 use serde_json::json;
 use tokio::{sync::Mutex, time::Instant};
 
@@ -23,9 +29,14 @@ use dt_common::{
     log_error, log_info, log_warn,
     meta::{
         col_value::ColValue,
+        ddl_meta::ddl_type::DdlType,
         dt_data::DtData,
         mongo::{
-            mongo_cdc_source::MongoCdcSource, mongo_constant::MongoConstants, mongo_key::MongoKey,
+            mongo_cdc_source::MongoCdcSource,
+            mongo_constant::MongoConstants,
+            mongo_ddl::change_stream_event_to_ddl,
+            mongo_key::MongoKey,
+            mongo_version::{get_server_version, MongoServerVersion},
         },
         position::Position,
         row_data::RowData,
@@ -35,12 +46,6 @@ use dt_common::{
     rdb_filter::RdbFilter,
     system_dbs::SystemDb,
     utils::time_util::TimeUtil,
-};
-use mongodb::{
-    bson::{doc, Bson, Document, Timestamp},
-    change_stream::event::{OperationType, ResumeToken},
-    options::{ChangeStreamOptions, FullDocumentBeforeChangeType, FullDocumentType, UpdateOptions},
-    Client,
 };
 
 pub struct MongoCdcExtractor {
@@ -59,6 +64,10 @@ pub struct MongoCdcExtractor {
 }
 
 impl MongoCdcExtractor {
+    fn supports_change_stream_6_0_features(version: &MongoServerVersion) -> bool {
+        version >= &MongoServerVersion::new(6, 0, 0)
+    }
+
     fn insert_id_from_doc(target: &mut HashMap<String, ColValue>, doc: &Document) {
         if let Some(key) = MongoKey::from_doc(doc) {
             target.insert(
@@ -66,6 +75,211 @@ impl MongoCdcExtractor {
                 ColValue::String(key.to_string()),
             );
         }
+    }
+
+    fn insert_document_key(target: &mut HashMap<String, ColValue>, document_key: &Document) {
+        target.insert(
+            MongoConstants::DOCUMENT_KEY.to_string(),
+            ColValue::MongoDoc(document_key.clone()),
+        );
+    }
+
+    fn append_oplog_diff_path(prefix: &str, field: &str) -> String {
+        if prefix.is_empty() {
+            field.to_string()
+        } else {
+            format!("{}.{}", prefix, field)
+        }
+    }
+
+    fn flatten_oplog_diff(
+        diff: &Document,
+        prefix: &str,
+        set_doc: &mut Document,
+        unset_doc: &mut Document,
+    ) {
+        if let Some(inserted) = diff.get("i").and_then(|value| value.as_document()) {
+            for (field, value) in inserted {
+                set_doc.insert(Self::append_oplog_diff_path(prefix, field), value.clone());
+            }
+        }
+
+        if let Some(updated) = diff.get("u").and_then(|value| value.as_document()) {
+            for (field, value) in updated {
+                set_doc.insert(Self::append_oplog_diff_path(prefix, field), value.clone());
+            }
+        }
+
+        if let Some(deleted) = diff.get("d").and_then(|value| value.as_document()) {
+            for (field, value) in deleted {
+                unset_doc.insert(Self::append_oplog_diff_path(prefix, field), value.clone());
+            }
+        }
+
+        for (field, value) in diff {
+            if matches!(field.as_str(), "i" | "u" | "d" | "a") {
+                continue;
+            }
+
+            let Some(nested_field) = field.strip_prefix('s') else {
+                continue;
+            };
+            if nested_field.is_empty() {
+                continue;
+            }
+            if let Some(nested_diff) = value.as_document() {
+                let nested_prefix = Self::append_oplog_diff_path(prefix, nested_field);
+                Self::flatten_oplog_diff(nested_diff, &nested_prefix, set_doc, unset_doc);
+            }
+        }
+    }
+
+    fn build_oplog_update_doc(after_doc: &Document) -> Document {
+        let mut set_doc = Document::new();
+        let mut unset_doc = Document::new();
+
+        if let Some(diff) = after_doc.get("diff").and_then(|value| value.as_document()) {
+            Self::flatten_oplog_diff(diff, "", &mut set_doc, &mut unset_doc);
+        } else {
+            if let Some(doc) = after_doc
+                .get(MongoConstants::SET)
+                .and_then(|value| value.as_document())
+            {
+                set_doc.extend(doc.clone());
+            }
+            if let Some(doc) = after_doc
+                .get(MongoConstants::UNSET)
+                .and_then(|value| value.as_document())
+            {
+                unset_doc.extend(doc.clone());
+            }
+        }
+
+        let mut update_doc = Document::new();
+        if !set_doc.is_empty() {
+            update_doc.insert(MongoConstants::SET, set_doc);
+        }
+        if !unset_doc.is_empty() {
+            update_doc.insert(MongoConstants::UNSET, unset_doc);
+        }
+        update_doc
+    }
+
+    fn get_path_value<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
+        let mut current = doc;
+        let mut fields = path.split('.').peekable();
+        while let Some(field) = fields.next() {
+            let value = current.get(field)?;
+            if fields.peek().is_none() {
+                return Some(value);
+            }
+            current = value.as_document()?;
+        }
+        None
+    }
+
+    fn build_change_stream_update_doc(
+        update_description: &Document,
+        full_document: Option<&Document>,
+    ) -> Document {
+        let mut set_doc = Document::new();
+        let mut unset_doc = Document::new();
+
+        if let Some(updated_fields) = update_description
+            .get("updatedFields")
+            .and_then(|value| value.as_document())
+        {
+            set_doc.extend(updated_fields.clone());
+        }
+
+        if let Some(removed_fields) = update_description
+            .get("removedFields")
+            .and_then(|value| value.as_array())
+        {
+            for field in removed_fields {
+                if let Some(field) = field.as_str() {
+                    unset_doc.insert(field, "");
+                }
+            }
+        }
+
+        if let Some(truncated_arrays) = update_description
+            .get("truncatedArrays")
+            .and_then(|value| value.as_array())
+        {
+            for truncated_array in truncated_arrays {
+                let Some(truncated_array) = truncated_array.as_document() else {
+                    continue;
+                };
+                let Ok(field) = truncated_array.get_str("field") else {
+                    continue;
+                };
+                if let Some(value) = full_document.and_then(|doc| Self::get_path_value(doc, field))
+                {
+                    set_doc.insert(field, value.clone());
+                }
+            }
+        }
+
+        let mut update_doc = Document::new();
+        if !set_doc.is_empty() {
+            update_doc.insert(MongoConstants::SET, set_doc);
+        }
+        if !unset_doc.is_empty() {
+            update_doc.insert(MongoConstants::UNSET, unset_doc);
+        }
+        update_doc
+    }
+
+    fn change_stream_update_requires_full_document(update_description: &Document) -> bool {
+        update_description
+            .get("disambiguatedPaths")
+            .and_then(|value| value.as_document())
+            .map(|doc| {
+                doc.values()
+                    .any(Self::disambiguated_path_requires_full_document)
+            })
+            .unwrap_or(false)
+    }
+
+    fn disambiguated_path_requires_full_document(path: &Bson) -> bool {
+        let Some(components) = path.as_array() else {
+            return true;
+        };
+        if components.is_empty() {
+            return true;
+        }
+
+        components.iter().any(|component| match component {
+            Bson::String(field) => field.contains('.'),
+            Bson::Int32(_) | Bson::Int64(_) => false,
+            _ => true,
+        })
+    }
+
+    fn parse_change_stream_ns(event: &Document) -> Option<(String, String)> {
+        let ns = event.get_document("ns").ok()?;
+        let db = ns.get_str("db").ok()?.to_string();
+        let tb = ns.get_str("coll").unwrap_or("").to_string();
+        Some((db, tb))
+    }
+
+    fn filter_requests_change_stream_ddl(&self) -> bool {
+        if self.filter.do_ddls.contains("*") {
+            return true;
+        }
+
+        [
+            DdlType::MongoCreateCollection,
+            DdlType::MongoCreateIndex,
+            DdlType::MongoDropIndex,
+            DdlType::MongoCollMod,
+            DdlType::MongoShardCollection,
+            DdlType::MongoReshardCollection,
+            DdlType::MongoRefineCollectionShardKey,
+        ]
+        .iter()
+        .any(|ddl_type| self.filter.do_ddls.contains(&ddl_type.to_string()))
     }
 }
 
@@ -129,15 +343,14 @@ impl MongoCdcExtractor {
         let filter = doc! {
             "ts": { "$gte": start_timestamp }
         };
-        let options = mongodb::options::FindOptions::builder()
-            .cursor_type(mongodb::options::CursorType::TailableAwait)
-            .build();
-
         let oplog = self
             .mongo_client
             .database("local")
             .collection::<Document>("oplog.rs");
-        let mut cursor = oplog.find(filter, options).await?;
+        let mut cursor = oplog
+            .find(filter)
+            .cursor_type(mongodb::options::CursorType::TailableAwait)
+            .await?;
 
         while cursor.advance().await? {
             let doc: Document = cursor.deserialize_current()?;
@@ -177,24 +390,7 @@ impl MongoCdcExtractor {
                     // https://www.mongodb.com/docs/manual/reference/operator/update/#update-operators-1
                     // in MongoDB 4.4 and earlier, after_doc contains $set with all new document fields,
                     // after that, after_doc contains diff with only changed fields.
-                    let diff_doc = if let Some(doc) = after_doc.get("diff") {
-                        let doc = doc.as_document().unwrap();
-                        if let Some(i_doc) = doc.get("i") {
-                            doc! {MongoConstants::SET: i_doc.as_document().unwrap()}
-                        } else if let Some(u_doc) = doc.get("u") {
-                            doc! {MongoConstants::SET: u_doc.as_document().unwrap()}
-                        } else if let Some(d_doc) = doc.get("d") {
-                            doc! {MongoConstants::UNSET: d_doc.as_document().unwrap()}
-                        } else {
-                            doc! {}
-                        }
-                    } else if let Some(set_doc) = after_doc.get(MongoConstants::SET) {
-                        doc! {MongoConstants::SET: set_doc.as_document().unwrap()}
-                    } else if let Some(unset_doc) = after_doc.get(MongoConstants::UNSET) {
-                        doc! {MongoConstants::UNSET: unset_doc.as_document().unwrap()}
-                    } else {
-                        doc! {}
-                    };
+                    let diff_doc = Self::build_oplog_update_doc(after_doc);
 
                     if diff_doc.is_empty() {
                         log_error!(
@@ -360,6 +556,51 @@ impl MongoCdcExtractor {
         (row_data, position)
     }
 
+    // Event example:
+    /*
+    {
+        _id : { // stores metadata
+            "_data" : <BinData|hex string> // resumeToken
+        },
+        "operationType" : "<operation>", // insert, delete, replace, update, drop, rename, dropDatabase, invalidate
+        "fullDocument" : { <document> }, // data after modification, appears in insert, replace, delete, update. Equivalent to the original "o" field
+        "ns" : { // namespace
+            "db" : "<database>",
+            "coll" : "<collection>"
+        },
+        "to" : { // only valid when operationType == rename, indicates the new namespace after renaming
+            "db" : "<database>",
+            "coll" : "<collection>"
+        },
+        "documentKey" : { "_id" : <value> }, // equivalent to o2 field. Appears in insert, replace, delete, update. Normally only contains _id, for sharded collections also includes shard key
+        "updateDescription" : { // only appears when operationType == update; represents incremental modification, while replace is complete replacement
+            "updatedFields" : { <document> }, // values of updated fields
+            "removedFields" : [ "<field>", ... ] // list of removed fields
+        },
+        "fullDocument" : { <document> }, // if full_document is enabled, is updateLookup, otherwise default
+        "clusterTime" : <Timestamp>, // equivalent to ts field
+        "txnNumber" : <NumberLong>, // equivalent to txnNumber in oplog, only appears in transactions. txnNumber is monotonically increasing within a logical session
+        "lsid" : { // equivalent to lsid field in oplog, only appears in transactions. Logical session id, id of session for the request
+               "id" : <UUID>,
+               "uid" : <BinData>
+           },
+        "operationDescription": { // stores index-related info in DDL operations (createIndexes/dropIndexes/collMod, etc.)
+          "index": {
+             "name": "age_1",
+             "hidden": true
+          }
+        },
+        "stateBeforeChange": { // only present in modify event; records status before collMod command
+          "collectionOptions": { // namespace options
+              "uuid": UUID("47d6baac-eeaa-488b-98ae-893f3abaaf25")
+          },
+          "indexOptions": { // index options
+             "hidden": false
+          }
+       },
+        "wallTime" : <Date>, // equivalent to wall field
+    }
+    */
     async fn extract_change_stream(&mut self) -> anyhow::Result<()> {
         let (resume_token, start_timestamp) = if self.resume_token.is_empty() {
             (None, Some(self.parse_start_timestamp()))
@@ -368,24 +609,45 @@ impl MongoCdcExtractor {
             (Some(token), None)
         };
 
-        // refer: https://www.mongodb.com/docs/manual/changeStreams/
-        // Starting in MongoDB 6.0, you can use change stream events to output the version of
-        // a document before and after changes (the document pre- and post-images)
-        let stream_options = ChangeStreamOptions::builder()
-            .start_at_operation_time(start_timestamp)
-            .start_after(resume_token)
-            .full_document(Some(FullDocumentType::UpdateLookup))
-            .full_document_before_change(Some(FullDocumentBeforeChangeType::WhenAvailable))
-            .build();
+        let server_version = get_server_version(&self.mongo_client).await?;
+        let supports_change_stream_6_0_features =
+            Self::supports_change_stream_6_0_features(&server_version);
+        let requests_change_stream_ddl = self.filter_requests_change_stream_ddl();
+        let enable_change_stream_ddl =
+            requests_change_stream_ddl && supports_change_stream_6_0_features;
+        if requests_change_stream_ddl && !supports_change_stream_6_0_features {
+            log_warn!(
+                "MongoDB {} does not support change stream showExpandedEvents; change stream DDL events will be skipped",
+                server_version
+            );
+        }
 
-        let mut change_stream = self.mongo_client.watch(None, stream_options).await?;
+        let mut watch = self
+            .mongo_client
+            .watch()
+            .full_document(FullDocumentType::UpdateLookup);
+        if supports_change_stream_6_0_features {
+            watch = watch.full_document_before_change(FullDocumentBeforeChangeType::WhenAvailable);
+        }
+        if supports_change_stream_6_0_features {
+            watch = watch.show_expanded_events(true);
+        }
+        if let Some(resume_token) = resume_token {
+            watch = watch.start_after(resume_token);
+        } else if let Some(start_time) = start_timestamp {
+            watch = watch.start_at_operation_time(start_time);
+        }
+        let mut change_stream = watch.await?.with_type::<Document>();
+
         loop {
             let result = change_stream.next_if_any().await?;
-            if let Some(doc) = result {
-                let resume_token = doc.id;
-                let position = if let Some(operation_time) = doc.cluster_time {
+            if let Some(event) = result {
+                let resume_token = change_stream.resume_token();
+                let position = if let Ok(operation_time) = event.get_timestamp("clusterTime") {
                     Position::MongoCdc {
-                        resume_token: json!(resume_token).to_string(),
+                        resume_token: resume_token
+                            .map(|token| json!(token).to_string())
+                            .unwrap_or_default(),
                         operation_time: operation_time.time,
                         timestamp: Position::format_timestamp_millis(
                             operation_time.time as i64 * 1000,
@@ -393,65 +655,171 @@ impl MongoCdcExtractor {
                     }
                 } else {
                     Position::MongoCdc {
-                        resume_token: json!(resume_token).to_string(),
+                        resume_token: resume_token
+                            .map(|token| json!(token).to_string())
+                            .unwrap_or_default(),
                         operation_time: 0,
                         timestamp: String::new(),
                     }
                 };
 
-                let (mut db, mut tb) = (String::new(), String::new());
-                if let Some(ns) = doc.ns {
-                    db = ns.db.clone();
-                    if let Some(coll) = ns.coll {
-                        tb = coll.clone();
-                    }
-                }
-
+                let (db, tb) = Self::parse_change_stream_ns(&event).unwrap_or_default();
+                let operation_type = event.get_str("operationType").unwrap_or("");
                 let mut row_type = RowType::Insert;
                 let mut before = HashMap::new();
                 let mut after = HashMap::new();
 
-                match doc.operation_type {
-                    OperationType::Insert => {
-                        Self::insert_id_from_doc(&mut after, doc.full_document.as_ref().unwrap());
+                match operation_type {
+                    "insert" => {
+                        let document = match event.get_document("fullDocument") {
+                            Ok(document) => document.clone(),
+                            Err(_) => continue,
+                        };
+                        if let Ok(document_key) = event.get_document("documentKey") {
+                            Self::insert_id_from_doc(&mut after, document_key);
+                            Self::insert_document_key(&mut after, document_key);
+                        }
+                        Self::insert_id_from_doc(&mut after, &document);
                         after.insert(
                             MongoConstants::DOC.to_string(),
-                            ColValue::MongoDoc(doc.full_document.unwrap()),
+                            ColValue::MongoDoc(document),
                         );
                     }
 
-                    OperationType::Delete => {
+                    "delete" => {
                         row_type = RowType::Delete;
-                        let doc = doc.document_key.unwrap();
-                        Self::insert_id_from_doc(&mut before, &doc);
-                        before.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
+                        let document_key = match event.get_document("documentKey") {
+                            Ok(document_key) => document_key.clone(),
+                            Err(_) => continue,
+                        };
+                        Self::insert_id_from_doc(&mut before, &document_key);
+                        Self::insert_document_key(&mut before, &document_key);
+                        before.insert(
+                            MongoConstants::DOC.to_string(),
+                            ColValue::MongoDoc(document_key),
+                        );
                     }
 
-                    OperationType::Update | OperationType::Replace => {
+                    "update" => {
                         row_type = RowType::Update;
-                        if let Some(document) = doc.full_document {
-                            if let Some(id_doc) = doc.document_key.as_ref() {
-                                Self::insert_id_from_doc(&mut after, id_doc);
-                            }
-                            Self::insert_id_from_doc(&mut after, &document);
+                        let document = event.get_document("fullDocument").ok().cloned();
+                        let document_key = match event.get_document("documentKey") {
+                            Ok(document_key) => document_key.clone(),
+                            Err(_) => continue,
+                        };
+                        Self::insert_id_from_doc(&mut before, &document_key);
+                        Self::insert_document_key(&mut before, &document_key);
+                        Self::insert_id_from_doc(&mut after, &document_key);
+                        Self::insert_document_key(&mut after, &document_key);
+                        if let Some(document) = &document {
+                            Self::insert_id_from_doc(&mut after, document);
+                        }
+                        if let Ok(pre_image) = event.get_document("fullDocumentBeforeChange") {
+                            before.insert(
+                                MongoConstants::PRE_IMAGE.to_string(),
+                                ColValue::MongoDoc(pre_image.clone()),
+                            );
                             before.insert(
                                 MongoConstants::DOC.to_string(),
-                                ColValue::MongoDoc(doc.document_key.unwrap()),
+                                ColValue::MongoDoc(pre_image.clone()),
                             );
+                        }
+                        let update_description = match event.get_document("updateDescription") {
+                            Ok(update_description) => update_description,
+                            Err(_) => continue,
+                        };
+                        if Self::change_stream_update_requires_full_document(update_description) {
+                            // Ambiguous paths may refer to literal dotted field names, so a normal
+                            // $set/$unset dotted path can update the wrong shape.
+                            let Some(document) = document else {
+                                log_error!(
+                                    "change stream updateDescription has disambiguatedPaths, but fullDocument is missing, ignore, event: {:?}",
+                                    event
+                                );
+                                continue;
+                            };
                             after.insert(
                                 MongoConstants::DOC.to_string(),
                                 ColValue::MongoDoc(document),
                             );
+                        } else {
+                            let update_doc = Self::build_change_stream_update_doc(
+                                update_description,
+                                document.as_ref(),
+                            );
+                            if update_doc.is_empty() {
+                                log_error!(
+                                "change stream updateDescription is empty or unsupported, ignore, event: {:?}",
+                                event
+                            );
+                                continue;
+                            }
+                            after.insert(
+                                MongoConstants::DIFF_DOC.to_string(),
+                                ColValue::MongoDoc(update_doc),
+                            );
+                            if let Some(document) = document {
+                                after.insert(
+                                    MongoConstants::DOC.to_string(),
+                                    ColValue::MongoDoc(document),
+                                );
+                            }
                         }
                     }
 
-                    // TODO, heartbeat and DDL
+                    "replace" => {
+                        row_type = RowType::Update;
+                        let document = match event.get_document("fullDocument") {
+                            Ok(document) => document.clone(),
+                            Err(_) => continue,
+                        };
+                        let document_key = match event.get_document("documentKey") {
+                            Ok(document_key) => document_key.clone(),
+                            Err(_) => continue,
+                        };
+                        Self::insert_id_from_doc(&mut before, &document_key);
+                        Self::insert_document_key(&mut before, &document_key);
+                        Self::insert_id_from_doc(&mut after, &document_key);
+                        Self::insert_document_key(&mut after, &document_key);
+                        Self::insert_id_from_doc(&mut after, &document);
+                        if let Ok(pre_image) = event.get_document("fullDocumentBeforeChange") {
+                            before.insert(
+                                MongoConstants::PRE_IMAGE.to_string(),
+                                ColValue::MongoDoc(pre_image.clone()),
+                            );
+                            before.insert(
+                                MongoConstants::DOC.to_string(),
+                                ColValue::MongoDoc(pre_image.clone()),
+                            );
+                        }
+                        after.insert(
+                            MongoConstants::DOC.to_string(),
+                            ColValue::MongoDoc(document),
+                        );
+                    }
                     _ => {
+                        if !enable_change_stream_ddl {
+                            continue;
+                        }
+                        if let Some(ddl_data) = change_stream_event_to_ddl(&event) {
+                            let (ddl_db, ddl_tb) = ddl_data.get_schema_tb();
+                            if !self.filter.filter_ddl(&ddl_db, &ddl_tb, &ddl_data.ddl_type) {
+                                self.base_extractor
+                                    .push_ddl(&mut self.extract_state, ddl_data, position)
+                                    .await?;
+                            }
+                        };
                         continue;
                     }
                 }
 
-                let row_data = RowData::new(db, tb, 0, row_type, Some(before), Some(after));
+                let before = if before.is_empty() {
+                    None
+                } else {
+                    Some(before)
+                };
+                let after = if after.is_empty() { None } else { Some(after) };
+                let row_data = RowData::new(db, tb, 0, row_type, before, after);
                 self.push_row_to_buf(row_data, position).await?;
             }
         }
@@ -575,13 +943,277 @@ impl MongoCdcExtractor {
         }};
 
         let collection = client.database(db).collection::<Document>(tb);
-        let options = UpdateOptions::builder().upsert(true).build();
         if let Err(err) = collection
-            .update_one(query_doc, update_doc, Some(options))
+            .update_one(query_doc, update_doc)
+            .upsert(true)
             .await
         {
             log_error!("heartbeat failed: {:?}", err);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_oplog_update_doc_merges_insert_update_and_delete_diff() {
+        let after_doc = doc! {
+            "diff": {
+                "i": { "created": true },
+                "u": { "name": "new-name" },
+                "d": { "removed": false },
+            },
+        };
+
+        let update_doc = MongoCdcExtractor::build_oplog_update_doc(&after_doc);
+
+        assert_eq!(
+            update_doc.get_document(MongoConstants::SET).unwrap(),
+            &doc! { "created": true, "name": "new-name" }
+        );
+        assert_eq!(
+            update_doc.get_document(MongoConstants::UNSET).unwrap(),
+            &doc! { "removed": false }
+        );
+    }
+
+    #[test]
+    fn build_oplog_update_doc_flattens_nested_sub_diff() {
+        let after_doc = doc! {
+            "diff": {
+                "sprofile": {
+                    "u": { "name": "new-name" },
+                    "d": { "age": false },
+                    "saddress": {
+                        "i": { "city": "Hangzhou" },
+                    },
+                },
+            },
+        };
+
+        let update_doc = MongoCdcExtractor::build_oplog_update_doc(&after_doc);
+
+        assert_eq!(
+            update_doc.get_document(MongoConstants::SET).unwrap(),
+            &doc! {
+                "profile.name": "new-name",
+                "profile.address.city": "Hangzhou",
+            }
+        );
+        assert_eq!(
+            update_doc.get_document(MongoConstants::UNSET).unwrap(),
+            &doc! { "profile.age": false }
+        );
+    }
+
+    #[test]
+    fn build_oplog_update_doc_keeps_legacy_set_and_unset() {
+        let after_doc = doc! {
+            MongoConstants::SET: { "name": "new-name" },
+            MongoConstants::UNSET: { "age": "" },
+        };
+
+        let update_doc = MongoCdcExtractor::build_oplog_update_doc(&after_doc);
+
+        assert_eq!(
+            update_doc.get_document(MongoConstants::SET).unwrap(),
+            &doc! { "name": "new-name" }
+        );
+        assert_eq!(
+            update_doc.get_document(MongoConstants::UNSET).unwrap(),
+            &doc! { "age": "" }
+        );
+    }
+
+    #[test]
+    fn build_change_stream_update_doc_converts_update_description() {
+        let update_description = doc! {
+            "updatedFields": {
+                "name": "new-name",
+                "profile.score": 10,
+            },
+            "removedFields": ["old_field"],
+            "truncatedArrays": [
+                { "field": "attrs", "newSize": 1 },
+            ],
+        };
+        let full_document = doc! {
+            "name": "new-name",
+            "profile": { "score": 10 },
+            "attrs": ["kept"],
+        };
+
+        let update_doc = MongoCdcExtractor::build_change_stream_update_doc(
+            &update_description,
+            Some(&full_document),
+        );
+
+        assert_eq!(
+            update_doc.get_document(MongoConstants::SET).unwrap(),
+            &doc! {
+                "name": "new-name",
+                "profile.score": 10,
+                "attrs": ["kept"],
+            }
+        );
+        assert_eq!(
+            update_doc.get_document(MongoConstants::UNSET).unwrap(),
+            &doc! { "old_field": "" }
+        );
+    }
+
+    #[test]
+    fn change_stream_update_requires_full_document_for_literal_dot_path() {
+        let update_description = doc! {
+            "updatedFields": {
+                "home.town": "London",
+            },
+            "disambiguatedPaths": {
+                "home.town": ["home.town"],
+            },
+        };
+
+        assert!(
+            MongoCdcExtractor::change_stream_update_requires_full_document(&update_description)
+        );
+
+        let update_description = doc! {
+            "updatedFields": {
+                "profile.score": 10,
+            },
+        };
+
+        assert!(
+            !MongoCdcExtractor::change_stream_update_requires_full_document(&update_description)
+        );
+    }
+
+    #[test]
+    fn change_stream_disambiguated_paths_keeps_safe_update_paths_as_diff() {
+        let update_description = doc! {
+            "updatedFields": {
+                "profile.score": 10,
+                "attrs.0": "first",
+            },
+            "removedFields": ["profile.old"],
+            "disambiguatedPaths": {
+                "profile.score": ["profile", "score"],
+                "attrs.0": ["attrs", 0],
+                "profile.old": ["profile", "old"],
+            },
+        };
+
+        assert!(
+            !MongoCdcExtractor::change_stream_update_requires_full_document(&update_description)
+        );
+        let update_doc =
+            MongoCdcExtractor::build_change_stream_update_doc(&update_description, None);
+
+        assert_eq!(
+            update_doc.get_document(MongoConstants::SET).unwrap(),
+            &doc! {
+                "profile.score": 10,
+                "attrs.0": "first",
+            }
+        );
+        assert_eq!(
+            update_doc.get_document(MongoConstants::UNSET).unwrap(),
+            &doc! { "profile.old": "" }
+        );
+    }
+
+    #[test]
+    fn change_stream_disambiguated_paths_keeps_array_and_numeric_field_paths_as_diff() {
+        let update_description = doc! {
+            "updatedFields": {
+                "scores.2": 99,
+                "matrix.0.1": 42,
+                "residences.0.0": "street",
+                "profile.0": "zero-field",
+            },
+            "removedFields": ["old_scores.1", "profile.1"],
+            "disambiguatedPaths": {
+                "scores.2": ["scores", 2],
+                "matrix.0.1": ["matrix", 0, 1],
+                "residences.0.0": ["residences", 0, "0"],
+                "profile.0": ["profile", "0"],
+                "old_scores.1": ["old_scores", 1],
+                "profile.1": ["profile", "1"],
+            },
+        };
+
+        assert!(
+            !MongoCdcExtractor::change_stream_update_requires_full_document(&update_description)
+        );
+        let update_doc =
+            MongoCdcExtractor::build_change_stream_update_doc(&update_description, None);
+
+        assert_eq!(
+            update_doc.get_document(MongoConstants::SET).unwrap(),
+            &doc! {
+                "scores.2": 99,
+                "matrix.0.1": 42,
+                "residences.0.0": "street",
+                "profile.0": "zero-field",
+            }
+        );
+        assert_eq!(
+            update_doc.get_document(MongoConstants::UNSET).unwrap(),
+            &doc! {
+                "old_scores.1": "",
+                "profile.1": "",
+            }
+        );
+    }
+
+    #[test]
+    fn change_stream_disambiguated_paths_requires_full_document_for_literal_dot_fields() {
+        for update_description in [
+            doc! {
+                "updatedFields": { "home.town": "London" },
+                "disambiguatedPaths": { "home.town": ["home.town"] },
+            },
+            doc! {
+                "updatedFields": { "profile.name.first": "Ada" },
+                "disambiguatedPaths": { "profile.name.first": ["profile", "name.first"] },
+            },
+            doc! {
+                "removedFields": ["archive.2026.status"],
+                "disambiguatedPaths": { "archive.2026.status": ["archive.2026", "status"] },
+            },
+        ] {
+            assert!(
+                MongoCdcExtractor::change_stream_update_requires_full_document(&update_description),
+                "update_description should require fullDocument: {:?}",
+                update_description
+            );
+        }
+    }
+
+    #[test]
+    fn change_stream_disambiguated_paths_requires_full_document_for_malformed_paths() {
+        for update_description in [
+            doc! {
+                "updatedFields": { "profile.score": 10 },
+                "disambiguatedPaths": { "profile.score": [] },
+            },
+            doc! {
+                "updatedFields": { "profile.score": 10 },
+                "disambiguatedPaths": { "profile.score": "profile.score" },
+            },
+            doc! {
+                "updatedFields": { "profile.score": 10 },
+                "disambiguatedPaths": { "profile.score": ["profile", true] },
+            },
+        ] {
+            assert!(
+                MongoCdcExtractor::change_stream_update_requires_full_document(&update_description),
+                "malformed disambiguated path should require fullDocument: {:?}",
+                update_description
+            );
+        }
     }
 }

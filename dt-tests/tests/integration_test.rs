@@ -1,8 +1,8 @@
 mod log_reader;
+mod mock_test;
 mod mongo_to_mongo;
 mod mysql_to_clickhouse;
 mod mysql_to_doris;
-mod mysql_to_foxlake;
 mod mysql_to_kafka_to_mysql;
 mod mysql_to_mysql;
 mod mysql_to_mysql_case_sensitive;

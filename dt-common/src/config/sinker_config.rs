@@ -1,13 +1,9 @@
-use super::{
-    config_enums::{ConflictPolicyEnum, DbType},
-    json_template_type::JsonTemplateType,
-    message_format::MessageFormat,
-    s3_config::S3Config,
-};
+use super::config_enums::{ConflictPolicyEnum, DbType};
 use crate::config::{
     config_enums::{RdbTransactionIsolation, SinkType},
     connection_auth_config::ConnectionAuthConfig,
     limiter_config::RateLimiterConfig,
+    task_config::APE_DTS,
 };
 
 #[derive(Clone, Debug)]
@@ -36,8 +32,18 @@ pub enum SinkerConfig {
     Mongo {
         url: String,
         connection_auth: ConnectionAuthConfig,
+        is_direct_connection: Option<bool>,
         app_name: String,
         batch_size: usize,
+        require_shard_key_filter: bool,
+    },
+
+    MongoStruct {
+        url: String,
+        connection_auth: ConnectionAuthConfig,
+        is_direct_connection: Option<bool>,
+        app_name: String,
+        conflict_policy: ConflictPolicyEnum,
     },
 
     MysqlStruct {
@@ -58,8 +64,6 @@ pub enum SinkerConfig {
         ack_timeout_secs: u64,
         required_acks: String,
         with_field_defs: bool,
-        message_format: MessageFormat,
-        json_template: JsonTemplateType,
         skip_confirmed_noop_updates: bool,
     },
 
@@ -68,7 +72,7 @@ pub enum SinkerConfig {
         connection_auth: ConnectionAuthConfig,
         batch_size: usize,
         method: String,
-        is_cluster: bool,
+        is_cluster: Option<bool>,
     },
 
     RedisStatistic {
@@ -116,33 +120,6 @@ pub enum SinkerConfig {
         engine: String,
     },
 
-    Foxlake {
-        url: String,
-        batch_size: usize,
-        batch_memory_mb: usize,
-        s3_config: S3Config,
-        engine: String,
-    },
-
-    FoxlakePush {
-        url: String,
-        batch_size: usize,
-        batch_memory_mb: usize,
-        s3_config: S3Config,
-    },
-
-    FoxlakeMerge {
-        url: String,
-        batch_size: usize,
-        s3_config: S3Config,
-    },
-
-    FoxlakeStruct {
-        url: String,
-        conflict_policy: ConflictPolicyEnum,
-        engine: String,
-    },
-
     Sql {
         reverse: bool,
     },
@@ -157,6 +134,11 @@ pub struct BasicSinkerConfig {
     pub batch_size: usize,
     pub max_connections: u32,
     pub rate_limiter: RateLimiterConfig,
+    // mongo special attrs
+    pub app_name: Option<String>,
+    pub is_direct_connection: Option<bool>,
+    // redis special attrs
+    pub is_cluster: Option<bool>,
 }
 
 impl Default for BasicSinkerConfig {
@@ -169,6 +151,9 @@ impl Default for BasicSinkerConfig {
             batch_size: 0,
             max_connections: 10,
             rate_limiter: RateLimiterConfig::default(),
+            app_name: Some(APE_DTS.to_string()),
+            is_direct_connection: None,
+            is_cluster: None,
         }
     }
 }

@@ -31,6 +31,28 @@ pub enum DdlType {
     CreateIndex,
     #[strum(serialize = "drop_index")]
     DropIndex,
+    // MongoDB DDLs
+    #[strum(serialize = "mongo_create_collection")]
+    MongoCreateCollection,
+    #[strum(serialize = "mongo_drop_collection")]
+    MongoDropCollection,
+    #[strum(serialize = "mongo_rename_collection")]
+    MongoRenameCollection,
+    #[strum(serialize = "mongo_drop_database")]
+    MongoDropDatabase,
+    #[strum(serialize = "mongo_create_index")]
+    MongoCreateIndex,
+    #[strum(serialize = "mongo_drop_index")]
+    MongoDropIndex,
+    #[strum(serialize = "mongo_coll_mod")]
+    MongoCollMod,
+    #[strum(serialize = "mongo_shard_collection")]
+    MongoShardCollection,
+    #[strum(serialize = "mongo_reshard_collection")]
+    MongoReshardCollection,
+    #[strum(serialize = "mongo_refine_collection_shard_key")]
+    MongoRefineCollectionShardKey,
+
     #[strum(serialize = "unknown")]
     Unknown,
 }
@@ -38,5 +60,16 @@ pub enum DdlType {
 impl Default for DdlType {
     fn default() -> Self {
         Self::Unknown
+    }
+}
+
+impl DdlType {
+    pub fn is_mongo_shard_ddl(&self) -> bool {
+        matches!(
+            self,
+            DdlType::MongoShardCollection
+                | DdlType::MongoReshardCollection
+                | DdlType::MongoRefineCollectionShardKey
+        )
     }
 }

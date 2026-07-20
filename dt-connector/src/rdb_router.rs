@@ -138,9 +138,7 @@ impl RdbRouter {
     }
 
     pub fn validate_redis_db_map(&self, is_cluster: bool) -> anyhow::Result<()> {
-        if let Err(e) = self.forward.validate_redis_db_map() {
-            return Err(e);
-        }
+        self.forward.validate_redis_db_map()?;
         if is_cluster {
             return self.forward.validate_redis_target_cluster_db_map();
         }
@@ -302,10 +300,14 @@ impl RdbRouterInner {
     }
 
     fn route_ddl(&self, mut ddl_data: DdlData) -> DdlData {
+        let has_rename_target = !ddl_data.get_rename_to_schema_tb().1.is_empty();
         match &mut ddl_data.statement {
             DdlStatement::MysqlAlterTableRename(_)
             | DdlStatement::PgAlterTableRename(_)
-            | DdlStatement::RenameTable(_) => {
+            | DdlStatement::RenameTable(_)
+            | DdlStatement::MongoCommand(_)
+                if has_rename_target =>
+            {
                 let (src_schema, src_tb) = ddl_data.get_schema_tb();
                 let (src_new_schema, src_new_tb) = ddl_data.get_rename_to_schema_tb();
                 let (dst_schema, dst_tb) = self.get_tb_map(&src_schema, &src_tb);
@@ -341,6 +343,20 @@ impl RdbRouterInner {
             StructStatement::MysqlCreateDatabase(s) => {
                 let dst_schema = self.get_schema_map(&s.database.name).to_string();
                 s.route(&dst_schema)
+            }
+
+            StructStatement::MongoCreateCollection(s) => {
+                let (schema, tb) = (s.database_name.clone(), s.collection_name.clone());
+                let (dst_schema, dst_tb) = self.get_tb_map(&schema, &tb);
+                s.route(dst_schema, dst_tb)
+            }
+
+            StructStatement::MongoShardKey(s) => {
+                let ns = s.shard_collection.ns.clone();
+                if let Some((schema, tb)) = ns.split_once('.') {
+                    let (dst_schema, dst_tb) = self.get_tb_map(schema, tb);
+                    s.route(schema, tb, dst_schema, dst_tb)
+                }
             }
 
             StructStatement::PgCreateTable(s) => {

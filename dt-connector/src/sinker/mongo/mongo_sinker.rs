@@ -1,10 +1,9 @@
-use std::cmp;
+use std::{cmp, collections::HashMap};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use mongodb::{
     bson::{doc, Document},
-    options::UpdateOptions,
     Client, Collection,
 };
 use tokio::time::Instant;
@@ -14,7 +13,14 @@ use crate::{call_batch_fn, rdb_router::RdbRouter, sinker::base_sinker::BaseSinke
 use dt_common::{
     log_error,
     meta::{
-        col_value::ColValue, mongo::mongo_constant::MongoConstants, row_data::RowData,
+        col_value::ColValue,
+        ddl_meta::{ddl_data::DdlData, ddl_type::DdlType},
+        mongo::{
+            mongo_constant::MongoConstants,
+            mongo_ddl::query_to_command,
+            mongo_shard::{get_shard_collection, MongoShardCollection},
+        },
+        row_data::RowData,
         row_type::RowType,
     },
     utils::limit_queue::LimitedQueue,
@@ -26,6 +32,9 @@ pub struct MongoSinker {
     pub batch_size: usize,
     pub mongo_client: Client,
     pub base_sinker: BaseSinker,
+    pub target_shard_collections: HashMap<String, Option<MongoShardCollection>>,
+    pub require_shard_key_filter: bool,
+    pub is_target_mongos: bool,
 }
 
 #[async_trait]
@@ -52,6 +61,17 @@ impl Sinker for MongoSinker {
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn sink_ddl(&mut self, data: Vec<DdlData>, _batch: bool) -> anyhow::Result<()> {
+        for ddl_data in data {
+            if !self.is_target_mongos && ddl_data.ddl_type.is_mongo_shard_ddl() {
+                continue;
+            }
+            self.run_ddl(&ddl_data).await?;
+        }
+        self.target_shard_collections.clear();
         Ok(())
     }
 }
@@ -81,6 +101,285 @@ impl CheckableSink for MongoSinker {
 }
 
 impl MongoSinker {
+    fn target_ns(&self, row_data: &RowData) -> String {
+        format!("{}.{}", row_data.schema, row_data.tb)
+    }
+
+    async fn target_shard_collection(
+        &mut self,
+        row_data: &RowData,
+    ) -> anyhow::Result<Option<MongoShardCollection>> {
+        let ns = self.target_ns(row_data);
+        self.target_shard_collection_by_ns(&ns).await
+    }
+
+    async fn target_shard_collection_by_ns(
+        &mut self,
+        ns: &str,
+    ) -> anyhow::Result<Option<MongoShardCollection>> {
+        if let Some(shard_collection) = self.target_shard_collections.get(ns) {
+            return Ok(shard_collection.clone());
+        }
+
+        let shard_collection = if self.is_target_mongos {
+            get_shard_collection(&self.mongo_client, ns).await?
+        } else {
+            None
+        };
+        self.target_shard_collections
+            .insert(ns.to_string(), shard_collection.clone());
+        Ok(shard_collection)
+    }
+
+    async fn is_target_sharded(&mut self, row_data: &RowData) -> anyhow::Result<bool> {
+        Ok(self.target_shard_collection(row_data).await?.is_some())
+    }
+
+    fn mongo_doc<'a>(fields: &'a HashMap<String, ColValue>, key: &str) -> Option<&'a Document> {
+        match fields.get(key) {
+            Some(ColValue::MongoDoc(doc)) => Some(doc),
+            _ => None,
+        }
+    }
+
+    async fn complete_shard_filter(
+        &mut self,
+        row_data: &RowData,
+        document_key: Option<&Document>,
+        full_doc: Option<&Document>,
+    ) -> anyhow::Result<Document> {
+        self.complete_shard_filter_with_priority(row_data, document_key, full_doc, false)
+            .await
+    }
+
+    async fn complete_shard_filter_prefer_full_doc(
+        &mut self,
+        row_data: &RowData,
+        document_key: Option<&Document>,
+        full_doc: Option<&Document>,
+    ) -> anyhow::Result<Document> {
+        self.complete_shard_filter_with_priority(row_data, document_key, full_doc, true)
+            .await
+    }
+
+    async fn complete_shard_filter_with_priority(
+        &mut self,
+        row_data: &RowData,
+        document_key: Option<&Document>,
+        full_doc: Option<&Document>,
+        prefer_full_doc_shard_keys: bool,
+    ) -> anyhow::Result<Document> {
+        let shard_collection = match self.target_shard_collection(row_data).await? {
+            Some(shard_collection) => shard_collection,
+            None => {
+                let doc = document_key
+                    .or(full_doc)
+                    .context("mongo doc missing for filter")?;
+                let id = doc
+                    .get(MongoConstants::ID)
+                    .context("mongo doc missing `_id`")?;
+                return Ok(doc! { MongoConstants::ID: id.clone() });
+            }
+        };
+
+        let mut filter = Document::new();
+        if prefer_full_doc_shard_keys {
+            for key in shard_collection.key.keys() {
+                if let Some(value) = full_doc.and_then(|doc| doc.get(key)) {
+                    filter.insert(key, value.clone());
+                }
+            }
+        }
+
+        if let Some(document_key) = document_key {
+            for (key, value) in document_key {
+                if !filter.contains_key(key) {
+                    filter.insert(key, value.clone());
+                }
+            }
+        }
+
+        for key in shard_collection.key.keys() {
+            if !filter.contains_key(key) {
+                if let Some(value) = full_doc.and_then(|doc| doc.get(key)) {
+                    filter.insert(key, value.clone());
+                }
+            }
+        }
+
+        if !filter.contains_key(MongoConstants::ID) {
+            if let Some(value) = full_doc
+                .and_then(|doc| doc.get(MongoConstants::ID))
+                .or_else(|| document_key.and_then(|doc| doc.get(MongoConstants::ID)))
+            {
+                filter.insert(MongoConstants::ID, value.clone());
+            }
+        }
+
+        let missing_keys: Vec<_> = shard_collection
+            .key
+            .keys()
+            .filter(|key| !filter.contains_key(*key))
+            .cloned()
+            .collect();
+        if self.require_shard_key_filter && !missing_keys.is_empty() {
+            anyhow::bail!(
+                "mongo target collection [{}] is sharded, but row filter is missing shard key field(s): {:?}",
+                shard_collection.ns,
+                missing_keys
+            );
+        }
+
+        if filter.is_empty() {
+            anyhow::bail!(
+                "mongo target collection [{}] is sharded, but row filter is empty",
+                shard_collection.ns
+            );
+        }
+        Ok(filter)
+    }
+
+    async fn shard_key_changed(
+        &mut self,
+        row_data: &RowData,
+        old_doc: Option<&Document>,
+        old_doc_is_pre_image: bool,
+        full_doc: Option<&Document>,
+    ) -> anyhow::Result<bool> {
+        let Some(shard_collection) = self.target_shard_collection(row_data).await? else {
+            return Ok(false);
+        };
+        let (Some(old_doc), Some(full_doc)) = (old_doc, full_doc) else {
+            return Ok(false);
+        };
+
+        Ok(shard_collection.key.keys().any(|key| {
+            let old_value = old_doc.get(key);
+            let new_value = full_doc.get(key);
+            if old_doc_is_pre_image {
+                old_value != new_value
+            } else {
+                old_value.is_some() && old_value != new_value
+            }
+        }))
+    }
+
+    fn id_filter(document_key: Option<&Document>, full_doc: Option<&Document>) -> Option<Document> {
+        let id = document_key
+            .and_then(|doc| doc.get(MongoConstants::ID))
+            .or_else(|| full_doc.and_then(|doc| doc.get(MongoConstants::ID)))?;
+        Some(doc! { MongoConstants::ID: id.clone() })
+    }
+
+    async fn run_ddl(&mut self, ddl_data: &DdlData) -> anyhow::Result<()> {
+        let mut command = query_to_command(&ddl_data.query)?;
+        self.rewrite_ddl_command_namespace(ddl_data, &mut command);
+
+        match ddl_data.ddl_type {
+            DdlType::MongoDropDatabase => {
+                let (db, _) = ddl_data.get_schema_tb();
+                self.mongo_client.database(&db).drop().await?;
+            }
+
+            DdlType::MongoShardCollection => {
+                if self.ensure_shard_collection_command(&command).await? {
+                    self.run_admin_command(command).await?;
+                }
+            }
+
+            DdlType::MongoReshardCollection | DdlType::MongoRefineCollectionShardKey => {
+                self.run_admin_command(command).await?;
+            }
+
+            DdlType::MongoRenameCollection => {
+                self.run_admin_command(command).await?;
+            }
+
+            DdlType::MongoCreateCollection
+            | DdlType::MongoDropCollection
+            | DdlType::MongoCreateIndex
+            | DdlType::MongoDropIndex
+            | DdlType::MongoCollMod => {
+                let (db, _) = ddl_data.get_schema_tb();
+                self.mongo_client.database(&db).run_command(command).await?;
+            }
+
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn run_admin_command(&self, command: Document) -> anyhow::Result<()> {
+        self.mongo_client
+            .database("admin")
+            .run_command(command)
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_shard_collection_command(
+        &mut self,
+        command: &Document,
+    ) -> anyhow::Result<bool> {
+        let ns = command
+            .get_str("shardCollection")
+            .context("mongo shardCollection command missing namespace")?;
+        let (db, _) = ns
+            .split_once('.')
+            .context("mongo shardCollection namespace missing db")?;
+        if let Some(existing) = self.target_shard_collection_by_ns(ns).await? {
+            let key = command
+                .get_document("key")
+                .context("mongo shardCollection command missing key")?;
+            let unique = command.get_bool("unique").unwrap_or(false);
+            if existing.key != *key || existing.unique != unique {
+                anyhow::bail!(
+                    "mongo target collection [{}] shard key mismatch, source key: {:?}, source unique: {}, target key: {:?}, target unique: {}",
+                    ns,
+                    key,
+                    unique,
+                    existing.key,
+                    existing.unique,
+                );
+            }
+            return Ok(false);
+        }
+
+        self.mongo_client
+            .database("admin")
+            .run_command(doc! { "enableSharding": db })
+            .await?;
+        Ok(true)
+    }
+
+    fn rewrite_ddl_command_namespace(&self, ddl_data: &DdlData, command: &mut Document) {
+        let (db, tb) = ddl_data.get_schema_tb();
+        let (new_db, new_tb) = ddl_data.get_rename_to_schema_tb();
+        for command_name in ["create", "drop", "createIndexes", "dropIndexes", "collMod"] {
+            if command.contains_key(command_name) && !tb.is_empty() {
+                command.insert(command_name, tb.clone());
+                return;
+            }
+        }
+
+        if command.contains_key("renameCollection") {
+            command.insert("renameCollection", format!("{}.{}", db, tb));
+            command.insert("to", format!("{}.{}", new_db, new_tb));
+            return;
+        }
+
+        for command_name in [
+            "shardCollection",
+            "reshardCollection",
+            "refineCollectionShardKey",
+        ] {
+            if command.contains_key(command_name) && !tb.is_empty() {
+                command.insert(command_name, format!("{}.{}", db, tb));
+                return;
+            }
+        }
+    }
+
     async fn serial_sink(&mut self, data: &[RowData]) -> anyhow::Result<()> {
         let task_id = self.base_sinker.source_task_id_for_rows(data, &self.router);
         self.base_sinker.ensure_monitor_for(&task_id);
@@ -103,11 +402,14 @@ impl MongoSinker {
             match row_data.row_type {
                 RowType::Insert => {
                     let after = row_data.require_after()?;
-                    if let Some(ColValue::MongoDoc(doc)) = after.get(MongoConstants::DOC) {
-                        let id = doc
-                            .get(MongoConstants::ID)
-                            .context("mongo doc missing `_id`")?;
-                        let query_doc = doc! {MongoConstants::ID: id};
+                    if let Some(doc) = Self::mongo_doc(after, MongoConstants::DOC) {
+                        let query_doc = self
+                            .complete_shard_filter(
+                                row_data,
+                                Self::mongo_doc(after, MongoConstants::DOCUMENT_KEY),
+                                Some(doc),
+                            )
+                            .await?;
                         let update_doc = doc! {MongoConstants::SET: doc.clone()};
                         self.upsert(&collection, query_doc, update_doc).await?;
                         rts.push((start_time.elapsed().as_millis() as u64, 1));
@@ -116,47 +418,131 @@ impl MongoSinker {
 
                 RowType::Delete => {
                     let before = row_data.require_before()?;
-                    if let Some(ColValue::MongoDoc(doc)) = before.get(MongoConstants::DOC) {
-                        let id = doc
-                            .get(MongoConstants::ID)
-                            .context("mongo doc missing `_id`")?;
-                        let query_doc = doc! {MongoConstants::ID: id};
-                        collection.delete_one(query_doc, None).await?;
+                    if let Some(doc) = Self::mongo_doc(before, MongoConstants::DOC) {
+                        let query_doc = self
+                            .complete_shard_filter(
+                                row_data,
+                                Self::mongo_doc(before, MongoConstants::DOCUMENT_KEY).or(Some(doc)),
+                                None,
+                            )
+                            .await?;
+                        collection.delete_one(query_doc).await?;
                         rts.push((start_time.elapsed().as_millis() as u64, 1));
                     }
                 }
 
                 RowType::Update => {
-                    let query_doc = {
-                        let before = row_data.require_before()?;
-                        if let Some(ColValue::MongoDoc(doc)) = before.get(MongoConstants::DOC) {
-                            let id = doc
-                                .get(MongoConstants::ID)
-                                .context("mongo doc missing `_id`")?;
-                            Some(doc! {MongoConstants::ID: id})
-                        } else {
-                            None
-                        }
-                    };
+                    let before = row_data.require_before()?;
+                    let before_doc =
+                        before
+                            .get(MongoConstants::DOC)
+                            .and_then(|value| match value {
+                                ColValue::MongoDoc(doc) => Some(doc),
+                                _ => None,
+                            });
+                    let pre_image = Self::mongo_doc(before, MongoConstants::PRE_IMAGE);
+                    let document_key = Self::mongo_doc(before, MongoConstants::DOCUMENT_KEY);
+                    let old_shard_doc = pre_image.or(document_key).or(before_doc);
+                    let after_full_doc = row_data
+                        .after
+                        .as_ref()
+                        .and_then(|after| Self::mongo_doc(after, MongoConstants::DOC));
 
-                    let update_doc = {
-                        let after = row_data.require_after()?;
-                        if let Some(ColValue::MongoDoc(doc)) = after.get(MongoConstants::DOC) {
-                            Some(doc.clone())
-                        } else if let Some(ColValue::MongoDoc(doc)) =
-                            after.get(MongoConstants::DIFF_DOC)
-                        {
-                            // for Update row_data from oplog (NOT change stream), after contains diff_doc instead of doc
-                            Some(doc.clone())
+                    if self
+                        .shard_key_changed(
+                            row_data,
+                            old_shard_doc,
+                            pre_image.is_some(),
+                            after_full_doc,
+                        )
+                        .await?
+                    {
+                        let old_filter = if let Some(pre_image) = pre_image {
+                            self.complete_shard_filter_prefer_full_doc(
+                                row_data,
+                                document_key,
+                                Some(pre_image),
+                            )
+                            .await?
                         } else {
-                            None
-                        }
-                    };
-
-                    if query_doc.is_some() && update_doc.is_some() {
-                        self.upsert(&collection, query_doc.unwrap(), update_doc.unwrap())
+                            self.complete_shard_filter(row_data, document_key.or(before_doc), None)
+                                .await?
+                        };
+                        let new_doc = after_full_doc
+                            .context("mongo shard key update requires full document after image")?;
+                        let new_filter = self
+                            .complete_shard_filter(row_data, None, Some(new_doc))
                             .await?;
+                        if !self
+                            .replace_existing(&collection, old_filter, new_doc.clone())
+                            .await?
+                        {
+                            self.replace(&collection, new_filter, new_doc.clone())
+                                .await?;
+                        }
                         rts.push((start_time.elapsed().as_millis() as u64, 1));
+                        continue;
+                    }
+
+                    let query_doc = {
+                        if let Some(pre_image) = pre_image {
+                            Some(
+                                self.complete_shard_filter_prefer_full_doc(
+                                    row_data,
+                                    document_key,
+                                    Some(pre_image),
+                                )
+                                .await?,
+                            )
+                        } else if let Some(doc) = before_doc {
+                            Some(
+                                self.complete_shard_filter(
+                                    row_data,
+                                    document_key.or(Some(doc)),
+                                    row_data.after.as_ref().and_then(|after| {
+                                        Self::mongo_doc(after, MongoConstants::DOC)
+                                    }),
+                                )
+                                .await?,
+                            )
+                        } else if let Some(document_key) = document_key {
+                            Some(
+                                self.complete_shard_filter(
+                                    row_data,
+                                    Some(document_key),
+                                    row_data.after.as_ref().and_then(|after| {
+                                        Self::mongo_doc(after, MongoConstants::DOC)
+                                    }),
+                                )
+                                .await?,
+                            )
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(query_doc) = query_doc {
+                        let after = row_data.require_after()?;
+                        if let Some(doc) = Self::mongo_doc(after, MongoConstants::DIFF_DOC) {
+                            let after_full_doc = Self::mongo_doc(after, MongoConstants::DOC);
+                            if let Some(after_full_doc) = after_full_doc {
+                                self.update_existing_with_fallback(
+                                    &collection,
+                                    row_data,
+                                    query_doc,
+                                    doc.clone(),
+                                    document_key,
+                                    after_full_doc,
+                                )
+                                .await?;
+                            } else {
+                                self.upsert(&collection, query_doc, doc.clone()).await?;
+                            }
+                            rts.push((start_time.elapsed().as_millis() as u64, 1));
+                        } else if let Some(doc) = Self::mongo_doc(after, MongoConstants::DOC) {
+                            self.replace(&collection, query_doc, doc.clone()).await?;
+                            rts.push((start_time.elapsed().as_millis() as u64, 1));
+                        }
                     }
                 }
             }
@@ -203,6 +589,14 @@ impl MongoSinker {
             .database(&data[0].schema)
             .collection::<Document>(&data[0].tb);
 
+        for row_data in data.iter().skip(start_index).take(batch_size) {
+            if self.is_target_sharded(row_data).await? {
+                return self
+                    .serial_sink(&data[start_index..start_index + batch_size])
+                    .await;
+            }
+        }
+
         let mut ids = Vec::new();
         for rd in data.iter().skip(start_index).take(batch_size) {
             data_size += rd.get_data_size() as usize;
@@ -223,7 +617,7 @@ impl MongoSinker {
         };
         let start_time = Instant::now();
         let mut rts = LimitedQueue::new(1);
-        collection.delete_many(query, None).await?;
+        collection.delete_many(query).await?;
         rts.push((start_time.elapsed().as_millis() as u64, 1));
 
         self.base_sinker
@@ -258,7 +652,7 @@ impl MongoSinker {
             }
         }
 
-        if let Err(error) = collection.insert_many(docs, None).await {
+        if let Err(error) = collection.insert_many(docs).await {
             log_error!(
                 "batch insert failed, will insert one by one, schema: {}, tb: {}, error: {}",
                 db,
@@ -280,10 +674,101 @@ impl MongoSinker {
         query_doc: Document,
         update_doc: Document,
     ) -> anyhow::Result<()> {
-        let options = UpdateOptions::builder().upsert(true).build();
         collection
-            .update_one(query_doc, update_doc, Some(options))
+            .update_one(query_doc, update_doc)
+            .upsert(true)
             .await?;
         Ok(())
+    }
+
+    async fn update_existing(
+        &mut self,
+        collection: &Collection<Document>,
+        query_doc: Document,
+        update_doc: Document,
+    ) -> anyhow::Result<bool> {
+        let result = collection.update_one(query_doc, update_doc).await?;
+        Ok(result.matched_count > 0)
+    }
+
+    async fn update_existing_with_fallback(
+        &mut self,
+        collection: &Collection<Document>,
+        row_data: &RowData,
+        query_doc: Document,
+        update_doc: Document,
+        document_key: Option<&Document>,
+        full_doc: &Document,
+    ) -> anyhow::Result<()> {
+        if self
+            .update_existing(collection, query_doc, update_doc.clone())
+            .await?
+        {
+            return Ok(());
+        }
+
+        if self.is_target_sharded(row_data).await? {
+            if let Some(id_filter) = Self::id_filter(document_key, Some(full_doc)) {
+                if let Some(target_doc) = collection.find_one(id_filter).await? {
+                    let retry_filter = self
+                        .complete_shard_filter_prefer_full_doc(
+                            row_data,
+                            document_key,
+                            Some(&target_doc),
+                        )
+                        .await?;
+                    if self
+                        .update_existing(collection, retry_filter, update_doc.clone())
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+
+            let new_filter = self
+                .complete_shard_filter(row_data, None, Some(full_doc))
+                .await?;
+            if self
+                .update_existing(collection, new_filter, update_doc.clone())
+                .await?
+            {
+                return Ok(());
+            }
+
+            anyhow::bail!(
+                "mongo update matched no target document for sharded collection [{}]",
+                self.target_ns(row_data)
+            );
+        }
+
+        if let Some(id_filter) = Self::id_filter(document_key, Some(full_doc)) {
+            self.replace(collection, id_filter, full_doc.clone())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn replace(
+        &mut self,
+        collection: &Collection<Document>,
+        query_doc: Document,
+        replacement_doc: Document,
+    ) -> anyhow::Result<()> {
+        collection
+            .replace_one(query_doc, replacement_doc)
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    async fn replace_existing(
+        &mut self,
+        collection: &Collection<Document>,
+        query_doc: Document,
+        replacement_doc: Document,
+    ) -> anyhow::Result<bool> {
+        let result = collection.replace_one(query_doc, replacement_doc).await?;
+        Ok(result.matched_count > 0)
     }
 }

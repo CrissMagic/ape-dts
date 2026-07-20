@@ -185,7 +185,16 @@ impl<'r> RdbSnapshotExtractStatement<'r> {
                 };
                 extract_cols.push(extract_col);
             } else {
-                extract_cols.push(self.escape(col));
+                let col_type = self
+                    .mysql_tb_meta
+                    .expect("mysql table meta missing when building mysql snapshot extract cols")
+                    .get_col_type(col)?;
+                let extract_col = if col_type.is_spatial() {
+                    SqlUtil::mysql_spatial_as_wkb_expr(&self.escape(col), &self.escape(col))
+                } else {
+                    self.escape(col)
+                };
+                extract_cols.push(extract_col);
             }
         }
         Ok(extract_cols.join(","))
@@ -209,17 +218,19 @@ impl<'r> RdbSnapshotExtractStatement<'r> {
                     let col_type = pg_tb_meta.get_col_type(col).unwrap();
                     let idx = self.placeholder_index.get() + 1;
                     self.placeholder_index.set(idx);
-                    format!(r#"${}::{}"#, idx, col_type.alias)
+                    format!(r#"${}::{}"#, idx, col_type.get_alias())
                 })
                 .collect::<Vec<String>>()
                 .join(", "))
-        } else if self.mysql_tb_meta.is_some() {
+        } else if let Some(mysql_tb_meta) = self.mysql_tb_meta {
             // MySQL: ?, ?, ...
-            Ok(order_cols
-                .iter()
-                .map(|_| "?".to_string())
-                .collect::<Vec<String>>()
-                .join(", "))
+            let mut placeholders = Vec::with_capacity(order_cols.len());
+            for col in order_cols {
+                placeholders.push(SqlUtil::mysql_comparison_placeholder(
+                    mysql_tb_meta.get_col_type(col)?,
+                ));
+            }
+            Ok(placeholders.join(", "))
         } else {
             bail!(
                 "unsupported db type: {:?} for building placeholder string",
@@ -387,6 +398,31 @@ mod tests {
         }
     }
 
+    fn create_mysql_time_order_tb_meta() -> MysqlTbMeta {
+        let cols = vec![
+            "time_col".to_string(),
+            "year_col".to_string(),
+            "val".to_string(),
+        ];
+
+        let basic = RdbTbMeta {
+            schema: "test_schema".to_string(),
+            tb: "time_order_table".to_string(),
+            cols,
+            ..Default::default()
+        };
+
+        let mut col_type_map = HashMap::new();
+        col_type_map.insert("time_col".to_string(), MysqlColType::Time { precision: 6 });
+        col_type_map.insert("year_col".to_string(), MysqlColType::Year);
+        col_type_map.insert("val".to_string(), MysqlColType::Int { unsigned: false });
+
+        MysqlTbMeta {
+            basic,
+            col_type_map,
+        }
+    }
+
     fn create_pg_tb_meta() -> PgTbMeta {
         let cols = vec![
             "id".to_string(),
@@ -423,6 +459,7 @@ mod tests {
                 category: "N".to_string(),
                 enum_values: None,
                 schema_name: "pg_catalog".to_string(),
+                typmod: 0,
             },
         );
         // Float type
@@ -438,6 +475,7 @@ mod tests {
                 category: "N".to_string(),
                 enum_values: None,
                 schema_name: "pg_catalog".to_string(),
+                typmod: 0,
             },
         );
         // Text types
@@ -453,6 +491,7 @@ mod tests {
                 category: "S".to_string(),
                 enum_values: None,
                 schema_name: "pg_catalog".to_string(),
+                typmod: 0,
             },
         );
         col_type_map.insert(
@@ -467,6 +506,7 @@ mod tests {
                 category: "S".to_string(),
                 enum_values: None,
                 schema_name: "pg_catalog".to_string(),
+                typmod: 0,
             },
         );
         // Binary type
@@ -482,12 +522,65 @@ mod tests {
                 category: "U".to_string(),
                 enum_values: None,
                 schema_name: "pg_catalog".to_string(),
+                typmod: 0,
             },
         );
 
         PgTbMeta {
             basic,
             oid: 16384,
+            col_type_map,
+        }
+    }
+
+    fn create_pg_bit_order_tb_meta() -> PgTbMeta {
+        let cols = vec!["bit_col".to_string(), "bit_array_col".to_string()];
+        let mut nullable_cols = HashSet::new();
+        nullable_cols.insert("bit_array_col".to_string());
+
+        let basic = RdbTbMeta {
+            schema: "test_schema".to_string(),
+            tb: "bit_order_table".to_string(),
+            cols,
+            nullable_cols,
+            ..Default::default()
+        };
+
+        let mut col_type_map = HashMap::new();
+        col_type_map.insert(
+            "bit_col".to_string(),
+            PgColType {
+                value_type: PgValueType::String,
+                name: "bit".to_string(),
+                alias: "bit".to_string(),
+                oid: 1560,
+                parent_oid: 0,
+                element_oid: 0,
+                category: "V".to_string(),
+                enum_values: None,
+                schema_name: "pg_catalog".to_string(),
+                typmod: 10,
+            },
+        );
+        col_type_map.insert(
+            "bit_array_col".to_string(),
+            PgColType {
+                value_type: PgValueType::String,
+                name: "_bit".to_string(),
+                alias: "_bit".to_string(),
+                oid: 1561,
+                parent_oid: 0,
+                element_oid: 1560,
+                category: "A".to_string(),
+                enum_values: None,
+                schema_name: "pg_catalog".to_string(),
+                typmod: 10,
+            },
+        );
+
+        PgTbMeta {
+            basic,
+            oid: 16385,
             col_type_map,
         }
     }
@@ -533,6 +626,23 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_time_order_col_gt_casts_placeholder() {
+        let mysql_meta = create_mysql_time_order_tb_meta();
+        let stmt = RdbSnapshotExtractStatement::from(&mysql_meta);
+        let order_cols = vec!["time_col".to_string(), "year_col".to_string()];
+        let stmt = stmt
+            .with_order_cols(&order_cols)
+            .with_predicate_type(OrderKeyPredicateType::GreaterThan)
+            .with_limit(4);
+
+        let sql = stmt.build().unwrap();
+        assert_eq!(
+            sql,
+            r#"SELECT `time_col`,`year_col`,`val` FROM `test_schema`.`time_order_table` WHERE (`time_col`, `year_col`) > (CAST(? AS TIME(6)), ?) ORDER BY `test_schema`.`time_order_table`.`time_col` ASC, `test_schema`.`time_order_table`.`year_col` ASC LIMIT 4"#
+        );
+    }
+
+    #[test]
     fn test_mysql_single_order_col_range() {
         let mysql_meta = create_mysql_tb_meta();
         let stmt = RdbSnapshotExtractStatement::from(&mysql_meta);
@@ -545,6 +655,22 @@ mod tests {
         assert_eq!(
             sql,
             r#"SELECT `id`,`price`,`username`,`bio`,`large_blob` FROM `test_schema`.`test_table` WHERE `id` > ? AND `id` <= ? ORDER BY `test_schema`.`test_table`.`id` ASC"#
+        );
+    }
+
+    #[test]
+    fn test_mysql_time_order_col_range_casts_placeholder() {
+        let mysql_meta = create_mysql_time_order_tb_meta();
+        let stmt = RdbSnapshotExtractStatement::from(&mysql_meta);
+        let order_cols = vec!["time_col".to_string(), "year_col".to_string()];
+        let stmt = stmt
+            .with_order_cols(&order_cols)
+            .with_predicate_type(OrderKeyPredicateType::Range);
+
+        let sql = stmt.build().unwrap();
+        assert_eq!(
+            sql,
+            r#"SELECT `time_col`,`year_col`,`val` FROM `test_schema`.`time_order_table` WHERE (`time_col`, `year_col`) > (CAST(? AS TIME(6)), ?) AND (`time_col`, `year_col`) <= (CAST(? AS TIME(6)), ?) ORDER BY `test_schema`.`time_order_table`.`time_col` ASC, `test_schema`.`time_order_table`.`year_col` ASC"#
         );
     }
 
@@ -676,6 +802,23 @@ mod tests {
         assert_eq!(
             sql,
             r#"SELECT "id"::int8,"price"::float8,"username"::text,"bio"::text,"large_blob"::bytea FROM "test_schema"."test_table" WHERE ("id", "price", "username", "bio", "large_blob") > ($1::int8, $2::float8, $3::varchar, $4::text, $5::bytea) AND "price" IS NOT NULL AND "bio" IS NOT NULL AND "large_blob" IS NOT NULL ORDER BY "test_schema"."test_table"."id" ASC, "test_schema"."test_table"."price" ASC, "test_schema"."test_table"."username" ASC, "test_schema"."test_table"."bio" ASC, "test_schema"."test_table"."large_blob" ASC LIMIT 100"#
+        );
+    }
+
+    #[test]
+    fn test_pg_bit_order_col_gt_uses_bit_typmod_placeholder() {
+        let pg_meta = create_pg_bit_order_tb_meta();
+        let stmt = RdbSnapshotExtractStatement::from(&pg_meta);
+        let order_cols = vec!["bit_col".to_string(), "bit_array_col".to_string()];
+        let stmt = stmt
+            .with_order_cols(&order_cols)
+            .with_predicate_type(OrderKeyPredicateType::GreaterThan)
+            .with_limit(100);
+
+        let sql = stmt.build().unwrap();
+        assert_eq!(
+            sql,
+            r#"SELECT "bit_col"::text,"bit_array_col"::text FROM "test_schema"."bit_order_table" WHERE ("bit_col", "bit_array_col") > ($1::bit(10), $2::bit(10)[]) AND "bit_array_col" IS NOT NULL ORDER BY "test_schema"."bit_order_table"."bit_col" ASC, "test_schema"."bit_order_table"."bit_array_col" ASC LIMIT 100"#
         );
     }
 

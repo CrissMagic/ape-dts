@@ -16,6 +16,7 @@ use crate::{
         limiter_config::{CapacityLimiterConfig, RateLimiterConfig},
     },
     error::Error,
+    meta::mongo::mongo_cdc_source::MongoCdcSource,
     utils::task_util::TaskUtil,
 };
 
@@ -41,6 +42,7 @@ use super::{
     runtime_config::RuntimeConfig,
     s3_config::S3Config,
     sinker_config::{BasicSinkerConfig, SinkerConfig},
+    tracing_config::TracingConfig,
 };
 
 #[derive(Clone)]
@@ -60,6 +62,7 @@ pub struct TaskConfig {
     pub meta_center: Option<MetaCenterConfig>,
     pub data_marker: Option<DataMarkerConfig>,
     pub processor: Option<ProcessorConfig>,
+    pub tracing: TracingConfig,
     #[cfg(feature = "metrics")]
     pub metrics: MetricsConfig,
 }
@@ -82,6 +85,7 @@ const DATA_MARKER: &str = "data_marker";
 const PROCESSOR: &str = "processor";
 const CHECKER: &str = "checker";
 const META_CENTER: &str = "metacenter";
+const TRACING: &str = "tracing";
 // keys
 const CHECK_LOG_DIR: &str = "check_log_dir";
 const CHECK_LOG_FILE_SIZE: &str = "check_log_file_size";
@@ -121,9 +125,13 @@ const CHECK_LOG_S3: &str = "check_log_s3";
 const S3_KEY_PREFIX: &str = "s3_key_prefix";
 const CDC_CHECK_LOG_INTERVAL_SECS: &str = "cdc_check_log_interval_secs";
 const SAMPLE_RATE: &str = "sample_rate";
+const IS_DIRECT_CONNECTION: &str = "is_direct_connection";
+const MONGO_REQUIRE_SHARD_KEY_FILTER: &str = "mongo_require_shard_key_filter";
+const TASK_SUMMARY_MODE: &str = "task_summary_mode";
+const OUTPUT_FORMAT: &str = "output_format";
 
 // default values
-const APE_DTS: &str = "APE_DTS";
+pub const APE_DTS: &str = "APE_DTS";
 const ASTRISK: &str = "*";
 const RESUMER_CONNECTION_LIMIT_DEFAULT: usize = 5;
 
@@ -269,6 +277,7 @@ impl TaskConfig {
             data_marker: Self::load_data_marker_config(&loader)?,
             processor: Self::load_processor_config(&loader)?,
             meta_center: Self::load_meta_center_config(&loader)?,
+            tracing: Self::load_tracing_config(&loader),
             #[cfg(feature = "metrics")]
             metrics: Self::load_metrics_config(&loader)?,
         })
@@ -549,6 +558,12 @@ impl TaskConfig {
             loader.get_with_default(EXTRACTOR, MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS);
 
         let connection_auth = ConnectionAuthConfig::from(loader, EXTRACTOR);
+        let app_name: String = loader.get_with_default(EXTRACTOR, APP_NAME, APE_DTS.to_string());
+        let is_direct_connection = if loader.contains(EXTRACTOR, IS_DIRECT_CONNECTION) {
+            Some(loader.get_optional(EXTRACTOR, IS_DIRECT_CONNECTION))
+        } else {
+            None
+        };
 
         let rate_limiter = RateLimiterConfig {
             max_rps: loader.get_optional(EXTRACTOR, "max_rps"),
@@ -561,6 +576,8 @@ impl TaskConfig {
             connection_auth: connection_auth.clone(),
             max_connections,
             rate_limiter,
+            app_name: Some(app_name.to_owned()),
+            is_direct_connection,
         };
 
         let not_supported_err =
@@ -637,33 +654,6 @@ impl TaskConfig {
                         DEFAULT_DB_BATCH_SIZE,
                     ),
                 },
-
-                ExtractType::FoxlakeS3 => {
-                    let s3_config = S3Config {
-                        bucket: loader.get_optional(EXTRACTOR, "s3_bucket"),
-                        access_key: loader.get_optional(EXTRACTOR, "s3_access_key"),
-                        secret_key: loader.get_optional(EXTRACTOR, "s3_secret_key"),
-                        region: loader.get_optional(EXTRACTOR, "s3_region"),
-                        endpoint: loader.get_optional(EXTRACTOR, "s3_endpoint"),
-                        root_dir: loader.get_optional(EXTRACTOR, "s3_root_dir"),
-                        root_url: loader.get_optional(EXTRACTOR, "s3_root_url"),
-                    };
-                    ExtractorConfig::FoxlakeS3 {
-                        url,
-                        schema: String::new(),
-                        tb: String::new(),
-                        schema_tbs: HashMap::new(),
-                        parallel_size: Self::load_snapshot_parallel_size(loader),
-                        parallel_type: loader.get_with_default(
-                            EXTRACTOR,
-                            "parallel_type",
-                            RdbParallelType::Table,
-                        ),
-                        s3_config,
-                        batch_size,
-                    }
-                }
-
                 _ => bail! {not_supported_err},
             },
 
@@ -724,58 +714,75 @@ impl TaskConfig {
                 _ => bail! { not_supported_err },
             },
 
-            DbType::Mongo => {
-                let app_name: String =
-                    loader.get_with_default(EXTRACTOR, APP_NAME, APE_DTS.to_string());
-                match extract_type {
-                    ExtractType::Snapshot => {
-                        let batch_size = match u32::try_from(batch_size) {
-                            std::result::Result::Ok(batch_size) => batch_size,
-                            Err(_) => bail! { Error::ConfigError(format!(
-                                "config [{}].{} default value exceeds u32::MAX",
-                                EXTRACTOR, BATCH_SIZE,
-                            ))},
-                        };
+            DbType::Mongo => match extract_type {
+                ExtractType::Snapshot => {
+                    let batch_size = match u32::try_from(batch_size) {
+                        std::result::Result::Ok(batch_size) => batch_size,
+                        Err(_) => bail! { Error::ConfigError(format!(
+                            "config [{}].{} default value exceeds u32::MAX",
+                            EXTRACTOR, BATCH_SIZE,
+                        ))},
+                    };
 
-                        ExtractorConfig::MongoSnapshot {
-                            url,
-                            connection_auth,
-                            app_name,
-                            db: String::new(),
-                            tb: String::new(),
-                            db_tbs: HashMap::new(),
-                            parallel_size: Self::load_snapshot_parallel_size(loader),
-                            parallel_type: loader.get_with_default(
-                                EXTRACTOR,
-                                "parallel_type",
-                                RdbParallelType::Table,
-                            ),
-                            batch_size,
-                        }
-                    }
-
-                    ExtractType::Cdc => ExtractorConfig::MongoCdc {
+                    ExtractorConfig::MongoSnapshot {
                         url,
                         connection_auth,
+                        is_direct_connection,
+                        app_name,
+                        db: String::new(),
+                        tb: String::new(),
+                        db_tbs: HashMap::new(),
+                        parallel_size: Self::load_snapshot_parallel_size(loader),
+                        parallel_type: loader.get_with_default(
+                            EXTRACTOR,
+                            "parallel_type",
+                            RdbParallelType::Table,
+                        ),
+                        batch_size,
+                    }
+                }
+
+                ExtractType::Cdc => {
+                    let source: String =
+                        loader.get_with_default(EXTRACTOR, "source", "change_stream".to_string());
+                    ExtractorConfig::MongoCdc {
+                        url,
+                        connection_auth,
+                        is_direct_connection,
                         app_name,
                         resume_token: loader.get_optional(EXTRACTOR, "resume_token"),
                         start_timestamp: loader.get_optional(EXTRACTOR, "start_timestamp"),
-                        source: loader.get_optional(EXTRACTOR, "source"),
+                        source: MongoCdcSource::parse(&source)?,
                         heartbeat_interval_secs,
                         heartbeat_tb,
-                    },
-
-                    ExtractType::CheckLog => ExtractorConfig::MongoCheck {
-                        url,
-                        connection_auth,
-                        app_name,
-                        check_log_dir: loader.get_required(EXTRACTOR, CHECK_LOG_DIR),
-                        batch_size: loader.get_with_default(EXTRACTOR, BATCH_SIZE, 200),
-                    },
-
-                    _ => bail! { not_supported_err },
+                    }
                 }
-            }
+
+                ExtractType::CheckLog => ExtractorConfig::MongoCheck {
+                    url,
+                    connection_auth,
+                    is_direct_connection,
+                    app_name,
+                    check_log_dir: loader.get_required(EXTRACTOR, CHECK_LOG_DIR),
+                    batch_size: loader.get_with_default(EXTRACTOR, BATCH_SIZE, 200),
+                },
+
+                ExtractType::Struct => ExtractorConfig::MongoStruct {
+                    url,
+                    connection_auth,
+                    is_direct_connection,
+                    app_name,
+                    db: String::new(),
+                    dbs: Vec::new(),
+                    db_batch_size: loader.get_with_default(
+                        EXTRACTOR,
+                        "db_batch_size",
+                        DEFAULT_DB_BATCH_SIZE,
+                    ),
+                },
+
+                _ => bail! { not_supported_err },
+            },
 
             DbType::Redis => match extract_type {
                 ExtractType::Snapshot => {
@@ -784,7 +791,7 @@ impl TaskConfig {
                         url,
                         connection_auth,
                         repl_port,
-                        is_cluster: loader.get_optional(EXTRACTOR, "is_cluster"),
+                        is_cluster: Self::get_is_cluster_config(loader, EXTRACTOR),
                     }
                 }
 
@@ -811,7 +818,7 @@ impl TaskConfig {
                         heartbeat_interval_secs,
                         heartbeat_key: loader.get_optional(EXTRACTOR, "heartbeat_key"),
                         now_db_id: loader.get_optional(EXTRACTOR, "now_db_id"),
-                        is_cluster: loader.get_optional(EXTRACTOR, "is_cluster"),
+                        is_cluster: Self::get_is_cluster_config(loader, EXTRACTOR),
                     }
                 }
 
@@ -825,7 +832,7 @@ impl TaskConfig {
                         keepalive_interval_secs,
                         heartbeat_interval_secs,
                         heartbeat_key: loader.get_optional(EXTRACTOR, "heartbeat_key"),
-                        is_cluster: loader.get_optional(EXTRACTOR, "is_cluster"),
+                        is_cluster: Self::get_is_cluster_config(loader, EXTRACTOR),
                     }
                 }
 
@@ -906,11 +913,18 @@ impl TaskConfig {
         let max_connections =
             loader.get_with_default(SINKER, MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS);
         let connection_auth = ConnectionAuthConfig::from(loader, SINKER);
-
+        let app_name: String = loader.get_with_default(SINKER, APP_NAME, APE_DTS.to_string());
+        let is_direct_connection = if loader.contains(SINKER, IS_DIRECT_CONNECTION) {
+            Some(loader.get_optional(SINKER, IS_DIRECT_CONNECTION))
+        } else {
+            None
+        };
         let rate_limiter = RateLimiterConfig {
             max_rps: loader.get_optional(SINKER, "max_rps"),
             max_mbps: loader.get_optional(SINKER, "max_mbps"),
         };
+        let is_cluster = Self::get_is_cluster_config(loader, SINKER);
+
         let basic = BasicSinkerConfig {
             sink_type: sink_type.clone(),
             db_type: db_type.clone(),
@@ -919,6 +933,9 @@ impl TaskConfig {
             batch_size,
             max_connections,
             rate_limiter,
+            app_name: Some(app_name.to_owned()),
+            is_direct_connection,
+            is_cluster,
         };
 
         let conflict_policy: ConflictPolicyEnum =
@@ -981,20 +998,30 @@ impl TaskConfig {
                 _ => bail! { not_supported_err },
             },
 
-            DbType::Mongo => {
-                let app_name: String =
-                    loader.get_with_default(SINKER, APP_NAME, APE_DTS.to_string());
-                match sink_type {
-                    SinkType::Write => SinkerConfig::Mongo {
-                        url,
-                        connection_auth,
-                        app_name,
-                        batch_size,
-                    },
+            DbType::Mongo => match sink_type {
+                SinkType::Write => SinkerConfig::Mongo {
+                    url,
+                    connection_auth,
+                    is_direct_connection,
+                    app_name,
+                    batch_size,
+                    require_shard_key_filter: loader.get_with_default(
+                        SINKER,
+                        MONGO_REQUIRE_SHARD_KEY_FILTER,
+                        true,
+                    ),
+                },
 
-                    _ => bail! { not_supported_err },
-                }
-            }
+                SinkType::Struct => SinkerConfig::MongoStruct {
+                    url,
+                    connection_auth,
+                    is_direct_connection,
+                    app_name,
+                    conflict_policy,
+                },
+
+                _ => bail! { not_supported_err },
+            },
 
             DbType::Kafka => SinkerConfig::Kafka {
                 url,
@@ -1002,8 +1029,6 @@ impl TaskConfig {
                 ack_timeout_secs: loader.get_with_default(SINKER, "ack_timeout_secs", 5),
                 required_acks: loader.get_with_default(SINKER, "required_acks", "one".to_string()),
                 with_field_defs: loader.get_with_default(SINKER, "with_field_defs", true),
-                message_format: loader.get_optional(SINKER, "message_format"),
-                json_template: loader.get_optional(SINKER, "json_template"),
                 skip_confirmed_noop_updates: loader.get_with_default(
                     SINKER,
                     "skip_confirmed_noop_updates",
@@ -1017,7 +1042,7 @@ impl TaskConfig {
                     connection_auth,
                     batch_size,
                     method: loader.get_optional(SINKER, "method"),
-                    is_cluster: loader.get_optional(SINKER, "is_cluster"),
+                    is_cluster,
                 },
 
                 SinkType::Statistic => SinkerConfig::RedisStatistic {
@@ -1080,49 +1105,6 @@ impl TaskConfig {
 
                 _ => bail! { not_supported_err },
             },
-
-            DbType::Foxlake => {
-                let s3_config = S3Config {
-                    bucket: loader.get_optional(SINKER, "s3_bucket"),
-                    access_key: loader.get_optional(SINKER, "s3_access_key"),
-                    secret_key: loader.get_optional(SINKER, "s3_secret_key"),
-                    region: loader.get_optional(SINKER, "s3_region"),
-                    endpoint: loader.get_optional(SINKER, "s3_endpoint"),
-                    root_dir: loader.get_optional(SINKER, "s3_root_dir"),
-                    root_url: loader.get_optional(SINKER, "s3_root_url"),
-                };
-
-                match sink_type {
-                    SinkType::Write => SinkerConfig::Foxlake {
-                        url,
-                        batch_size,
-                        batch_memory_mb: loader.get_optional(SINKER, "batch_memory_mb"),
-                        s3_config,
-                        engine: loader.get_optional(SINKER, "engine"),
-                    },
-
-                    SinkType::Struct => SinkerConfig::FoxlakeStruct {
-                        url,
-                        conflict_policy,
-                        engine: loader.get_optional(SINKER, "engine"),
-                    },
-
-                    SinkType::Push => SinkerConfig::FoxlakePush {
-                        url,
-                        batch_size,
-                        batch_memory_mb: loader.get_optional(SINKER, "batch_memory_mb"),
-                        s3_config,
-                    },
-
-                    SinkType::Merge => SinkerConfig::FoxlakeMerge {
-                        url,
-                        batch_size,
-                        s3_config,
-                    },
-
-                    _ => bail! { not_supported_err },
-                }
-            }
         };
         Ok((basic, sinker))
     }
@@ -1220,9 +1202,6 @@ impl TaskConfig {
             counter_time_window_secs: loader.get_optional(PIPELINE, "counter_time_window_secs"),
             counter_max_sub_count: loader.get_with_default(PIPELINE, "counter_max_sub_count", 1000),
             pipeline_type: loader.get_with_default(PIPELINE, "pipeline_type", PipelineType::Basic),
-            http_host: loader.get_with_default(PIPELINE, "http_host", "0.0.0.0".to_string()),
-            http_port: loader.get_with_default(PIPELINE, "http_port", 10231),
-            with_field_defs: loader.get_with_default(PIPELINE, "with_field_defs", true),
         };
 
         if config.counter_time_window_secs == 0 {
@@ -1326,6 +1305,7 @@ impl TaskConfig {
         Ok(Some(config))
     }
 
+    // TODO: checker support mongo & redis special configs
     fn checker_as_basic_sinker(checker: &CheckerConfig) -> BasicSinkerConfig {
         BasicSinkerConfig {
             sink_type: SinkType::Dummy,
@@ -1335,6 +1315,9 @@ impl TaskConfig {
             batch_size: checker.batch_size,
             max_connections: checker.max_connections,
             rate_limiter: RateLimiterConfig::default(),
+            app_name: Some(APP_NAME.to_string()),
+            is_direct_connection: None,
+            is_cluster: None,
         }
     }
 
@@ -1353,6 +1336,18 @@ impl TaskConfig {
                 false,
             ),
         })
+    }
+
+    fn load_tracing_config(loader: &IniLoader) -> TracingConfig {
+        let default = TracingConfig::default();
+        TracingConfig {
+            task_summary_mode: loader.get_with_default(
+                TRACING,
+                TASK_SUMMARY_MODE,
+                default.task_summary_mode,
+            ),
+            output_format: loader.get_with_default(TRACING, OUTPUT_FORMAT, default.output_format),
+        }
     }
 
     fn load_snapshot_parallel_size(loader: &IniLoader) -> usize {
@@ -1407,6 +1402,7 @@ impl TaskConfig {
         }
 
         let resume_type = loader.get_with_default(RESUMER, RESUME_TYPE, ResumeType::Dummy);
+
         match resume_type {
             ResumeType::FromLog => Ok(ResumerConfig::FromLog {
                 log_dir: loader.get_with_default(RESUMER, "log_dir", runtime.log_dir.clone()),
@@ -1433,19 +1429,28 @@ impl TaskConfig {
                         MAX_CONNECTIONS,
                         RESUMER_CONNECTION_LIMIT_DEFAULT,
                     ),
+                    is_direct_connection: target.is_direct_connection,
                 })
             }
-            ResumeType::FromDB => Ok(ResumerConfig::FromDB {
-                url: loader.get_required(RESUMER, URL),
-                connection_auth: ConnectionAuthConfig::from(loader, RESUMER),
-                db_type: loader.get_required(RESUMER, DB_TYPE),
-                table_full_name: loader.get_optional(RESUMER, "table_full_name"),
-                max_connections: loader.get_with_default(
-                    RESUMER,
-                    MAX_CONNECTIONS,
-                    RESUMER_CONNECTION_LIMIT_DEFAULT,
-                ),
-            }),
+            ResumeType::FromDB => {
+                let is_direct_connection = if loader.contains(RESUMER, IS_DIRECT_CONNECTION) {
+                    Some(loader.get_optional(RESUMER, IS_DIRECT_CONNECTION))
+                } else {
+                    None
+                };
+                Ok(ResumerConfig::FromDB {
+                    url: loader.get_required(RESUMER, URL),
+                    connection_auth: ConnectionAuthConfig::from(loader, RESUMER),
+                    db_type: loader.get_required(RESUMER, DB_TYPE),
+                    table_full_name: loader.get_optional(RESUMER, "table_full_name"),
+                    max_connections: loader.get_with_default(
+                        RESUMER,
+                        MAX_CONNECTIONS,
+                        RESUMER_CONNECTION_LIMIT_DEFAULT,
+                    ),
+                    is_direct_connection,
+                })
+            }
             _ => Ok(ResumerConfig::Dummy),
         }
     }
@@ -1523,6 +1528,14 @@ impl TaskConfig {
         Ok(Some(config))
     }
 
+    fn get_is_cluster_config(loader: &IniLoader, section: &str) -> Option<bool> {
+        let key = "is_cluster";
+        match loader.ini.get(section, key) {
+            Some(value) if !value.trim().is_empty() => Some(loader.get_optional(section, key)),
+            _ => None,
+        }
+    }
+
     #[cfg(feature = "metrics")]
     fn load_metrics_config(loader: &IniLoader) -> anyhow::Result<MetricsConfig> {
         let metrics_section = "metrics";
@@ -1555,9 +1568,11 @@ mod tests {
     use crate::config::parallelizer_config::{
         ChunkPartitionerRebalanceCost, ChunkPartitionerRebalanceStrategy,
     };
-    use crate::config::sinker_config::SinkerConfig;
+    use crate::runtime_trace::{TaskSummaryMode, TraceOutputFormat};
 
-    use super::{CheckMode, ParallelType, TaskConfig, TaskKind, TaskType};
+    use super::{
+        CheckMode, ExtractorConfig, ParallelType, SinkerConfig, TaskConfig, TaskKind, TaskType,
+    };
 
     static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1620,6 +1635,80 @@ url=mysql://127.0.0.1:3307
 parallel_type=rdb_merge
 "#
         )
+    }
+
+    fn basic_snapshot_config(extra_config: &str) -> String {
+        format!(
+            r#"[extractor]
+db_type=mysql
+extract_type=snapshot
+url=mysql://127.0.0.1:3306
+
+[sinker]
+db_type=mysql
+sink_type=write
+url=mysql://127.0.0.1:3307
+
+[parallelizer]
+parallel_type=rdb_merge
+
+{extra_config}
+"#
+        )
+    }
+
+    #[test]
+    fn tracing_config_defaults_to_marker_summary_mode() {
+        let config = load_temp_task_config(&basic_snapshot_config(""))
+            .expect("default tracing config should be valid");
+
+        assert_eq!(config.tracing.task_summary_mode, TaskSummaryMode::Marker);
+        assert_eq!(config.tracing.output_format, TraceOutputFormat::Plain);
+    }
+
+    #[test]
+    fn tracing_config_loads_marker_summary_mode_and_json_output() {
+        let config = load_temp_task_config(&basic_snapshot_config(
+            r#"[tracing]
+task_summary_mode=marker
+output_format=json
+"#,
+        ))
+        .expect("tracing config should be valid");
+
+        assert_eq!(config.tracing.task_summary_mode, TaskSummaryMode::Marker);
+        assert_eq!(config.tracing.output_format, TraceOutputFormat::Json);
+    }
+
+    #[test]
+    fn redis_empty_is_cluster_keeps_auto_detection() {
+        let config = load_temp_task_config(
+            r#"[extractor]
+db_type=redis
+extract_type=cdc
+url=redis://127.0.0.1:6379
+is_cluster=
+
+[sinker]
+db_type=redis
+sink_type=write
+url=redis://127.0.0.1:6380
+is_cluster=
+
+[parallelizer]
+parallel_type=redis
+"#,
+        )
+        .unwrap();
+
+        match config.extractor {
+            ExtractorConfig::RedisCdc { is_cluster, .. } => assert_eq!(is_cluster, None),
+            _ => panic!("expected redis cdc extractor"),
+        }
+        match config.sinker {
+            SinkerConfig::Redis { is_cluster, .. } => assert_eq!(is_cluster, None),
+            _ => panic!("expected redis sinker"),
+        }
     }
 
     #[test]

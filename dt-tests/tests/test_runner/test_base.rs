@@ -219,6 +219,23 @@ impl TestBase {
             .unwrap();
     }
 
+    pub async fn run_mongo_changestream_ddl_test(
+        test_dir: &str,
+        start_millis: u64,
+        parse_millis: u64,
+    ) {
+        let runner = MongoTestRunner::new(test_dir).await.unwrap();
+        runner
+            .run_changestream_ddl_test(start_millis, parse_millis)
+            .await
+            .unwrap();
+    }
+
+    pub async fn run_mongo_struct_test(test_dir: &str) {
+        let runner = MongoTestRunner::new(test_dir).await.unwrap();
+        runner.run_struct_test().await.unwrap();
+    }
+
     pub async fn run_mongo_cdc_resume_test(test_dir: &str, start_millis: u64, parse_millis: u64) {
         let runner = MongoTestRunner::new(test_dir).await.unwrap();
         runner
@@ -328,6 +345,13 @@ impl TestBase {
     pub async fn run_pg_struct_test(test_dir: &str) {
         let mut runner = RdbStructTestRunner::new(test_dir).await.unwrap();
         runner.run_pg_struct_test().await.unwrap();
+        runner.base.execute_clean_sqls().await.unwrap();
+        runner.close().await.unwrap();
+    }
+
+    pub async fn run_mock_struct_test(test_dir: &str) {
+        let mut runner = RdbStructTestRunner::new(test_dir).await.unwrap();
+        runner.run_mock_struct_test().await.unwrap();
         runner.base.execute_clean_sqls().await.unwrap();
         runner.close().await.unwrap();
     }

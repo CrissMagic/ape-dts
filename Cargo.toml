@@ -36,7 +36,10 @@ tokio-postgres = {git = "https://github.com/apecloud/rust-postgres"}
 postgres-openssl = {git = "https://github.com/apecloud/rust-postgres"}
 postgres-protocol = {git = "https://github.com/apecloud/rust-postgres"}
 postgres-types= {git = "https://github.com/apecloud/rust-postgres"}
-tokio = { version = "1.25.0", features = ["full"] }
+tokio = { version = "1.48.0", features = ["full"] }
+tokio-metrics = { version = "0.5.1", default-features = false }
+tokio-util = {version = "0.7.7", features = ["rt"]}
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "registry", "std"] }
 bytes = "1.0"
 configparser = "3.0.2"
 async-mutex = "1.4.0"
@@ -48,7 +51,7 @@ kafka = "0.10.0"
 reqwest = {git = "https://github.com/apecloud/reqwest", features = ["redirect-with-sensitive-headers"] }
 uuid = { version = "1.3.1", features = ["v4"] }
 nom = "7.1.3"
-mongodb = { version = "2.5.0" }
+mongodb = { version = "=3.6.0" }
 dotenv = "0.15.0"
 redis =  { version = "0.27.4", features = ["tokio-comp"] }
 thiserror = "1.0.44"
@@ -59,15 +62,13 @@ anyhow = {version = "1.0.83", features = ["backtrace"]}
 clap = { version = "4.5.40", features = ["derive"] }
 clap_complete = "4.5.40"
 rust_decimal = "1.35.0"
-orc-format = {git = "https://github.com/apecloud/orc-format"}
 openssl = { version = "0.10", features = ["vendored"] }
 openssl-sys = { version = "0.9", features = ["vendored"]}
-actix-web = "4.9.0"
+actix-web = "=4.12.1"
 hex = "0.4.3"
 clickhouse = "0.13.1"
 dashmap = "6.1.0"
 percent-encoding = "2.3.1"
-base64 = "0.22.1"
 urlencoding = "2.1.3"
 opendal = { version = "0.54.1", features = ["services-s3"] }
 governor = "0.10.4"
@@ -80,3 +81,10 @@ strip = 'debuginfo'
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[profile.profiling]
+inherits = 'release'
+debug = true
+strip = 'none'
+lto = false
+codegen-units = 16

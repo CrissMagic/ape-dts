@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
-use crate::config::{
-    config_enums::RdbParallelType, connection_auth_config::ConnectionAuthConfig,
-    limiter_config::RateLimiterConfig,
+use crate::{
+    config::{
+        config_enums::RdbParallelType, connection_auth_config::ConnectionAuthConfig,
+        limiter_config::RateLimiterConfig,
+    },
+    meta::mongo::mongo_cdc_source::MongoCdcSource,
 };
 
-use super::{
-    config_enums::{DbType, ExtractType},
-    s3_config::S3Config,
-};
+use super::config_enums::{DbType, ExtractType};
 
 #[derive(Clone, Debug)]
 pub enum ExtractorConfig {
@@ -105,6 +105,7 @@ pub enum ExtractorConfig {
     MongoSnapshot {
         url: String,
         connection_auth: ConnectionAuthConfig,
+        is_direct_connection: Option<bool>,
         app_name: String,
         db: String,
         tb: String,
@@ -117,11 +118,12 @@ pub enum ExtractorConfig {
     MongoCdc {
         url: String,
         connection_auth: ConnectionAuthConfig,
+        is_direct_connection: Option<bool>,
         app_name: String,
         resume_token: String,
         start_timestamp: u32,
         // op_log, change_stream
-        source: String,
+        source: MongoCdcSource,
         heartbeat_interval_secs: u64,
         heartbeat_tb: String,
     },
@@ -129,16 +131,27 @@ pub enum ExtractorConfig {
     MongoCheck {
         url: String,
         connection_auth: ConnectionAuthConfig,
+        is_direct_connection: Option<bool>,
         app_name: String,
         check_log_dir: String,
         batch_size: usize,
+    },
+
+    MongoStruct {
+        url: String,
+        connection_auth: ConnectionAuthConfig,
+        is_direct_connection: Option<bool>,
+        app_name: String,
+        db: String,
+        dbs: Vec<String>,
+        db_batch_size: usize,
     },
 
     RedisSnapshot {
         url: String,
         connection_auth: ConnectionAuthConfig,
         repl_port: u64,
-        is_cluster: bool,
+        is_cluster: Option<bool>,
     },
 
     RedisCdc {
@@ -151,7 +164,7 @@ pub enum ExtractorConfig {
         heartbeat_interval_secs: u64,
         heartbeat_key: String,
         now_db_id: i64,
-        is_cluster: bool,
+        is_cluster: Option<bool>,
     },
 
     RedisSnapshotAndCdc {
@@ -162,7 +175,7 @@ pub enum ExtractorConfig {
         keepalive_interval_secs: u64,
         heartbeat_interval_secs: u64,
         heartbeat_key: String,
-        is_cluster: bool,
+        is_cluster: Option<bool>,
     },
 
     RedisSnapshotFile {
@@ -189,17 +202,6 @@ pub enum ExtractorConfig {
         offset: i64,
         ack_interval_secs: u64,
     },
-
-    FoxlakeS3 {
-        url: String,
-        schema: String,
-        tb: String,
-        schema_tbs: HashMap<String, Vec<String>>,
-        parallel_size: usize,
-        parallel_type: RdbParallelType,
-        s3_config: S3Config,
-        batch_size: usize,
-    },
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -210,4 +212,6 @@ pub struct BasicExtractorConfig {
     pub connection_auth: ConnectionAuthConfig,
     pub max_connections: u32,
     pub rate_limiter: RateLimiterConfig,
+    pub app_name: Option<String>,
+    pub is_direct_connection: Option<bool>,
 }

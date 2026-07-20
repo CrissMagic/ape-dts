@@ -3,16 +3,15 @@ use std::collections::{HashMap, VecDeque};
 use super::task_util::TaskUtil;
 use anyhow::anyhow;
 use dt_common::{
-    config::{config_enums::ParallelType, sinker_config::SinkerConfig, task_config::TaskConfig},
+    config::{config_enums::ParallelType, task_config::TaskConfig},
     meta::redis::command::key_parser::KeyParser,
     monitor::task_monitor_handle::TaskMonitorHandle,
     utils::redis_util::RedisUtil,
 };
 use dt_parallelizer::{
-    base_parallelizer::BaseParallelizer, foxlake_parallelizer::FoxlakeParallelizer,
-    merge_parallelizer::MergeParallelizer, mongo_merger::MongoMerger,
-    partition_parallelizer::PartitionParallelizer, rdb_merger::RdbMerger,
-    rdb_partitioner::RdbPartitioner, redis_parallelizer::RedisParallelizer,
+    base_parallelizer::BaseParallelizer, merge_parallelizer::MergeParallelizer,
+    mongo_merger::MongoMerger, partition_parallelizer::PartitionParallelizer,
+    rdb_merger::RdbMerger, rdb_partitioner::RdbPartitioner, redis_parallelizer::RedisParallelizer,
     serial_parallelizer::SerialParallelizer, snapshot_parallelizer::SnapshotParallelizer,
     table_parallelizer::TableParallelizer, Merger, Parallelizer,
 };
@@ -69,16 +68,14 @@ impl ParallelizerUtil {
 
             ParallelType::Redis => {
                 let mut slot_node_map = HashMap::new();
-                if let SinkerConfig::Redis { is_cluster, .. } = config.sinker {
-                    let mut conn = RedisUtil::create_redis_conn(
-                        &config.sinker_basic.url,
-                        &config.sinker_basic.connection_auth,
-                    )
-                    .await?;
-                    if is_cluster {
-                        let nodes = RedisUtil::get_cluster_master_nodes(&mut conn)?;
-                        slot_node_map = RedisUtil::get_slot_address_map(&nodes);
-                    }
+                let mut conn = RedisUtil::create_redis_conn(
+                    &config.sinker_basic.url,
+                    &config.sinker_basic.connection_auth,
+                )
+                .await?;
+                if RedisUtil::is_redis_cluster(&mut conn, config.sinker_basic.is_cluster) {
+                    let nodes = RedisUtil::get_cluster_master_nodes(&mut conn)?;
+                    slot_node_map = RedisUtil::get_slot_address_map(&nodes);
                 }
                 Box::new(RedisParallelizer {
                     base_parallelizer,
@@ -86,18 +83,6 @@ impl ParallelizerUtil {
                     slot_node_map,
                     key_parser: KeyParser::new(),
                     node_sinker_index_map: HashMap::new(),
-                })
-            }
-
-            ParallelType::Foxlake => {
-                let snapshot_parallelizer = SnapshotParallelizer {
-                    base_parallelizer,
-                    parallel_size,
-                    chunk_partitioner_rebalance: Default::default(),
-                };
-                Box::new(FoxlakeParallelizer {
-                    task_config: config.clone(),
-                    snapshot_parallelizer,
                 })
             }
         };

@@ -4,13 +4,13 @@ APE DTS supports two Kafka output paths: encoding RDB data before writing it to 
 
 ## RDB -> Kafka fanout
 
-- MySQL/PostgreSQL snapshot or CDC data is still encoded according to `message_format`. With `[router].topic_fanout_map`, the same encoded result is written to multiple target topics.
+- MySQL/PostgreSQL snapshot or CDC data is encoded as Avro. With `[router].topic_fanout_map`, the same encoded result is written to multiple target topics.
 - DML routing priority is `schema.table > schema.* > *.*`; DDL uses `schema.*` or `*.*`.
 - This path sends the same key/value and does not create Kafka headers.
 
 ## Kafka -> Kafka raw forwarding
 
-Raw forwarding preserves the source key, payload, and headers, including a null key, null payload, or header with a null value. Only the target topic changes. `message_format`, `json_template`, and `with_field_defs` do not apply to this path.
+Raw forwarding preserves the source key, payload, and headers, including a null key, null payload, or header with a null value. Only the target topic changes. `with_field_defs` does not apply to this path.
 
 ### Required configuration
 

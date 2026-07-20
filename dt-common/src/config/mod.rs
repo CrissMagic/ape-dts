@@ -7,9 +7,7 @@ pub mod extractor_config;
 pub mod filter_config;
 pub mod global_config;
 pub mod ini_loader;
-pub mod json_template_type;
 pub mod limiter_config;
-pub mod message_format;
 pub mod meta_center_config;
 pub mod monitor_config;
 pub mod parallelizer_config;
@@ -22,6 +20,7 @@ pub mod s3_config;
 pub mod sinker_config;
 pub mod ssl_config;
 pub mod task_config;
+pub mod tracing_config;
 
 #[cfg(feature = "metrics")]
 pub mod metrics_config;

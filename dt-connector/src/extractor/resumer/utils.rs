@@ -60,6 +60,7 @@ impl ResumerUtil {
         connection_auth: &ConnectionAuthConfig,
         db_type: &DbType,
         max_connections: u32,
+        is_direct_connection: Option<bool>,
     ) -> anyhow::Result<ResumerDbPool> {
         let final_url = ConnectionAuthConfig::merge_url_with_auth(url, connection_auth)
             .context("failed to merge URL with connection auth")?;
@@ -100,12 +101,14 @@ impl ResumerUtil {
                 Ok(ResumerDbPool::Postgres(pool))
             }
             DbType::Mongo => {
-                let mut client_options = ClientOptions::parse_async(&final_url)
+                let mut client_options = ClientOptions::parse(&final_url)
                     .await
                     .context("failed to parse MongoDB connection URL")?;
                 client_options.app_name = Some("ape-dts-resumer".to_string());
-                client_options.direct_connection = Some(true);
                 client_options.max_pool_size = Some(max_connections);
+                if let Some(is_direct_connection_option) = is_direct_connection {
+                    client_options.direct_connection = Some(is_direct_connection_option)
+                }
 
                 let client = mongodb::Client::with_options(client_options)
                     .context("failed to create MongoDB client")?;
@@ -115,7 +118,7 @@ impl ResumerUtil {
                 let mut conn = RedisUtil::create_redis_conn(url, connection_auth)
                     .await
                     .context("failed to create Redis resumer connection")?;
-                let is_cluster = Self::is_redis_cluster(&mut conn);
+                let is_cluster = RedisUtil::is_redis_cluster(&mut conn, None);
 
                 if is_cluster {
                     let nodes = RedisUtil::get_cluster_master_nodes(&mut conn)
@@ -161,17 +164,6 @@ impl ResumerUtil {
                 )
             }
         }
-    }
-
-    fn is_redis_cluster(conn: &mut Connection) -> bool {
-        RedisUtil::send_cmd(conn, &["INFO", "cluster"])
-            .ok()
-            .and_then(|value| RedisUtil::parse_result_as_string(value).ok())
-            .is_some_and(|values| {
-                values
-                    .iter()
-                    .any(|value| value.contains("cluster_enabled:1"))
-            })
     }
 
     fn redis_node_url(base_url: &str, node: &ClusterNode) -> Result<String> {
@@ -240,8 +232,7 @@ impl ResumerUtil {
     pub fn get_key_from_position(position: &Position) -> String {
         match position {
             Position::RdbSnapshot { schema, tb, .. }
-            | Position::RdbSnapshotFinished { schema, tb, .. }
-            | Position::FoxlakeS3 { schema, tb, .. } => {
+            | Position::RdbSnapshotFinished { schema, tb, .. } => {
                 format!("{}-{}", schema, tb)
             }
             Position::Kafka {

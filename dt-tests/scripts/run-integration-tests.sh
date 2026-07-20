@@ -72,12 +72,15 @@ DEFAULT_LOG_BASE_DIR="${PROJECT_ROOT}/tmp/integration-logs"
 DEFAULT_RUN_ID="$(date '+%Y%m%d-%H%M%S')-$$"
 
 declare -a ALL_SUITES=(
+  "mock_test_mysql_5_7"
+  "mock_test_mysql_8_0"
+  "mock_test_pg_13_3_4"
+  "mock_test_pg_17_3_4"
   "mysql_to_clickhouse"
   # "mysql_to_doris"       # disabled: local/CI Doris suite is temporarily excluded
-  # "mysql_to_foxlake"      # disabled: local runnable Foxlake service is not provisioned
   "mysql_to_kafka_to_mysql"
   "mysql_to_mysql"
-  # "mysql_to_mysql_5_7"   # disabled: MySQL 5.7 has some struct-related failure case and is unsupport for arm64.
+  "mysql_to_mysql_check"
   "mysql_to_mysql_case_sensitive"
   "mysql_to_mysql_lua"
   "mysql_to_redis"
@@ -87,9 +90,11 @@ declare -a ALL_SUITES=(
   # "pg_to_doris"          # disabled: local/CI Doris suite is temporarily excluded
   "pg_to_kafka_to_pg"
   "pg_to_pg"
+  "pg_to_pg_check"
   "pg_to_pg_lua"
   # "pg_to_starrocks"       # disabled: temporarily excluded from default local matrix
   "mongo_to_mongo"
+  "mongo_to_mongo_precheck"
   "redis_to_redis_2_8"
   "redis_to_redis_4_0"
   "redis_to_redis_5_0"
@@ -137,7 +142,7 @@ TEST_FAIL_FAST=1
 declare -a REQUESTED_SUITES=()
 declare -a EXTRA_TEST_ARGS=()
 declare -a ARM_UNSUPPORTED_SUITES=(
-  "mysql_to_mysql_5_7"
+  "mock_test_mysql_5_7"
   "redis_to_redis_2_8"
 )
 
@@ -164,7 +169,7 @@ Options:
   --wait-timeout <secs>  Service wait timeout. Default: 30.
   --log-tail <lines>     Number of log lines for Docker logs. Default: 200.
   --keep-docker          Skip the final docker compose down cleanup.
-  --down-each-suite     Stop all integration Docker services after each suite.
+  --down-each-suite      Stop all integration Docker services after each suite.
   --keep-going           Continue with later suites after a suite fails.
   --no-fail-fast         Continue running remaining tests in the current suite after a test fails.
   --logs-on-failure      Dump Docker logs automatically when a test step fails.
@@ -329,12 +334,15 @@ is_suite_supported_on_current_arch() {
 suite_services() {
   local suite="$1"
   case "${suite}" in
+    mock_test_mysql_5_7) echo "mysql-src-5-7 mysql-dst-5-7" ;;
+    mock_test_mysql_8_0) echo "mysql-src-8-0 mysql-dst-8-0" ;;
+    mock_test_pg_13_3_4) echo "postgres-src-13-3-4 postgres-dst-13-3-4" ;;
+    mock_test_pg_17_3_4) echo "postgres-src-17-3-4 postgres-dst-17-3-4" ;;
     mysql_to_clickhouse) echo "mysql-src clickhouse" ;;
     mysql_to_doris) echo "mysql-src doris-2-1-0" ;;
-    mysql_to_foxlake) echo "mysql-src minio minio-init" ;;
     mysql_to_kafka_to_mysql) echo "mysql-src mysql-dst kafka" ;;
     mysql_to_mysql) echo "mysql-src mysql-dst mysql-meta mysql-src-8-0 mysql-dst-8-0" ;;
-    mysql_to_mysql_5_7) echo "mysql-src-5-7 mysql-dst-5-7 mysql-meta-5-7 mysql-src-8-0 mysql-dst-8-0" ;;
+    mysql_to_mysql_check) echo "mysql-src mysql-dst" ;;
     mysql_to_mysql_case_sensitive) echo "mysql-src-8-0 mysql-dst-8-0" ;;
     mysql_to_mysql_lua) echo "mysql-src mysql-dst mysql-meta" ;;
     mysql_to_redis) echo "mysql-src redis-dst" ;;
@@ -344,9 +352,11 @@ suite_services() {
     pg_to_doris) echo "postgres-src doris-2-1-0" ;;
     pg_to_kafka_to_pg) echo "postgres-src postgres-dst kafka" ;;
     pg_to_pg) echo "postgres-src postgres-dst postgres-node3" ;;
+    pg_to_pg_check) echo "postgres-src postgres-dst" ;;
     pg_to_pg_lua) echo "postgres-src postgres-dst" ;;
     pg_to_starrocks) echo "postgres-src starrocks-3-2-11" ;;
-    mongo_to_mongo) echo "mongo-src mongo-dst" ;;
+    mongo_to_mongo) echo "mongo-src mongo-dst mongo-sharding-src-config mongo-sharding-src-shard mongo-sharding-src-init mongo-sharding-src-mongos mongo-sharding-src-add-shard-init mongo-sharding-dst-config mongo-sharding-dst-shard mongo-sharding-dst-init mongo-sharding-dst-mongos mongo-sharding-dst-add-shard-init" ;;
+    mongo_to_mongo_precheck) echo "mongo-src mongo-dst mongo-sharding-src-config mongo-sharding-src-shard mongo-sharding-src-init mongo-sharding-src-mongos mongo-sharding-src-add-shard-init mongo-sharding-dst-config mongo-sharding-dst-shard mongo-sharding-dst-init mongo-sharding-dst-mongos mongo-sharding-dst-add-shard-init" ;;
     redis_to_redis_2_8) echo "redis-src-2-8 redis-dst-2-8" ;;
     redis_to_redis_4_0) echo "redis-src-4-0 redis-dst-4-0" ;;
     redis_to_redis_5_0) echo "redis-src-5-0 redis-dst-5-0" ;;
@@ -359,7 +369,7 @@ suite_services() {
     redis_to_redis_rebloom) echo "redis-rebloom" ;;
     redis_to_redis_redisearch) echo "redis-redisearch" ;;
     redis_to_redis_rejson) echo "redis-rejson-src redis-rejson-dst" ;;
-    redis_to_redis_precheck) echo "redis-src-8-0 redis-dst-8-0" ;;
+    redis_to_redis_precheck) echo "redis-src-8-0 redis-dst-8-0 redis-dst redis-source-cluster-node1 redis-source-cluster-node2 redis-source-cluster-node3 redis-source-cluster-init" ;;
     no_services) echo "" ;;
     *) die "unknown suite '${suite}'" ;;
   esac
@@ -376,6 +386,14 @@ service_wait_mode() {
   fi
 
   echo "default"
+}
+
+suite_wait_timeout_secs() {
+  local suite="$1"
+  case "${suite}" in
+    mongo_to_mongo | mongo_to_mongo_precheck) echo "${MONGO_SHARDING_WAIT_TIMEOUT_SECS:-120}" ;;
+    *) echo "${WAIT_TIMEOUT_SECS}" ;;
+  esac
 }
 
 service_is_init() {
@@ -401,38 +419,43 @@ resolve_service_container_id() {
 suite_nextest_filter() {
   local suite="$1"
   case "${suite}" in
-    mysql_to_clickhouse) echo "test(mysql_to_clickhouse::)" ;;
-    mysql_to_doris) echo "test(mysql_to_doris::)" ;;
-    mysql_to_foxlake) echo "test(mysql_to_foxlake::)" ;;
-    mysql_to_kafka_to_mysql) echo "test(mysql_to_kafka_to_mysql::)" ;;
-    mysql_to_mysql) echo "test(mysql_to_mysql::)" ;;
-    mysql_to_mysql_5_7) echo "test(mysql_to_mysql::)" ;;
-    mysql_to_mysql_case_sensitive) echo "test(mysql_to_mysql_case_sensitive::)" ;;
-    mysql_to_mysql_lua) echo "test(mysql_to_mysql_lua::)" ;;
-    mysql_to_redis) echo "test(mysql_to_redis::)" ;;
-    mysql_to_starrocks) echo "test(mysql_to_starrocks::)" ;;
-    mysql_to_tidb) echo "test(mysql_to_tidb::)" ;;
-    pg_to_clickhouse) echo "test(pg_to_clickhouse::)" ;;
-    pg_to_doris) echo "test(pg_to_doris::)" ;;
-    pg_to_kafka_to_pg) echo "test(pg_to_kafka_to_pg::)" ;;
-    pg_to_pg) echo "test(pg_to_pg::)" ;;
-    pg_to_pg_lua) echo "test(pg_to_pg_lua::)" ;;
-    pg_to_starrocks) echo "test(pg_to_starrocks::)" ;;
-    mongo_to_mongo) echo "test(mongo_to_mongo::)" ;;
-    redis_to_redis_2_8) echo "test(redis_to_redis::cdc_2_8_tests::) | test(redis_to_redis::snapshot_2_8_tests::)" ;;
-    redis_to_redis_4_0) echo "test(redis_to_redis::cdc_4_0_tests::) | test(redis_to_redis::snapshot_4_0_tests::)" ;;
-    redis_to_redis_5_0) echo "test(redis_to_redis::cdc_5_0_tests::) | test(redis_to_redis::snapshot_5_0_tests::)" ;;
-    redis_to_redis_6_0) echo "test(redis_to_redis::cdc_6_0_tests::) | test(redis_to_redis::snapshot_6_0_tests::)" ;;
-    redis_to_redis_6_2) echo "test(redis_to_redis::cdc_6_2_tests::) | test(redis_to_redis::snapshot_6_2_tests::)" ;;
-    redis_to_redis_7_0) echo "test(redis_to_redis::cdc_7_0_tests::) | test(redis_to_redis::snapshot_7_0_tests::) | test(redis_to_redis::snapshot_and_cdc_7_0_tests::)" ;;
-    redis_to_redis_8_0) echo "test(redis_to_redis::cdc_8_0_tests::) | test(redis_to_redis::snapshot_8_0_tests::)" ;;
-    redis_to_redis_cross_version) echo "test(redis_to_redis::cdc_cross_version_tests::) | test(redis_to_redis::snapshot_cross_version_tests::)" ;;
-    redis_to_redis_graph) echo "test(redis_to_redis::cdc_graph_tests::) | test(redis_to_redis::snapshot_graph_tests::)" ;;
-    redis_to_redis_rebloom) echo "test(redis_to_redis::cdc_rebloom_tests::) | test(redis_to_redis::snapshot_rebloom_tests::)" ;;
-    redis_to_redis_redisearch) echo "test(redis_to_redis::cdc_redisearch_tests::) | test(redis_to_redis::snapshot_redisearch_tests::)" ;;
-    redis_to_redis_rejson) echo "test(redis_to_redis::cdc_rejson_tests::) | test(redis_to_redis::snapshot_rejson_tests::)" ;;
-    redis_to_redis_precheck) echo "test(redis_to_redis::precheck_tests::)" ;;
-    no_services) echo "test(log_reader::)" ;;
+    mock_test_mysql_5_7) echo "test(/^mock_test::mysql_to_mysql::from_5_7_to_5_7::/)" ;;
+    mock_test_mysql_8_0) echo "test(/^mock_test::mysql_to_mysql::from_8_0_to_8_0::/)" ;;
+    mock_test_pg_13_3_4) echo "test(/^mock_test::pg_to_pg::from_13_3_4_to_13_3_4::/)" ;;
+    mock_test_pg_17_3_4) echo "test(/^mock_test::pg_to_pg::from_17_3_4_to_17_3_4::/)" ;;
+    mysql_to_clickhouse) echo "test(/^mysql_to_clickhouse::/)" ;;
+    mysql_to_doris) echo "test(/^mysql_to_doris::/)" ;;
+    mysql_to_kafka_to_mysql) echo "test(/^mysql_to_kafka_to_mysql::/)" ;;
+    mysql_to_mysql) echo "test(/^mysql_to_mysql::cdc_tests::/) | test(/^mysql_to_mysql::precheck_tests::/) | test(/^mysql_to_mysql::review_tests::/) | test(/^mysql_to_mysql::revise_tests::/) | test(/^mysql_to_mysql::snapshot_tests::/) | test(/^mysql_to_mysql::struct_tests::/)" ;;
+    mysql_to_mysql_check) echo "test(/^mysql_to_mysql::check_tests::/)" ;;
+    mysql_to_mysql_case_sensitive) echo "test(/^mysql_to_mysql_case_sensitive::/)" ;;
+    mysql_to_mysql_lua) echo "test(/^mysql_to_mysql_lua::/)" ;;
+    mysql_to_redis) echo "test(/^mysql_to_redis::/)" ;;
+    mysql_to_starrocks) echo "test(/^mysql_to_starrocks::/)" ;;
+    mysql_to_tidb) echo "test(/^mysql_to_tidb::/)" ;;
+    pg_to_clickhouse) echo "test(/^pg_to_clickhouse::/)" ;;
+    pg_to_doris) echo "test(/^pg_to_doris::/)" ;;
+    pg_to_kafka_to_pg) echo "test(/^pg_to_kafka_to_pg::/)" ;;
+    pg_to_pg) echo "test(/^pg_to_pg::cdc_tests::/) | test(/^pg_to_pg::precheck_tests::/) | test(/^pg_to_pg::review_tests::/) | test(/^pg_to_pg::revise_tests::/) | test(/^pg_to_pg::snapshot_tests::/) | test(/^pg_to_pg::struct_tests::/) | test(/^pg_to_pg::tb_meta_tests::/)" ;;
+    pg_to_pg_check) echo "test(/^pg_to_pg::check_tests::/)" ;;
+    pg_to_pg_lua) echo "test(/^pg_to_pg_lua::/)" ;;
+    pg_to_starrocks) echo "test(/^pg_to_starrocks::/)" ;;
+    mongo_to_mongo) echo "test(/^mongo_to_mongo::cdc_tests::/) | test(/^mongo_to_mongo::check_tests::/) | test(/^mongo_to_mongo::review_tests::/) | test(/^mongo_to_mongo::revise_tests::/) | test(/^mongo_to_mongo::snapshot_tests::/) | test(/^mongo_to_mongo::struct_tests::/)" ;;
+    mongo_to_mongo_precheck) echo "test(/^mongo_to_mongo::precheck_tests::/)" ;;
+    redis_to_redis_2_8) echo "test(/^redis_to_redis::cdc_2_8_tests::/) | test(/^redis_to_redis::snapshot_2_8_tests::/)" ;;
+    redis_to_redis_4_0) echo "test(/^redis_to_redis::cdc_4_0_tests::/) | test(/^redis_to_redis::snapshot_4_0_tests::/)" ;;
+    redis_to_redis_5_0) echo "test(/^redis_to_redis::cdc_5_0_tests::/) | test(/^redis_to_redis::snapshot_5_0_tests::/)" ;;
+    redis_to_redis_6_0) echo "test(/^redis_to_redis::cdc_6_0_tests::/) | test(/^redis_to_redis::snapshot_6_0_tests::/)" ;;
+    redis_to_redis_6_2) echo "test(/^redis_to_redis::cdc_6_2_tests::/) | test(/^redis_to_redis::snapshot_6_2_tests::/)" ;;
+    redis_to_redis_7_0) echo "test(/^redis_to_redis::cdc_7_0_tests::/) | test(/^redis_to_redis::snapshot_7_0_tests::/) | test(/^redis_to_redis::snapshot_and_cdc_7_0_tests::/)" ;;
+    redis_to_redis_8_0) echo "test(/^redis_to_redis::cdc_8_0_tests::/) | test(/^redis_to_redis::snapshot_8_0_tests::/)" ;;
+    redis_to_redis_cross_version) echo "test(/^redis_to_redis::cdc_cross_version_tests::/) | test(/^redis_to_redis::snapshot_cross_version_tests::/)" ;;
+    redis_to_redis_graph) echo "test(/^redis_to_redis::cdc_graph_tests::/) | test(/^redis_to_redis::snapshot_graph_tests::/)" ;;
+    redis_to_redis_rebloom) echo "test(/^redis_to_redis::cdc_rebloom_tests::/) | test(/^redis_to_redis::snapshot_rebloom_tests::/)" ;;
+    redis_to_redis_redisearch) echo "test(/^redis_to_redis::cdc_redisearch_tests::/) | test(/^redis_to_redis::snapshot_redisearch_tests::/)" ;;
+    redis_to_redis_rejson) echo "test(/^redis_to_redis::cdc_rejson_tests::/) | test(/^redis_to_redis::snapshot_rejson_tests::/)" ;;
+    redis_to_redis_precheck) echo "test(/^redis_to_redis::precheck_tests::/)" ;;
+    no_services) echo "test(/^log_reader::/)" ;;
     *) die "unknown suite '${suite}'" ;;
   esac
 }
@@ -669,7 +692,7 @@ wait_for_services() {
     return 0
   fi
 
-  local deadline=$((SECONDS + WAIT_TIMEOUT_SECS))
+  local deadline=$((SECONDS + $(suite_wait_timeout_secs "${suite}")))
   local service
   while IFS= read -r service; do
     [[ -n "${service}" ]] || continue
@@ -761,6 +784,7 @@ run_nextest_suite() {
   fi
 
   cargo nextest run \
+    --release \
     --package dt-tests \
     --test integration_test \
     "${fail_fast_args[@]}" \

@@ -7,20 +7,9 @@ Refer to [Send data to Kafka](/docs/en/consumer/kafka_consumer.md) for consumers
 
 - This article is for quick start, refer to [templates](/docs/templates/rdb_to_kafka.md) and [common configs](/docs/en/config.md) for more details.
 
-# Message Format Support
+# Message encoding
 
-APE DTS supports these message formats when sending data to Kafka:
-- **Avro format** (default): binary payload.
-- **Standard JSON format**: human-readable JSON payload.
-- **CloudCanal JSON format**: JSON payload with fields such as `action`, `before`, `data`, `db`, `schema`, and `table`.
-
-You can configure the message format using the `message_format` parameter in the `[sinker]` section:
-- `message_format=avro` (default)
-- `message_format=json`
-- `message_format=cloudcanal`
-- `message_format=json_template:cloudcanal`
-
-You can also use `message_format=json` with `json_template=cloudcanal`.
+APE DTS encodes MySQL snapshot and CDC events as Avro when sending them to Kafka.
 
 # Prepare MySQL instance
 Refer to [mysql to mysql](./mysql_to_mysql.md)
@@ -84,7 +73,6 @@ db_type=kafka
 sink_type=write
 url=127.0.0.1:9093
 with_field_defs=true
-message_format=avro
 
 [filter]
 do_dbs=test_db

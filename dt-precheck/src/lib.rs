@@ -26,7 +26,7 @@ pub async fn do_precheck_with_config_str(config_str: &str) {
 
 async fn do_precheck_internal(task_config: TaskConfig, precheck_config: PrecheckTaskConfig) {
     let checker_connector = PrecheckerBuilder::build(precheck_config.precheck, task_config);
-    let result = checker_connector.verify_check_result().await;
+    let result: Result<(), anyhow::Error> = checker_connector.verify_check_result().await;
     if let Err(e) = result {
         println!("precheck not passed.");
         panic!("precheck meet error: {}", e);

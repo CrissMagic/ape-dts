@@ -3,13 +3,11 @@
 pub mod adaptor;
 pub mod avro;
 pub mod col_value;
-pub mod json;
 pub mod dcl_meta;
 pub mod ddl_meta;
 pub mod dt_data;
 pub mod dt_queue;
 pub mod foreign_key;
-pub mod foxlake;
 pub mod kafka;
 pub mod mongo;
 pub mod mysql;

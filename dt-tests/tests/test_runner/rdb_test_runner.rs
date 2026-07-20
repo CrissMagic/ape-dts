@@ -6,17 +6,18 @@ use std::{
 use chrono::{Duration, Utc};
 use dt_common::{
     config::{
-        config_enums::DbType,
+        config_enums::{DbType, TaskKind},
         config_token_parser::{ConfigTokenParser, TokenEscapePair},
         extractor_config::ExtractorConfig,
+        ini_loader::IniLoader,
         meta_center_config::MetaCenterConfig,
-        sinker_config::SinkerConfig,
         task_config::TaskConfig,
     },
     meta::{ddl_meta::ddl_type::DdlType, time::dt_utc_time::DtNaiveTime},
     rdb_filter::RdbFilter,
     utils::{sql_util::SqlUtil, time_util::TimeUtil},
 };
+use serde::de::DeserializeOwned;
 
 use dt_common::meta::{
     col_value::ColValue, ddl_meta::ddl_parser::DdlParser,
@@ -28,15 +29,18 @@ use dt_connector::{
 use dt_task::{task_runner::TaskRunner, task_util::TaskUtil};
 
 use sqlx::{query, types::BigDecimal, MySql, Pool, Postgres, Row};
-use tokio::task::JoinHandle;
+use tokio::{sync::Semaphore, task::JoinHandle};
 
 use crate::{
     test_config_util::TestConfigUtil,
-    test_runner::mock_utils::{mock_config::MockConfig, mysql_type::MysqlType, pg_type::PgType},
+    test_runner::mock_data::{
+        context::MockDbContext, mysql_type::MysqlType, pg_type::PgType, MockData,
+    },
 };
 
 use super::{base_test_runner::BaseTestRunner, rdb_util::RdbUtil};
 
+#[derive(Clone)]
 pub struct RdbTestRunner {
     pub base: BaseTestRunner,
     pub src_conn_pool_mysql: Option<Pool<MySql>>,
@@ -48,6 +52,9 @@ pub struct RdbTestRunner {
     pub router: Option<RdbRouter>,
     pub filter: RdbFilter,
     pub unordered_compare: bool, // whether to compare rows in unordered way
+    pub unordered_compare_threads: usize,
+    pub mock_prepare_only: bool,
+    pub mock_db_tbs: Vec<(String, String)>,
 }
 
 pub const SRC: &str = "src";
@@ -55,6 +62,32 @@ pub const DST: &str = "dst";
 pub const PUBLIC: &str = "public";
 
 const UTC_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+struct MockDataPrepare {
+    src_prepare_stmts: Vec<String>,
+    dst_prepare_stmts_for_data_task: Vec<String>,
+    dst_prepare_stmts_for_struct_task: Vec<String>,
+    snapshot_dml_stmts: Vec<String>,
+    cdc_insert_stmts: Vec<String>,
+    db_tbs: Vec<(String, String)>,
+}
+
+impl MockDataPrepare {
+    fn from_mock_data<
+        T: crate::test_runner::mock_data::mock_stmt::MockColType + DeserializeOwned,
+    >(
+        mock_data: MockData<T>,
+    ) -> Self {
+        Self {
+            src_prepare_stmts: mock_data.mock_src_prepare_stmts(),
+            dst_prepare_stmts_for_data_task: mock_data.mock_dst_prepare_stmts_for_data_task(),
+            dst_prepare_stmts_for_struct_task: mock_data.mock_dst_prepare_stmts_for_struct_task(),
+            snapshot_dml_stmts: mock_data.mock_dml_stmts(),
+            cdc_insert_stmts: mock_data.mock_insert_stmts(),
+            db_tbs: mock_data.mock_db_tbs(),
+        }
+    }
+}
 
 #[allow(dead_code)]
 impl RdbTestRunner {
@@ -88,24 +121,12 @@ impl RdbTestRunner {
             dst_connection_auth = target.connection_auth;
         }
 
-        // generate mock sqls
-        let mut unordered_compare = false;
-        let mock_result: Option<(Vec<String>, Vec<String>)> = match src_db_type {
-            DbType::Pg => MockConfig::<PgType>::new(&base.task_config_file)
-                .map(|c| (c.mock_ddl_stmts(), c.mock_dml_stmts())),
-            DbType::Mysql => MockConfig::<MysqlType>::new(&base.task_config_file)
-                .map(|c| (c.mock_ddl_stmts(), c.mock_dml_stmts())),
-            _ => None,
-        };
-        if let Some((mock_ddl_stmts, mock_dml_stmts)) = mock_result {
-            base.src_prepare_sqls.extend(mock_ddl_stmts.clone());
-            base.dst_prepare_sqls.extend(mock_ddl_stmts);
-            base.src_test_sqls.extend(mock_dml_stmts);
-
-            unordered_compare = true;
-        }
-
         let mysql_conn_settings = Some(vec!["SET FOREIGN_KEY_CHECKS=0"]);
+        let dst_mysql_conn_settings = if matches!(dst_db_type, DbType::StarRocks | DbType::Doris) {
+            None
+        } else {
+            mysql_conn_settings.clone()
+        };
 
         match &src_db_type {
             DbType::Mysql => {
@@ -130,13 +151,54 @@ impl RdbTestRunner {
             _ => {}
         }
 
-        if !dst_url.is_empty() {
+        let (mut unordered_compare, unordered_compare_configured, unordered_compare_threads) =
+            Self::load_mock_compare_config(&base.task_config_file);
+        let configured_mock_prepare_only =
+            Self::load_mock_prepare_only_config(&base.task_config_file);
+        let task_kind = config.task_type().map(|task_type| task_type.kind);
+        let is_struct_task = matches!(task_kind, Some(TaskKind::Struct));
+        let mock_result: Option<MockDataPrepare> = match src_db_type {
+            DbType::Pg => {
+                let context =
+                    Self::detect_pg_mock_context(src_conn_pool_pg.as_ref().unwrap()).await?;
+                MockData::<PgType>::new(&base.task_config_file, context)
+                    .map(MockDataPrepare::from_mock_data)
+            }
+            DbType::Mysql => {
+                let context =
+                    Self::detect_mysql_mock_context(src_conn_pool_mysql.as_ref().unwrap()).await?;
+                MockData::<MysqlType>::new(&base.task_config_file, context)
+                    .map(MockDataPrepare::from_mock_data)
+            }
+            _ => None,
+        };
+        let has_mock_data = mock_result.is_some();
+        let mut mock_db_tbs = Vec::new();
+        if let Some(mock_prepare) = mock_result {
+            base.src_prepare_sqls.extend(mock_prepare.src_prepare_stmts);
+            if is_struct_task {
+                base.dst_prepare_sqls
+                    .extend(mock_prepare.dst_prepare_stmts_for_struct_task);
+            } else {
+                base.dst_prepare_sqls
+                    .extend(mock_prepare.dst_prepare_stmts_for_data_task);
+                if matches!(task_kind, Some(TaskKind::Cdc)) {
+                    base.src_test_sqls.extend(mock_prepare.cdc_insert_stmts);
+                } else {
+                    base.src_test_sqls.extend(mock_prepare.snapshot_dml_stmts);
+                }
+            }
+            mock_db_tbs = mock_prepare.db_tbs;
+
+            if !unordered_compare_configured {
+                unordered_compare = true;
+            }
+        }
+        let mock_prepare_only = configured_mock_prepare_only && has_mock_data && !is_struct_task;
+
+        if !dst_url.is_empty() && !mock_prepare_only {
             match &dst_db_type {
-                DbType::Mysql
-                | DbType::Foxlake
-                | DbType::StarRocks
-                | DbType::Doris
-                | DbType::Tidb => {
+                DbType::Mysql | DbType::StarRocks | DbType::Doris | DbType::Tidb => {
                     dst_conn_pool_mysql = Some(
                         TaskUtil::create_mysql_conn_pool(
                             &dst_url,
@@ -144,7 +206,7 @@ impl RdbTestRunner {
                             &dst_connection_auth,
                             5,
                             false,
-                            mysql_conn_settings.clone(),
+                            dst_mysql_conn_settings,
                         )
                         .await?,
                     );
@@ -199,6 +261,9 @@ impl RdbTestRunner {
             filter,
             base,
             unordered_compare,
+            unordered_compare_threads,
+            mock_prepare_only,
+            mock_db_tbs,
         })
     }
 
@@ -218,6 +283,41 @@ impl RdbTestRunner {
         Ok(())
     }
 
+    async fn detect_mysql_mock_context(pool: &Pool<MySql>) -> anyhow::Result<MockDbContext> {
+        let row = query("SELECT VERSION() AS version").fetch_one(pool).await?;
+        let version: String = row.try_get("version")?;
+        Ok(MockDbContext::new(DbType::Mysql, &version))
+    }
+
+    async fn detect_pg_mock_context(pool: &Pool<Postgres>) -> anyhow::Result<MockDbContext> {
+        let row = query("SHOW server_version").fetch_one(pool).await?;
+        let version: String = row.try_get("server_version")?;
+        Ok(MockDbContext::new(DbType::Pg, &version))
+    }
+
+    fn load_mock_compare_config(config_file: &str) -> (bool, bool, usize) {
+        let loader = IniLoader::new(config_file);
+        let unordered_compare_configured = loader.contains("mock", "unordered_compare")
+            || loader.contains("mock", "unorder_compare");
+        let unordered_compare = if loader.contains("mock", "unordered_compare") {
+            loader.get_with_default("mock", "unordered_compare", false)
+        } else {
+            loader.get_with_default("mock", "unorder_compare", false)
+        };
+        let unordered_compare_threads =
+            loader.get_with_default("mock", "unordered_compare_threads", 1usize);
+        (
+            unordered_compare,
+            unordered_compare_configured,
+            unordered_compare_threads.max(1),
+        )
+    }
+
+    fn load_mock_prepare_only_config(config_file: &str) -> bool {
+        let loader = IniLoader::new(config_file);
+        loader.get_with_default("mock", "prepare_only", false)
+    }
+
     pub async fn get_dst_mysql_version(&self) -> String {
         if let Some(conn_pool) = &self.dst_conn_pool_mysql {
             let meta_manager = MysqlMetaManager::new(conn_pool.clone()).await.unwrap();
@@ -227,6 +327,11 @@ impl RdbTestRunner {
     }
 
     pub async fn run_snapshot_test(&self, compare_data: bool) -> anyhow::Result<()> {
+        if self.mock_prepare_only {
+            self.execute_mock_prepare_only_sqls().await?;
+            return Ok(());
+        }
+
         // prepare src and dst tables
         self.execute_prepare_sqls().await?;
         self.execute_test_sqls().await?;
@@ -240,6 +345,11 @@ impl RdbTestRunner {
             assert!(self.compare_data_for_tbs(&src_db_tbs, &dst_db_tbs).await?)
         }
         Ok(())
+    }
+
+    pub async fn execute_mock_prepare_only_sqls(&self) -> anyhow::Result<()> {
+        self.execute_src_sqls(&self.base.src_prepare_sqls).await?;
+        self.execute_src_sqls(&self.base.src_test_sqls).await
     }
 
     pub async fn run_ddl_test(&self, start_millis: u64, parse_millis: u64) -> anyhow::Result<()> {
@@ -459,6 +569,11 @@ impl RdbTestRunner {
     }
 
     pub async fn run_cdc_test(&self, start_millis: u64, parse_millis: u64) -> anyhow::Result<()> {
+        if self.mock_prepare_only {
+            self.execute_mock_prepare_only_sqls().await?;
+            return Ok(());
+        }
+
         // prepare src and dst tables
         self.execute_prepare_sqls().await?;
 
@@ -654,6 +769,17 @@ impl RdbTestRunner {
         dst_db_tbs: &[(String, String)],
     ) -> anyhow::Result<bool> {
         let filtered_db_tbs = self.get_filtered_db_tbs();
+        if self.unordered_compare && self.unordered_compare_threads > 1 {
+            let mut compare_pairs = Vec::new();
+            for i in 0..src_db_tbs.len() {
+                if filtered_db_tbs.contains(&src_db_tbs[i]) {
+                    continue;
+                }
+                compare_pairs.push((src_db_tbs[i].clone(), dst_db_tbs[i].clone()));
+            }
+            return self.compare_tb_data_pairs_parallel(compare_pairs).await;
+        }
+
         for i in 0..src_db_tbs.len() {
             if filtered_db_tbs.contains(&src_db_tbs[i]) {
                 continue;
@@ -669,6 +795,22 @@ impl RdbTestRunner {
         dst_db_tbs: &[(String, String)],
     ) -> anyhow::Result<bool> {
         let filtered_db_tbs = self.get_filtered_db_tbs();
+        if self.unordered_compare && self.unordered_compare_threads > 1 {
+            let mut compare_pairs = Vec::new();
+            for i in 0..src_db_tbs.len() {
+                if filtered_db_tbs.contains(&src_db_tbs[i]) {
+                    let dst_data = self.fetch_data(&dst_db_tbs[i], DST).await?;
+                    if !dst_data.is_empty() {
+                        println!("tb: {:?} is filtered but dst is not empty", dst_db_tbs[i]);
+                        panic!()
+                    }
+                } else {
+                    compare_pairs.push((src_db_tbs[i].clone(), dst_db_tbs[i].clone()));
+                }
+            }
+            return self.compare_tb_data_pairs_parallel(compare_pairs).await;
+        }
+
         for i in 0..src_db_tbs.len() {
             if filtered_db_tbs.contains(&src_db_tbs[i]) {
                 let dst_data = self.fetch_data(&dst_db_tbs[i], DST).await?;
@@ -678,6 +820,31 @@ impl RdbTestRunner {
                 }
             } else {
                 assert!(self.compare_tb_data(&src_db_tbs[i], &dst_db_tbs[i]).await?)
+            }
+        }
+        Ok(true)
+    }
+
+    async fn compare_tb_data_pairs_parallel(
+        &self,
+        compare_pairs: Vec<((String, String), (String, String))>,
+    ) -> anyhow::Result<bool> {
+        let semaphore = std::sync::Arc::new(Semaphore::new(self.unordered_compare_threads));
+        let mut handles = Vec::with_capacity(compare_pairs.len());
+
+        for (src_db_tb, dst_db_tb) in compare_pairs {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let runner = self.clone();
+            handles.push(tokio::spawn(async move {
+                let result = runner.compare_tb_data(&src_db_tb, &dst_db_tb).await;
+                drop(permit);
+                result
+            }));
+        }
+
+        for handle in handles {
+            if !handle.await?? {
+                return Ok(false);
             }
         }
         Ok(true)
@@ -785,17 +952,6 @@ impl RdbTestRunner {
                 // ignored cols were NOT synced to target
                 if ignore_cols.is_some_and(|cols| cols.contains(src_col)) {
                     assert_eq!(*dst_col_value, ColValue::None);
-                    continue;
-                }
-
-                // TODO
-                // issue: https://github.com/apecloud/foxlake/issues/2108
-                // sqlx will execute: "SET time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;"
-                // to initialize each connection.
-                // but it doesn't work on Foxlake
-                if matches!(self.base.get_config().sinker, SinkerConfig::Foxlake { .. })
-                    && matches!(dst_col_value, ColValue::Timestamp(..))
-                {
                     continue;
                 }
 
@@ -969,17 +1125,6 @@ impl RdbTestRunner {
                 continue;
             }
 
-            // TODO
-            // issue: https://github.com/apecloud/foxlake/issues/2108
-            // sqlx will execute: "SET time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;"
-            // to initialize each connection.
-            // but it doesn't work on Foxlake
-            if matches!(self.base.get_config().sinker, SinkerConfig::Foxlake { .. })
-                && matches!(dst_col_value, ColValue::Timestamp(..))
-            {
-                continue;
-            }
-
             if !Self::compare_col_value(src_col_value, dst_col_value, src_db_type, dst_db_type) {
                 return false;
             }
@@ -1013,7 +1158,6 @@ impl RdbTestRunner {
         // for example: we use Year in mysql, but INT in StarRocks,
         // so try to compare after both converted to string.
         match src_col_value {
-            // mysql 00:00:00 == foxlake 00:00:00.000000
             ColValue::Time(_) => {
                 DtNaiveTime::from_str(&src_col_value.to_string()).unwrap()
                     == DtNaiveTime::from_str(&dst_col_value.to_string()).unwrap()
@@ -1267,5 +1411,88 @@ impl RdbTestRunner {
         } else {
             format!("{} AND {}", res, condition)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TMP_CONFIG_SUFFIX: AtomicU64 = AtomicU64::new(0);
+
+    fn write_tmp_config(content: &str) -> String {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let counter = TMP_CONFIG_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        let path = format!(
+            "/tmp/dt_mock_compare_config_{}_{}_{}.ini",
+            std::process::id(),
+            suffix,
+            counter
+        );
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_load_mock_compare_config_defaults() {
+        let path = write_tmp_config("[mock]\n");
+        let (unordered_compare, configured, threads) =
+            RdbTestRunner::load_mock_compare_config(&path);
+        fs::remove_file(path).unwrap();
+
+        assert!(!unordered_compare);
+        assert!(!configured);
+        assert_eq!(threads, 1);
+    }
+
+    #[test]
+    fn test_load_mock_compare_config_values() {
+        let path =
+            write_tmp_config("[mock]\nunordered_compare=true\nunordered_compare_threads=4\n");
+        let (unordered_compare, configured, threads) =
+            RdbTestRunner::load_mock_compare_config(&path);
+        fs::remove_file(path).unwrap();
+
+        assert!(unordered_compare);
+        assert!(configured);
+        assert_eq!(threads, 4);
+    }
+
+    #[test]
+    fn test_load_mock_compare_config_unorder_alias() {
+        let path = write_tmp_config("[mock]\nunorder_compare=true\nunordered_compare_threads=0\n");
+        let (unordered_compare, configured, threads) =
+            RdbTestRunner::load_mock_compare_config(&path);
+        fs::remove_file(path).unwrap();
+
+        assert!(unordered_compare);
+        assert!(configured);
+        assert_eq!(threads, 1);
+    }
+
+    #[test]
+    fn test_load_mock_prepare_only_config() {
+        let path = write_tmp_config("[mock]\nprepare_only=true\n");
+        let prepare_only = RdbTestRunner::load_mock_prepare_only_config(&path);
+        fs::remove_file(path).unwrap();
+
+        assert!(prepare_only);
+    }
+
+    #[test]
+    fn test_load_mock_prepare_only_config_defaults() {
+        let path = write_tmp_config("[mock]\n");
+        let prepare_only = RdbTestRunner::load_mock_prepare_only_config(&path);
+        fs::remove_file(path).unwrap();
+
+        assert!(!prepare_only);
     }
 }
