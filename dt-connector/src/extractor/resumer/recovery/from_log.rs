@@ -2,21 +2,22 @@ use anyhow::{bail, Context, Result};
 use async_std::path::Path;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dt_common::{
+    config::{
+        config_enums::{TaskKind, TaskType},
+        resumer_config::ResumerConfig,
+    },
+    error::{DtError, DtResultExt, EndpointRole, Stage},
+    log_warn,
+    meta::position::Position,
+    utils::file_util::FileUtil,
+};
 use tokio::{fs::File, io::AsyncBufReadExt, io::BufReader};
 
 use crate::extractor::resumer::{
     recovery::{Recovery, RecoverySnapshotCache},
     utils::ResumerUtil,
     CURRENT_POSITION_LOG_FLAG, TAIL_POSITION_COUNT,
-};
-use dt_common::{
-    config::{
-        config_enums::{TaskKind, TaskType},
-        resumer_config::ResumerConfig,
-    },
-    log_warn,
-    meta::position::Position,
-    utils::file_util::FileUtil,
 };
 
 const CDC_CURRENT_POSITION_KEY: &str = "current_position";
@@ -50,10 +51,16 @@ impl LogRecovery {
                 cdc_cache: DashMap::new(),
             },
             _ => {
-                bail!("logRecovery only supports ResumerConfig::FromLog");
+                bail!(DtError::invalid_config(
+                    "log checkpoint recovery requires resume_type=from_log",
+                ));
             }
         };
-        recovery.initialization().await?;
+        recovery
+            .initialization()
+            .await
+            .stage(Stage::Resumer)
+            .endpoint(EndpointRole::Metadata)?;
         Ok(recovery)
     }
 
@@ -65,13 +72,13 @@ impl LogRecovery {
         };
         let position = Position::from_log(line);
         match &position {
-            Position::RdbSnapshot { schema, tb, .. } => {
-                tb_positions.insert((schema.clone(), tb.clone()), position);
+            Position::RdbSnapshot { db, schema, tb, .. } => {
+                tb_positions.insert((db.clone(), schema.clone(), tb.clone()), position);
             }
-            Position::RdbSnapshotFinished { schema, tb, .. } => {
+            Position::RdbSnapshotFinished { db, schema, tb, .. } => {
                 self.snapshot_cache
                     .finished_tbs
-                    .insert((schema.clone(), tb.clone()), true);
+                    .insert((db.clone(), schema.clone(), tb.clone()), true);
             }
 
             _ => {}
@@ -207,7 +214,10 @@ impl LogRecovery {
                     .await?;
                 }
             }
-            _ => bail!("logRecovery not supports TaskType: {:?}", self.task_type),
+            _ => bail!(DtError::invalid_config(format!(
+                "log checkpoint recovery does not support task type: {:?}",
+                self.task_type
+            ),)),
         }
         Ok(())
     }
@@ -215,19 +225,22 @@ impl LogRecovery {
 
 #[async_trait]
 impl Recovery for LogRecovery {
-    async fn check_snapshot_finished(&self, schema: &str, tb: &str) -> bool {
-        self.snapshot_cache
-            .finished_tbs
-            .contains_key(&(schema.to_string(), tb.to_string()))
+    async fn check_snapshot_finished(&self, db: &str, schema: &str, tb: &str) -> bool {
+        self.snapshot_cache.finished_tbs.contains_key(&(
+            db.to_string(),
+            schema.to_string(),
+            tb.to_string(),
+        ))
     }
 
     async fn get_snapshot_resume_position(
         &self,
+        db: &str,
         schema: &str,
         tb: &str,
         checkpoint: bool,
     ) -> Option<Position> {
-        let key = (schema.to_string(), tb.to_string());
+        let key = (db.to_string(), schema.to_string(), tb.to_string());
         let tb_positions =
             if !checkpoint && self.snapshot_cache.current_tb_positions.contains_key(&key) {
                 &self.snapshot_cache.current_tb_positions
@@ -255,13 +268,13 @@ impl Recovery for LogRecovery {
 #[cfg(test)]
 mod tests {
     use dashmap::DashMap;
-
-    use super::{LogRecovery, RecoverySnapshotCache};
-    use crate::extractor::resumer::recovery::Recovery;
     use dt_common::{
         config::config_enums::{TaskKind, TaskType},
         meta::position::Position,
     };
+
+    use super::{LogRecovery, RecoverySnapshotCache};
+    use crate::extractor::resumer::recovery::Recovery;
 
     fn new_log_recovery() -> LogRecovery {
         LogRecovery {

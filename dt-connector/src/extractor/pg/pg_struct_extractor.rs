@@ -1,13 +1,6 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use sqlx::{Pool, Postgres};
-
-use crate::{
-    extractor::base_extractor::{BaseExtractor, ExtractState},
-    meta_fetcher::pg::pg_struct_fetcher::PgStructFetcher,
-    Extractor,
-};
 use dt_common::{
     config::task_config::DEFAULT_DB_BATCH_SIZE,
     log_info, log_warn,
@@ -16,6 +9,13 @@ use dt_common::{
         structure::structure_type::StructureType,
     },
     rdb_filter::RdbFilter,
+};
+use sqlx::{Pool, Postgres};
+
+use crate::{
+    extractor::base_extractor::{BaseExtractor, ExtractState},
+    meta_fetcher::pg::pg_struct_fetcher::PgStructFetcher,
+    Extractor,
 };
 
 pub struct PgStructExtractor {
@@ -67,6 +67,7 @@ impl PgStructExtractor {
             conn_pool: self.conn_pool.to_owned(),
             schemas,
             filter: Some(self.filter.to_owned()),
+            allow_missing_schemas: false,
         };
 
         // User-Defined Type
@@ -113,7 +114,9 @@ impl PgStructExtractor {
 
     pub async fn push_dt_data(&mut self, statement: StructStatement) -> anyhow::Result<()> {
         let struct_data = StructData {
+            db: String::new(),
             schema: "".to_string(),
+            tb: String::new(),
             statement,
         };
         self.base_extractor

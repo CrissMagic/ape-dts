@@ -2,17 +2,6 @@ use std::{cmp, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use sqlx::{
-    mysql::{MySqlConnectOptions, MySqlPoolOptions},
-    MySql, Pool,
-};
-use tokio::{sync::RwLock, time::Instant};
-
-use crate::sinker::checkable_sinker::CheckableSink;
-use crate::{
-    call_batch_fn, data_marker::DataMarker, rdb_query_builder::RdbQueryBuilder,
-    rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker,
-};
 use dt_common::{
     config::connection_auth_config::ConnectionAuthConfig,
     log_error, log_info,
@@ -26,6 +15,17 @@ use dt_common::{
         row_type::RowType,
     },
     utils::limit_queue::LimitedQueue,
+};
+use sqlx::{
+    mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    MySql, Pool, TcpKeepalive,
+};
+use tokio::{sync::RwLock, time::Instant};
+
+use crate::sinker::checkable_sinker::CheckableSink;
+use crate::{
+    call_batch_fn, data_marker::DataMarker, rdb_query_builder::RdbQueryBuilder,
+    rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker,
 };
 
 #[derive(Clone)]
@@ -85,7 +85,8 @@ impl Sinker for MysqlSinker {
                 self.url.as_str(),
                 &self.connection_auth,
             )?;
-            let mut conn_options = MySqlConnectOptions::from_str(final_url.as_str())?;
+            let mut conn_options = MySqlConnectOptions::from_str(final_url.as_str())?
+                .tcp_keepalive(TcpKeepalive::new());
             if !db.is_empty() {
                 match ddl_data.ddl_type {
                     DdlType::CreateDatabase | DdlType::DropDatabase | DdlType::AlterDatabase => {}

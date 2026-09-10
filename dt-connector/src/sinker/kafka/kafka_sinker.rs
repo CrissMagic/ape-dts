@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use kafka::producer::{Producer, Record};
 use rdkafka::{
@@ -7,6 +7,7 @@ use rdkafka::{
 };
 use tokio::time::{Duration, Instant};
 
+use crate::{call_batch_fn, rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker};
 use dt_common::{
     config::config_enums::DbType,
     meta::{
@@ -19,8 +20,6 @@ use dt_common::{
     },
     utils::limit_queue::LimitedQueue,
 };
-
-use crate::{call_batch_fn, rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker};
 
 pub struct KafkaSinker {
     pub batch_size: usize,
@@ -246,9 +245,11 @@ impl KafkaSinker {
                 record = record.headers(Self::owned_headers(&message.headers));
             }
 
-            if let Err(err) = self.raw_producer.send(record, queue_timeout).await {
-                bail!("failed in kafka raw producer, error: {:?}", err);
-            }
+            self.raw_producer
+                .send(record, queue_timeout)
+                .await
+                .map_err(|(error, _message)| error)
+                .context("failed to send raw Kafka message")?;
         }
         Ok(())
     }
@@ -290,6 +291,7 @@ mod tests {
             ("content".to_string(), ColValue::UnchangedToast),
         ]);
         let mut row_data = RowData::new(
+            String::new(),
             "public".to_string(),
             "items".to_string(),
             0,
@@ -313,6 +315,7 @@ mod tests {
             ("content".to_string(), ColValue::UnchangedToast),
         ]);
         let mut row_data = RowData::new(
+            String::new(),
             "public".to_string(),
             "items".to_string(),
             0,
@@ -340,6 +343,7 @@ mod tests {
             ("content".to_string(), ColValue::UnchangedToast),
         ]);
         let mut row_data = RowData::new(
+            String::new(),
             "public".to_string(),
             "items".to_string(),
             0,
@@ -370,6 +374,7 @@ mod tests {
             ("content".to_string(), ColValue::UnchangedToast),
         ]);
         let mut row_data = RowData::new(
+            String::new(),
             "public".to_string(),
             "items".to_string(),
             0,
@@ -403,6 +408,7 @@ mod tests {
             ("content".to_string(), ColValue::UnchangedToast),
         ]);
         let mut row_data = RowData::new(
+            String::new(),
             "public".to_string(),
             "items".to_string(),
             0,
@@ -427,6 +433,7 @@ mod tests {
             ("content".to_string(), ColValue::UnchangedToast),
         ]);
         let mut row_data = RowData::new(
+            String::new(),
             "test_db".to_string(),
             "items".to_string(),
             0,

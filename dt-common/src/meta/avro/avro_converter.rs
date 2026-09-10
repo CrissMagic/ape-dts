@@ -1,9 +1,12 @@
 use std::{collections::HashMap, str::FromStr};
 
+use anyhow::Context;
 use apache_avro::{from_avro_datum, to_avro_datum, types::Value, Schema};
 
+use super::avro_converter_schema::{AvroConverterSchema, AvroFieldDef};
 use crate::{
     config::config_enums::DbType,
+    error::DtError,
     meta::{
         col_value::ColValue,
         ddl_meta::{ddl_data::DdlData, ddl_type::DdlType},
@@ -14,8 +17,6 @@ use crate::{
         row_type::RowType,
     },
 };
-
-use super::avro_converter_schema::{AvroConverterSchema, AvroFieldDef};
 
 #[derive(Clone)]
 pub struct AvroConverter {
@@ -32,17 +33,21 @@ const DDL: &str = "ddl";
 const DB_TYPE: &str = "db_type";
 const DDL_TYPE: &str = "ddl_type";
 const QUERY: &str = "query";
+const DB: &str = "db";
 const SCHEMA: &str = "schema";
 const TB: &str = "tb";
 const FIELDS: &str = "fields";
 
 impl AvroConverter {
-    pub fn new(meta_manager: Option<RdbMetaManager>, with_field_defs: bool) -> Self {
-        AvroConverter {
-            schema: AvroConverterSchema::get_avro_schema(),
+    pub fn new(
+        meta_manager: Option<RdbMetaManager>,
+        with_field_defs: bool,
+    ) -> anyhow::Result<Self> {
+        Ok(AvroConverter {
+            schema: AvroConverterSchema::get_avro_schema()?,
             meta_manager,
             with_field_defs,
-        }
+        })
     }
 
     pub fn refresh_meta(&mut self, data: &[DdlData]) {
@@ -135,7 +140,18 @@ impl AvroConverter {
                     avro_type,
                 });
             }
-            Value::Union(1, Box::new(apache_avro::to_value(fields).unwrap()))
+            let value = apache_avro::to_value(fields).context(DtError::InvariantViolated(
+                "failed to encode Avro field definitions".to_string(),
+            ))?;
+            Value::Union(1, Box::new(value))
+        };
+
+        let extra = if row_data.db.is_empty() {
+            Value::Union(0, Box::new(Value::Null))
+        } else {
+            let values = HashMap::from([(DB.to_string(), ColValue::String(row_data.db.clone()))]);
+            let (avro_values, _) = Self::col_values_to_avro(&Some(values));
+            Value::Union(1, Box::new(avro_values))
         };
 
         let value = Value::Record(vec![
@@ -148,7 +164,7 @@ impl AvroConverter {
             (FIELDS.into(), fields),
             (BEFORE.into(), before),
             (AFTER.into(), after),
-            (EXTRA.into(), Value::Union(0, Box::new(Value::Null))),
+            (EXTRA.into(), extra),
         ]);
         Ok(to_avro_datum(&self.schema, value)?)
     }
@@ -164,6 +180,9 @@ impl AvroConverter {
             ColValue::String(ddl_data.ddl_type.to_string()),
         );
         col_values.insert(QUERY.into(), ColValue::String(ddl_data.query));
+        if !ddl_data.default_db.is_empty() {
+            col_values.insert(DB.into(), ColValue::String(ddl_data.default_db.clone()));
+        }
 
         let (avro_values, _) = Self::col_values_to_avro(&Some(col_values));
         let extra = Value::Union(1, Box::new(avro_values));
@@ -195,22 +214,24 @@ impl AvroConverter {
         let schema = avro_to_string(avro_map.remove(SCHEMA));
         let tb = avro_to_string(avro_map.remove(TB));
         let operation = avro_to_string(avro_map.remove(OPERATION));
+        let extra = self.avro_to_col_values(avro_map.remove(EXTRA));
+
+        let get_extra_string = |key: &str| {
+            extra
+                .as_ref()
+                .and_then(|values| values.get(key))
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        };
+        let db = get_extra_string(DB);
 
         if operation == *DDL {
-            let get_extra_string = |extra: &Option<HashMap<String, ColValue>>, key: &str| {
-                if let Some(extra) = extra {
-                    if let Some(v) = extra.get(key) {
-                        return v.to_string();
-                    }
-                }
-                String::new()
-            };
-            let extra = self.avro_to_col_values(avro_map.remove(EXTRA));
-            let db_type = get_extra_string(&extra, DB_TYPE);
-            let ddl_type = get_extra_string(&extra, DDL_TYPE);
-            let query = get_extra_string(&extra, QUERY);
+            let db_type = get_extra_string(DB_TYPE);
+            let ddl_type = get_extra_string(DDL_TYPE);
+            let query = get_extra_string(QUERY);
             Ok(DtData::Ddl {
                 ddl_data: DdlData {
+                    default_db: db,
                     default_schema: schema,
                     query,
                     db_type: DbType::from_str(&db_type)?,
@@ -219,31 +240,33 @@ impl AvroConverter {
                 },
             })
         } else {
-            let _fields = self.avro_to_fields(avro_map.remove(FIELDS));
+            let _fields = self.avro_to_fields(avro_map.remove(FIELDS))?;
             let before = self.avro_to_col_values(avro_map.remove(BEFORE));
             let after = self.avro_to_col_values(avro_map.remove(AFTER));
-            Ok(DtData::Dml {
-                row_data: RowData::new(
-                    schema,
-                    tb,
-                    0,
-                    RowType::from_str(&operation)?,
-                    before,
-                    after,
-                ),
-            })
+            let row_data = RowData::new(
+                db,
+                schema,
+                tb,
+                0,
+                RowType::from_str(&operation)?,
+                before,
+                after,
+            );
+            Ok(DtData::Dml { row_data })
         }
     }
 
-    fn avro_to_fields(&self, value: Option<Value>) -> Vec<AvroFieldDef> {
+    fn avro_to_fields(&self, value: Option<Value>) -> anyhow::Result<Vec<AvroFieldDef>> {
         if let Some(v) = value {
-            return apache_avro::from_value(&v).unwrap();
+            return apache_avro::from_value(&v).context(DtError::DataDecodeFailed(
+                "failed to decode Avro field definitions".to_string(),
+            ));
         }
-        vec![]
+        Ok(vec![])
     }
 
     fn avro_to_col_values(&self, value: Option<Value>) -> Option<HashMap<String, ColValue>> {
-        value.as_ref()?;
+        let value = value?;
 
         // Some(Union(1, Map({
         //     "bytes_col": Union(4, Bytes([5, 6, 7, 8])),
@@ -254,7 +277,7 @@ impl AvroConverter {
         //     "double_col": Union(3, Double(2.2))
         //   })))
 
-        if let Value::Union(1, v) = value.unwrap() {
+        if let Value::Union(1, v) = value {
             if let Value::Map(map_v) = *v {
                 let mut col_values = HashMap::new();
                 for (col, value) in map_v {
@@ -270,12 +293,12 @@ impl AvroConverter {
         col_values: &Option<HashMap<String, ColValue>>,
     ) -> (Value, HashMap<String, String>) {
         let mut avro_types = HashMap::new();
-        if col_values.is_none() {
+        let Some(col_values) = col_values else {
             return (Value::Null, avro_types);
-        }
+        };
 
         let mut avro_values = HashMap::new();
-        for (col, value) in col_values.as_ref().unwrap() {
+        for (col, value) in col_values {
             let avro_value = Self::col_value_to_avro(value);
             let (union_position, avro_type) = match avro_value {
                 Value::Null => (0, "Null".to_string()),
@@ -334,6 +357,7 @@ impl AvroConverter {
             ColValue::Json3(v) => Value::String(v.to_string()),
 
             ColValue::MongoDoc(v) => Value::String(v.to_string()),
+            ColValue::MongoRawDoc(v) => Value::Bytes(v.as_bytes().to_vec()),
 
             ColValue::Bool(v) => Value::Boolean(*v),
             ColValue::None | ColValue::UnchangedToast => Value::Null,
@@ -370,7 +394,7 @@ impl AvroConverter {
     ) -> anyhow::Result<Option<&'a RdbTbMeta>> {
         if let Some(meta_manager) = self.meta_manager.as_mut() {
             let tb_meta = meta_manager
-                .get_tb_meta(&row_data.schema, &row_data.tb)
+                .get_tb_meta(&row_data.db, &row_data.schema, &row_data.tb)
                 .await?;
             return Ok(Some(tb_meta));
         }
@@ -411,8 +435,9 @@ mod tests {
         after.insert(BOOLEAN_COL.into(), ColValue::Bool(true));
         after.insert(NULL_COL.into(), ColValue::None);
 
-        let mut avro_converter = AvroConverter::new(None, false);
+        let mut avro_converter = AvroConverter::new(None, false).unwrap();
         let mut row_data = RowData::new(
+            "catalog1".to_string(),
             schema.into(),
             tb.into(),
             0,
@@ -437,9 +462,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_ddl_data_to_avro() {
-        let mut avro_converter = AvroConverter::new(None, false);
+        let mut avro_converter = AvroConverter::new(None, false).unwrap();
 
         let ddl_data = DdlData {
+            default_db: "catalog1".to_string(),
             default_schema: "db1".to_string(),
             query: "create table a(id int);".to_string(),
             ddl_type: DdlType::CreateTable,

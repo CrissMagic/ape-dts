@@ -1,17 +1,15 @@
 use std::{cmp, collections::HashMap};
 
-use anyhow::bail;
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::{Client, Method, Response, StatusCode};
-use tokio::time::Instant;
-
 use dt_common::{
     config::config_enums::DbType,
-    error::Error,
+    error::DtError,
     meta::{col_value::ColValue, row_data::RowData, row_type::RowType},
     utils::{limit_queue::LimitedQueue, sql_util::SqlUtil},
 };
+use reqwest::{Client, Method, Response, StatusCode};
+use tokio::time::Instant;
 
 use crate::{call_batch_fn, sinker::base_sinker::BaseSinker, Sinker};
 
@@ -187,12 +185,16 @@ impl ClickhouseSinker {
 
     async fn check_response(response: Response) -> anyhow::Result<()> {
         let status_code = response.status();
-        let response_text = &response.text().await?;
+        response.text().await?;
         if status_code != StatusCode::OK {
-            bail! {Error::HttpError(format!(
-                "data load request failed, status_code: {}, response_text: {:?}",
-                status_code, response_text
-            ))}
+            return Err(DtError::HttpRejected {
+                status: status_code.as_u16(),
+                detail: format!(
+                    "the destination rejected the request with HTTP status {}",
+                    status_code.as_u16()
+                ),
+            }
+            .into());
         }
         Ok(())
     }

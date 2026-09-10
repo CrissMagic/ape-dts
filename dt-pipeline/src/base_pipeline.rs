@@ -1,17 +1,13 @@
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tokio::{
-    sync::{Mutex, RwLock},
-    time::{Duration, Instant},
-};
 
-use crate::{lua_processor::LuaProcessor, Pipeline};
+use async_trait::async_trait;
 use dt_common::{
     config::sinker_config::SinkerConfig,
+    error::{DtResultExt, Stage},
     log_error, log_finished, log_info, log_position, log_warn,
     meta::{
         dcl_meta::dcl_data::DclData,
@@ -29,12 +25,17 @@ use dt_common::{
     runtime_trace,
 };
 use dt_connector::{
-    checker::CheckerHandle,
     data_marker::DataMarker,
     extractor::resumer::{recorder::Recorder, utils::ResumerUtil},
     Sinker,
 };
 use dt_parallelizer::{DataSize, Parallelizer};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::{Duration, Instant},
+};
+
+use crate::{lua_processor::LuaProcessor, Pipeline};
 
 pub struct BasePipeline {
     pub buffer: Arc<DtQueue>,
@@ -50,7 +51,7 @@ pub struct BasePipeline {
     pub data_marker: Option<Arc<RwLock<DataMarker>>>,
     pub lua_processor: Option<LuaProcessor>,
     pub recorder: Option<Arc<dyn Recorder + Send + Sync>>,
-    pub checker: Option<CheckerHandle>,
+    pub propagate_checkpoint_to_sinker: bool,
 }
 
 enum SinkMethod {
@@ -64,19 +65,18 @@ enum SinkMethod {
 #[async_trait]
 impl Pipeline for BasePipeline {
     async fn stop(&mut self) -> anyhow::Result<()> {
-        for sinker in self.sinkers.iter_mut() {
-            sinker.lock().await.close().await?;
-        }
         let final_position = {
             let syncer = self.syncer.lock().await;
-            Self::checker_close_position(&syncer)
+            Self::final_commit_position(&syncer)
         };
-        if let Some(checker) = &mut self.checker {
-            if let Err(err) = checker.close_with_position(final_position.as_ref()).await {
-                log_warn!("checker close failed: {}", err);
-            }
+        for sinker in self.sinkers.iter_mut() {
+            sinker
+                .lock()
+                .await
+                .close_with_position(final_position.as_ref())
+                .await?;
         }
-        self.parallelizer.close().await
+        self.parallelizer.close().await.stage(Stage::Parallelizer)
     }
 
     async fn start(&mut self) -> anyhow::Result<()> {
@@ -140,7 +140,10 @@ impl Pipeline for BasePipeline {
                 Vec::new()
             } else {
                 last_sink_time = Instant::now();
-                self.parallelizer.drain(self.buffer.as_ref()).await?
+                self.parallelizer
+                    .drain(self.buffer.as_ref())
+                    .await
+                    .stage(Stage::Parallelizer)?
             };
 
             if let Some(data_marker) = &mut self.data_marker {
@@ -203,7 +206,7 @@ impl Pipeline for BasePipeline {
 }
 
 impl BasePipeline {
-    fn checker_close_position(syncer: &Syncer) -> Option<Position> {
+    fn final_commit_position(syncer: &Syncer) -> Option<Position> {
         (!matches!(syncer.committed_position, Position::None))
             .then_some(syncer.committed_position.clone())
     }
@@ -215,7 +218,11 @@ impl BasePipeline {
         let (data_count, last_received_position, commit_positions) =
             Self::fetch_raw(&all_data, &mut self.pending_snapshot_finished);
         if data_count > 0 {
-            let data_size = self.parallelizer.sink_raw(all_data, &self.sinkers).await?;
+            let data_size = self
+                .parallelizer
+                .sink_raw(all_data, &self.sinkers)
+                .await
+                .stage(Stage::Parallelizer)?;
             Ok((data_size, last_received_position, commit_positions))
         } else {
             Ok((
@@ -242,12 +249,9 @@ impl BasePipeline {
 
         let data_size = self
             .parallelizer
-            .sink_struct(data.clone(), &self.sinkers)
-            .await?;
-
-        if let Some(checker) = &mut self.checker {
-            checker.check_struct(data).await?;
-        }
+            .sink_struct(data, &self.sinkers)
+            .await
+            .stage(Stage::Parallelizer)?;
 
         Ok((data_size, None, Vec::new()))
     }
@@ -272,7 +276,11 @@ impl BasePipeline {
             data = lua_processor.process(data)?;
         }
 
-        let data_size = self.parallelizer.sink_dml(data, &self.sinkers).await?;
+        let data_size = self
+            .parallelizer
+            .sink_dml(data, &self.sinkers)
+            .await
+            .stage(Stage::Parallelizer)?;
         Ok((data_size, last_received_position, commit_positions))
     }
 
@@ -287,16 +295,11 @@ impl BasePipeline {
             let data_size = self
                 .parallelizer
                 .sink_ddl(data.clone(), &self.sinkers)
-                .await?;
+                .await
+                .stage(Stage::Parallelizer)?;
             // only part of sinkers will execute sink_ddl, but all sinkers should refresh metadata
             for sinker in self.sinkers.iter_mut() {
                 sinker.lock().await.refresh_meta(data.clone()).await?;
-            }
-            // cdc+check also needs refreshed table metadata after sink ddl changes the target schema
-            if let Some(checker) = &self.checker {
-                if let Err(err) = checker.refresh_meta(data.clone()).await {
-                    log_warn!("checker refresh_meta failed: {}", err);
-                }
             }
             self.monitor
                 .add_counter(
@@ -327,7 +330,10 @@ impl BasePipeline {
             bytes: 0,
         };
         if data_size.count > 0 {
-            self.parallelizer.sink_dcl(data, &self.sinkers).await?;
+            self.parallelizer
+                .sink_dcl(data, &self.sinkers)
+                .await
+                .stage(Stage::Parallelizer)?;
         }
         Ok((data_size, last_received_position, commit_positions))
     }
@@ -561,11 +567,6 @@ impl BasePipeline {
                 position: finish_position.clone(),
                 data_origin_node: String::new(),
             };
-            if let Some(checker) = &self.checker {
-                if let Err(err) = checker.handle_control_item(&item).await {
-                    log_warn!("checker handle_control_item failed: {}", err);
-                }
-            }
             for sinker in self.sinkers.iter_mut() {
                 sinker.lock().await.handle_control_item(&item).await?;
             }
@@ -577,9 +578,9 @@ impl BasePipeline {
         position: &Position,
         pending_snapshot_finished: &mut HashMap<String, Position>,
     ) -> bool {
-        if let Position::RdbSnapshotFinished { schema, tb, .. } = position {
+        if let Position::RdbSnapshotFinished { db, schema, tb, .. } = position {
             pending_snapshot_finished.insert(
-                TaskMonitorHandle::task_id_from_schema_tb(schema, tb),
+                TaskMonitorHandle::task_id_from_db_schema_tb(db, schema, tb),
                 position.clone(),
             );
             true
@@ -616,10 +617,17 @@ impl BasePipeline {
             .map(|(_, position)| *position)
             .unwrap_or(last_received_position);
 
-        if !matches!(checker_position, Position::None) {
-            if let Some(checker) = &self.checker {
-                if let Err(err) = checker.record_checkpoint(checker_position).await {
-                    log_warn!("checker checkpoint failed: {}", err);
+        if self.propagate_checkpoint_to_sinker && !matches!(checker_position, Position::None) {
+            // Lifecycle-aware decorators are attached to the last sinker so their close hook
+            // runs after every regular sinker has closed.
+            if let Some(sinker) = self.sinkers.last() {
+                if let Err(err) = sinker
+                    .lock()
+                    .await
+                    .record_checkpoint(checker_position)
+                    .await
+                {
+                    log_warn!("sinker checkpoint hook failed: {}", err);
                 }
             }
         }

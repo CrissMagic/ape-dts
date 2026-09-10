@@ -4,12 +4,9 @@ use std::{
 };
 
 use anyhow::bail;
-use futures::TryStreamExt;
-use sqlx::{mysql::MySqlRow, MySql, Pool, Row};
-
 use dt_common::{
     config::config_enums::DbType,
-    error::Error,
+    error::DtError,
     meta::{
         mysql::{mysql_col_type::MysqlColType, mysql_meta_manager::MysqlMetaManager},
         struct_meta::{
@@ -29,12 +26,15 @@ use dt_common::{
     rdb_filter::RdbFilter,
     utils::sql_util::SqlUtil,
 };
+use futures::TryStreamExt;
+use sqlx::{mysql::MySqlRow, MySql, Pool, Row};
 
 pub struct MysqlStructFetcher {
     pub conn_pool: Pool<MySql>,
     pub dbs: HashSet<String>,
     pub filter: Option<RdbFilter>,
     pub meta_manager: MysqlMetaManager,
+    pub allow_missing_databases: bool,
 }
 
 impl MysqlStructFetcher {
@@ -123,8 +123,8 @@ impl MysqlStructFetcher {
             .filter(|&s| !dbs.contains_key(s))
             .cloned()
             .collect();
-        if !filtered_dbs.is_empty() {
-            bail! {Error::StructError(format!(
+        if !self.allow_missing_databases && !filtered_dbs.is_empty() {
+            bail! {DtError::DatabaseNotFound(DbType::Mysql, format!(
                 "dbs: {} not found",
                 filtered_dbs.join(",")
             ))}
@@ -595,13 +595,13 @@ impl MysqlStructFetcher {
         let sql = format!("select '{}' as result", text);
         match sqlx::query(&sql).fetch_all(&self.conn_pool).await {
             Ok(rows) => {
-                if !rows.is_empty() {
-                    let result: String = rows.first().unwrap().get("result");
+                if let Some(row) = rows.first() {
+                    let result: String = row.get("result");
                     return Ok(result);
                 }
             }
             Err(error) => {
-                bail! {Error::SqlxError(error)}
+                bail! {error}
             }
         }
         Ok(text)

@@ -1,6 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use dt_common::{
+    config::{
+        config_enums::TaskType, connection_auth_config::ConnectionAuthConfig,
+        resumer_config::ResumerConfig,
+    },
+    error::DtError,
+    log_info, log_warn,
+    meta::{mssql::mssql_connection_pool::MssqlConnectionPool, position::Position},
+};
 use mongodb::Client;
 use sqlx::{MySql, Pool, Postgres};
 use strum::{Display, EnumString, IntoStaticStr};
@@ -9,14 +18,6 @@ use tokio::time::Instant;
 use crate::extractor::resumer::{
     recorder::{to_database::DatabaseRecorder, Recorder},
     recovery::{from_database::DatabaseRecovery, from_log::LogRecovery, Recovery},
-};
-use dt_common::{
-    config::{
-        config_enums::TaskType, connection_auth_config::ConnectionAuthConfig,
-        resumer_config::ResumerConfig,
-    },
-    log_info, log_warn,
-    meta::position::Position,
 };
 pub mod recorder;
 pub mod recovery;
@@ -32,6 +33,7 @@ const DEFAULT_POSITION_KEY: &str = "default_key";
 pub enum ResumerDbPool {
     MySql(Pool<MySql>),
     Postgres(Pool<Postgres>),
+    Mssql(MssqlConnectionPool),
     Mongo(Client),
     Redis(RedisResumerConn),
 }
@@ -77,7 +79,9 @@ pub async fn build_recorder(
         ResumerConfig::FromDB { .. } => {
             let pool_inner = match pool {
                 Some(p) => p,
-                None => bail!("pool is required for FromDB resumer config"),
+                None => bail!(DtError::invalid_config(
+                    "a database pool is required when resume_type=from_db",
+                )),
             };
             let recorder =
                 DatabaseRecorder::new(task_id, resumer_config, pool_inner, is_init).await?;
@@ -101,7 +105,9 @@ pub async fn build_recovery(
         ResumerConfig::FromDB { .. } => {
             let pool_inner = match pool {
                 Some(p) => p,
-                None => bail!("pool is required for FromDB resumer config"),
+                None => bail!(DtError::invalid_config(
+                    "a database pool is required when resume_type=from_db",
+                )),
             };
             let recovery = DatabaseRecovery::new(task_id, resumer_config, pool_inner).await?;
             Some(Arc::new(recovery))

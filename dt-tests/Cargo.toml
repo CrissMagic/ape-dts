@@ -8,6 +8,7 @@ workspace = true
 
 [features]
 tracing = ["dt-task/tracing"]
+metrics = ["dt-task/metrics"]
 
 [dependencies]
 dt-common = { path = "../dt-common", version = "0.1.0" }
@@ -21,6 +22,7 @@ chrono = { workspace = true }
 clickhouse = { workspace = true, features = ["time"] }
 concurrent-queue = { workspace = true }
 configparser = { workspace = true }
+connection-string = { workspace = true }
 dotenv = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -37,6 +39,8 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tiberius = { workspace = true }
 url = { workspace = true }
 rust_decimal = { workspace = true }
 uuid = { workspace = true }

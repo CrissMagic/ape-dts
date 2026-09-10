@@ -68,7 +68,9 @@ impl FlushableMonitor for TaskMonitor {
 
         self.reset_before_calc();
         if let Some(metrics) = self.calc().await {
-            log_task!("{}", serde_json::to_string(&metrics).unwrap());
+            if let Ok(serialized) = serde_json::to_string(&metrics) {
+                log_task!("{}", serialized);
+            }
             #[cfg(feature = "metrics")]
             self.prometheus_metrics.set_metrics(&metrics);
         }
@@ -894,6 +896,8 @@ fn calc_nowindow_metrics(
 
 #[cfg(test)]
 mod sinker_worker_tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
     use super::{collect_sinker_worker_metrics, MonitorType, TaskMonitor};
     use crate::{
         config::config_enums::{TaskKind, TaskType},
@@ -902,7 +906,6 @@ mod sinker_worker_tests {
             sinker_worker_metrics::SinkerWorkerMetrics, task_metrics::TaskMetricsType,
         },
     };
-    use std::{collections::BTreeMap, sync::Arc};
 
     fn build_task_monitor() -> TaskMonitor {
         let task_type = TaskType::new(TaskKind::Cdc, None);
@@ -912,11 +915,12 @@ mod sinker_worker_tests {
         }
         #[cfg(feature = "metrics")]
         {
+            use std::collections::HashMap;
+
             use crate::{
                 config::metrics_config::MetricsConfig,
                 monitor::prometheus_metrics::PrometheusMetrics,
             };
-            use std::collections::HashMap;
 
             let prometheus = Arc::new(PrometheusMetrics::new(
                 Some(task_type),

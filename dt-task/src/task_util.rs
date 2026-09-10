@@ -1,18 +1,9 @@
 use std::{str::FromStr, sync::Arc, time::Duration};
 
-use anyhow::bail;
-use futures::{future::join_all, TryStreamExt};
-use mongodb::{bson::doc, options::ClientOptions};
-use opendal::Operator;
-use sqlx::{
-    mysql::{MySqlConnectOptions, MySqlPoolOptions},
-    postgres::{PgConnectOptions, PgPoolOptions},
-    ConnectOptions, Executor, MySql, Pool, Postgres, Row,
-};
-
+use anyhow::{bail, Context};
 use dt_common::{
     config::{
-        config_enums::{DbType, RdbTransactionIsolation, TaskKind, TaskType},
+        config_enums::{DbType, RdbTransactionIsolation, SinkType, TaskKind, TaskType},
         connection_auth_config::ConnectionAuthConfig,
         extractor_config::ExtractorConfig,
         global_config::GlobalConfig,
@@ -22,9 +13,11 @@ use dt_common::{
         sinker_config::{BasicSinkerConfig, SinkerConfig},
         task_config::TaskConfig,
     },
-    error::Error,
+    error::{DtError, DtResultExt, EndpointRole},
     log_info, log_warn,
     meta::{
+        adaptor::mssql_col_value_convertor::MssqlColValueConvertor,
+        mssql::{mssql_connection_pool::MssqlConnectionPool, mssql_meta_manager::MssqlMetaManager},
         mysql::{
             mysql_dbengine_meta_center::MysqlDbEngineMetaCenter,
             mysql_meta_manager::MysqlMetaManager,
@@ -43,10 +36,21 @@ use dt_connector::{
         build_recorder, build_recovery, recorder::Recorder, recovery::Recovery, utils::ResumerUtil,
     },
 };
+use futures::{future::join_all, TryStreamExt};
+use mongodb::{bson::doc, options::ClientOptions, Client};
+use opendal::Operator;
+use sqlx::{
+    mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    postgres::{PgConnectOptions, PgPoolOptions},
+    ConnectOptions, Executor, MySql, Pool, Postgres, Row, TcpKeepalive,
+};
+use tiberius::Query;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 pub struct TaskUtil {}
+
+const MSSQL_ESTIMATE_DB_BATCH_SIZE: usize = 32;
 
 impl TaskUtil {
     pub async fn create_rdb_meta_manager_for_target(
@@ -74,6 +78,19 @@ impl TaskUtil {
                 Some(RdbMetaManager::from_pg(pg_meta_manager))
             }
 
+            DbType::Mssql => {
+                let connection_pool = MssqlConnectionPool::from_config(
+                    &target.url,
+                    &target.connection_auth,
+                    target.app_name.as_deref(),
+                    target.max_connections,
+                    target.connection_timeout_secs,
+                )
+                .await?;
+                let meta_manager = MssqlMetaManager::new(connection_pool).await?;
+                Some(RdbMetaManager::from_mssql(meta_manager))
+            }
+
             _ => None,
         };
         Ok(meta_manager)
@@ -92,6 +109,7 @@ impl TaskUtil {
         let mut conn_options = MySqlConnectOptions::from_str(&final_url)?;
         // The default character set is `utf8mb4`
         conn_options = conn_options
+            .tcp_keepalive(TcpKeepalive::new())
             .log_statements(log::LevelFilter::Debug)
             .log_slow_statements(log::LevelFilter::Debug, Duration::from_secs(1));
 
@@ -174,7 +192,12 @@ impl TaskUtil {
         let final_url = ConnectionAuthConfig::merge_url_with_auth(url, connection_auth)?;
 
         let mut conn_options = PgConnectOptions::from_str(&final_url)?;
+        let tcp_keepalive = conn_options
+            .get_tcp_keepalive()
+            .copied()
+            .unwrap_or_default();
         conn_options = conn_options
+            .tcp_keepalive(tcp_keepalive)
             .log_statements(log::LevelFilter::Debug)
             .log_slow_statements(log::LevelFilter::Debug, Duration::from_secs(1));
 
@@ -276,6 +299,20 @@ impl TaskUtil {
                 Self::create_rdb_meta_manager_for_target(&target, log_level).await?
             }
 
+            SinkerConfig::Mssql {
+                url,
+                connection_auth,
+                ..
+            } => {
+                let target = BasicSinkerConfig {
+                    db_type: DbType::Mssql,
+                    url: url.clone(),
+                    connection_auth: connection_auth.clone(),
+                    ..config.sinker_basic.clone()
+                };
+                Self::create_rdb_meta_manager_for_target(&target, log_level).await?
+            }
+
             _ => None,
         };
 
@@ -368,7 +405,13 @@ impl TaskUtil {
     ) -> anyhow::Result<mongodb::Client> {
         let final_url = ConnectionAuthConfig::merge_url_with_auth(url, connection_auth)?;
 
-        let mut client_options = ClientOptions::parse(&final_url).await?;
+        let mut client_options =
+            ClientOptions::parse(&final_url)
+                .await
+                .context(DtError::DatabaseInvalidConfig(
+                    DbType::Mongo,
+                    "failed to parse MongoDB client options".to_string(),
+                ))?;
         // app_name only for debug usage
         if let Some(app) = app_name {
             client_options.app_name = Some(app.to_string());
@@ -378,7 +421,10 @@ impl TaskUtil {
         }
         client_options.max_pool_size = max_pool_size;
 
-        Ok(mongodb::Client::with_options(client_options)?)
+        Client::with_options(client_options).context(DtError::DatabaseInvalidConfig(
+            DbType::Mongo,
+            "failed to create MongoDB client".to_string(),
+        ))
     }
 
     pub fn check_enable_sqlx_log(log_level: &str) -> bool {
@@ -389,25 +435,43 @@ impl TaskUtil {
         conn_pool: &ConnClient,
         db_type: &DbType,
     ) -> anyhow::Result<Vec<String>> {
-        let mut dbs = match db_type {
+        let mut schemas = match db_type {
             DbType::Mysql => Self::list_mysql_dbs(conn_pool).await?,
             DbType::Pg => Self::list_pg_schemas(conn_pool).await?,
+            DbType::Mssql => Self::list_mssql_dbs(conn_pool).await?,
             DbType::Mongo => Self::list_mongo_dbs(conn_pool).await?,
             _ => Vec::new(),
         };
-        dbs.sort();
-        Ok(dbs)
+        schemas.sort();
+        Ok(schemas)
     }
 
     pub async fn list_tbs(
         conn_client: &ConnClient,
-        schema: &str,
+        namespace: &str,
         db_type: &DbType,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
         let mut tbs = match db_type {
-            DbType::Mysql => Self::list_mysql_tbs(conn_client, schema).await?,
-            DbType::Pg => Self::list_pg_tbs(conn_client, schema).await?,
-            DbType::Mongo => Self::list_mongo_tbs(conn_client, schema).await?,
+            DbType::Mysql => Self::list_mysql_tbs(conn_client, namespace)
+                .await?
+                .into_iter()
+                .map(|tb| (String::new(), namespace.to_string(), tb))
+                .collect(),
+            DbType::Pg => Self::list_pg_tbs(conn_client, namespace)
+                .await?
+                .into_iter()
+                .map(|tb| (String::new(), namespace.to_string(), tb))
+                .collect(),
+            DbType::Mssql => Self::list_mssql_tbs(conn_client, namespace)
+                .await?
+                .into_iter()
+                .map(|(schema, tb)| (namespace.to_string(), schema, tb))
+                .collect(),
+            DbType::Mongo => Self::list_mongo_tbs(conn_client, namespace)
+                .await?
+                .into_iter()
+                .map(|tb| (String::new(), namespace.to_string(), tb))
+                .collect(),
             _ => Vec::new(),
         };
         tbs.sort();
@@ -425,6 +489,7 @@ impl TaskUtil {
             TaskKind::Snapshot => match db_type {
                 DbType::Mysql => Self::estimate_mysql_snapshot(conn_pool, schemas, filter).await,
                 DbType::Pg => Self::estimate_pg_snapshot(conn_pool, schemas, filter).await,
+                DbType::Mssql => Self::estimate_mssql_snapshot(conn_pool, schemas, filter).await,
                 _ => Ok(0),
             },
             _ => Ok(0),
@@ -439,7 +504,7 @@ impl TaskUtil {
         let conn_pool = match conn_pool {
             ConnClient::MySQL(conn_pool) => conn_pool,
             _ => {
-                bail!("conn_pool is not found")
+                bail!(DtError::MissingTaskClient(DbType::Mysql))
             }
         };
 
@@ -460,7 +525,7 @@ impl TaskUtil {
 
         let mut total_records = 0;
         let mut rows = sqlx::query(&sql).fetch(conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await? {
             let schema = SqlUtil::try_get_mysql_string(&row, 0)?;
             let tb = SqlUtil::try_get_mysql_string(&row, 1)?;
             let records: u64 = row.try_get(2)?;
@@ -481,7 +546,7 @@ impl TaskUtil {
         let conn_pool = match conn_pool {
             ConnClient::PostgreSQL(conn_pool) => conn_pool,
             _ => {
-                bail!("conn_pool is not found")
+                bail!(DtError::MissingTaskClient(DbType::Pg))
             }
         };
 
@@ -514,7 +579,7 @@ WHERE
 
         let mut total_length = 0;
         let mut rows = sqlx::query(&sql).fetch(conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await? {
             let schema: String = row.try_get(0)?;
             let table_name: String = row.try_get(1)?;
             let row_count: i64 = row.try_get(2)?;
@@ -529,6 +594,65 @@ WHERE
         Ok(total_length)
     }
 
+    async fn estimate_mssql_snapshot(
+        connection_pool: &ConnClient,
+        dbs: &[String],
+        filter: &RdbFilter,
+    ) -> anyhow::Result<u64> {
+        let connection_pool = match connection_pool {
+            ConnClient::Mssql(connection_pool) => connection_pool,
+            _ => bail!(DtError::MissingTaskClient(DbType::Mssql)),
+        };
+        let mut total_records = 0u64;
+        for db_batch in dbs.chunks(MSSQL_ESTIMATE_DB_BATCH_SIZE) {
+            let mut query = Query::new(Self::build_mssql_estimate_sql(db_batch));
+            for db in db_batch {
+                query.bind(db.as_str());
+            }
+            let mut connection = connection_pool.get().await?;
+            let rows = query
+                .query(connection.client_mut())
+                .await?
+                .into_first_result()
+                .await?;
+            for row in rows {
+                let db = MssqlColValueConvertor::from_query_required_string(&row, "database_name")?;
+                let schema =
+                    MssqlColValueConvertor::from_query_required_string(&row, "schema_name")?;
+                let table = MssqlColValueConvertor::from_query_required_string(&row, "table_name")?;
+                if filter.filter_tb_with_db(&db, &schema, &table) {
+                    continue;
+                }
+                let row_count = MssqlColValueConvertor::from_query_required_i64(&row, "row_count")?
+                    .max(0) as u64;
+                total_records = total_records.saturating_add(row_count);
+            }
+        }
+        Ok(total_records)
+    }
+
+    fn build_mssql_estimate_sql(dbs: &[String]) -> String {
+        dbs.iter()
+            .enumerate()
+            .map(|(index, db)| {
+                let parameter_index = index + 1;
+                let catalog = SqlUtil::escape_by_db_type(db, &DbType::Mssql);
+                format!(
+                    "SELECT CAST(@P{parameter_index} AS nvarchar(128)) COLLATE DATABASE_DEFAULT AS database_name, \
+                     s.name COLLATE DATABASE_DEFAULT AS schema_name, \
+                     t.name COLLATE DATABASE_DEFAULT AS table_name, \
+                     COALESCE(SUM(CONVERT(bigint, p.rows)), CONVERT(bigint, 0)) AS row_count \
+                     FROM {catalog}.sys.tables AS t \
+                     JOIN {catalog}.sys.schemas AS s ON s.schema_id = t.schema_id \
+                     JOIN {catalog}.sys.partitions AS p ON p.object_id = t.object_id \
+                     WHERE p.index_id IN (0, 1) AND t.is_ms_shipped = 0 \
+                     GROUP BY s.name, t.name"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ")
+    }
+
     pub async fn check_tb_exist(
         conn_client: &ConnClient,
         schema: &str,
@@ -541,7 +665,9 @@ WHERE
         }
 
         let tbs = Self::list_tbs(conn_client, schema, db_type).await?;
-        Ok(tbs.contains(&tb.to_string()))
+        Ok(tbs
+            .iter()
+            .any(|(_, listed_schema, listed_tb)| listed_schema == schema && listed_tb == tb))
     }
 
     pub async fn check_and_create_tb(
@@ -582,7 +708,7 @@ WHERE
         let conn_pool = match conn_client {
             ConnClient::PostgreSQL(conn_pool) => conn_pool,
             _ => {
-                bail!("conn_pool is not found")
+                bail!(DtError::MissingTaskClient(DbType::Pg))
             }
         };
 
@@ -590,7 +716,7 @@ WHERE
             FROM information_schema.schemata
             WHERE catalog_name = current_database()";
         let mut rows = sqlx::query(sql).fetch(conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await? {
             let schema: String = row.try_get(0)?;
             if SystemDb::is_system_db(&schema, &DbType::Pg) {
                 continue;
@@ -601,12 +727,40 @@ WHERE
         Ok(schemas)
     }
 
+    async fn list_mssql_dbs(conn_client: &ConnClient) -> anyhow::Result<Vec<String>> {
+        let connection_pool = match conn_client {
+            ConnClient::Mssql(connection_pool) => connection_pool,
+            _ => bail!(DtError::MissingTaskClient(DbType::Mssql)),
+        };
+        let mut dbs = MssqlMetaManager::new(connection_pool.clone())
+            .await?
+            .list_databases()
+            .await?;
+        dbs.retain(|db| !SystemDb::is_system_db(db, &DbType::Mssql));
+        dbs.sort();
+        Ok(dbs)
+    }
+
+    async fn list_mssql_tbs(
+        conn_client: &ConnClient,
+        db: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let connection_pool = match conn_client {
+            ConnClient::Mssql(connection_pool) => connection_pool,
+            _ => bail!(DtError::MissingTaskClient(DbType::Mssql)),
+        };
+        MssqlMetaManager::new(connection_pool.clone())
+            .await?
+            .list_schema_tables(db)
+            .await
+    }
+
     async fn list_pg_tbs(conn_client: &ConnClient, schema: &str) -> anyhow::Result<Vec<String>> {
         let mut tbs = Vec::new();
         let conn_pool = match conn_client {
             ConnClient::PostgreSQL(conn_pool) => conn_pool,
             _ => {
-                bail!("conn_pool is not found")
+                bail!(DtError::MissingTaskClient(DbType::Pg))
             }
         };
 
@@ -619,7 +773,7 @@ WHERE
             schema
         );
         let mut rows = sqlx::query(&sql).fetch(conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await? {
             let tb: String = row.try_get(0)?;
             tbs.push(tb);
         }
@@ -632,13 +786,13 @@ WHERE
         let conn_pool = match conn_client {
             ConnClient::MySQL(conn_pool) => conn_pool,
             _ => {
-                bail!("conn_pool is not found")
+                bail!(DtError::MissingTaskClient(DbType::Mysql))
             }
         };
 
         let sql = "SELECT schema_name FROM information_schema.schemata";
         let mut rows = sqlx::query(sql).fetch(conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await? {
             let db = SqlUtil::try_get_mysql_string(&row, 0)?;
             if SystemDb::is_system_db(&db, &DbType::Mysql) {
                 continue;
@@ -654,7 +808,7 @@ WHERE
         let conn_pool = match conn_client {
             ConnClient::MySQL(conn_pool) => conn_pool,
             _ => {
-                bail!("conn_pool is not found")
+                bail!(DtError::MissingTaskClient(DbType::Mysql))
             }
         };
 
@@ -663,7 +817,7 @@ WHERE
             WHERE table_schema = ? 
             AND table_type = 'BASE TABLE'";
         let mut rows = sqlx::query(sql).bind(db).fetch(conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await? {
             let tb = SqlUtil::try_get_mysql_string(&row, 0)?;
             tbs.push(tb);
         }
@@ -675,7 +829,7 @@ WHERE
         let client = match conn_client {
             ConnClient::MongoDB(client) => client,
             _ => {
-                bail!("client is not found")
+                bail!(DtError::MissingTaskClient(DbType::Mongo))
             }
         };
         let dbs = client
@@ -691,7 +845,7 @@ WHERE
         let client = match conn_client {
             ConnClient::MongoDB(client) => client,
             _ => {
-                bail!("client is not found")
+                bail!(DtError::MissingTaskClient(DbType::Mongo))
             }
         };
         // filter views and system tables
@@ -813,6 +967,7 @@ pub enum ConnClient {
     MySQL(Pool<MySql>),
     PostgreSQL(Pool<Postgres>),
     MongoDB(mongodb::Client),
+    Mssql(MssqlConnectionPool),
     S3(Operator),
 }
 
@@ -821,15 +976,27 @@ impl ConnClient {
         let enable_sqlx_log = TaskUtil::check_enable_sqlx_log(&task_config.runtime.log_level);
         let extractor_max_connections = task_config.extractor_basic.max_connections;
         let sinker_max_connections = task_config.sinker_basic.max_connections;
+        let extractor_connection_timeout_secs = task_config.extractor_basic.connection_timeout_secs;
+        let sinker_connection_timeout_secs = task_config.sinker_basic.connection_timeout_secs;
         if extractor_max_connections < 1 {
-            bail!(Error::ConfigError(
-                "`extractor.max_connections` must be greater than 0".into()
+            bail!(DtError::invalid_config(
+                "`extractor.max_connections` must be greater than 0"
             ));
         }
         let sinker_exists = !matches!(task_config.sinker, SinkerConfig::Dummy);
         if sinker_exists && sinker_max_connections < 1 {
-            bail!(Error::ConfigError(
-                "`sinker.max_connections` must be greater than 0".into()
+            bail!(DtError::invalid_config(
+                "`sinker.max_connections` must be greater than 0"
+            ));
+        }
+        if extractor_connection_timeout_secs < 1 {
+            bail!(DtError::invalid_config(
+                "`extractor.connection_timeout_secs` must be greater than 0"
+            ));
+        }
+        if sinker_exists && sinker_connection_timeout_secs < 1 {
+            bail!(DtError::invalid_config(
+                "`sinker.connection_timeout_secs` must be greater than 0"
             ));
         }
 
@@ -853,17 +1020,16 @@ impl ConnClient {
                 url,
                 connection_auth,
                 ..
-            } => ConnClient::MySQL(
-                TaskUtil::create_mysql_conn_pool(
-                    url,
-                    &DbType::Mysql,
-                    connection_auth,
-                    extractor_max_connections,
-                    enable_sqlx_log,
-                    None,
-                )
-                .await?,
-            ),
+            } => TaskUtil::create_mysql_conn_pool(
+                url,
+                &DbType::Mysql,
+                connection_auth,
+                extractor_max_connections,
+                enable_sqlx_log,
+                None,
+            )
+            .await
+            .map(ConnClient::MySQL),
             ExtractorConfig::PgSnapshot {
                 url,
                 connection_auth,
@@ -883,16 +1049,15 @@ impl ConnClient {
                 url,
                 connection_auth,
                 ..
-            } => ConnClient::PostgreSQL(
-                TaskUtil::create_pg_conn_pool(
-                    url,
-                    connection_auth,
-                    extractor_max_connections,
-                    enable_sqlx_log,
-                    false,
-                )
-                .await?,
-            ),
+            } => TaskUtil::create_pg_conn_pool(
+                url,
+                connection_auth,
+                extractor_max_connections,
+                enable_sqlx_log,
+                false,
+            )
+            .await
+            .map(ConnClient::PostgreSQL),
             ExtractorConfig::MongoSnapshot {
                 url,
                 connection_auth,
@@ -920,31 +1085,46 @@ impl ConnClient {
                 is_direct_connection,
                 app_name,
                 ..
-            } => ConnClient::MongoDB(
-                TaskUtil::create_mongo_client(
-                    url,
-                    connection_auth,
-                    *is_direct_connection,
-                    Some(app_name.to_string()),
-                    Some(extractor_max_connections),
-                )
-                .await?,
-            ),
-            _ => ConnClient::None,
-        };
-        let sinker_client = match &task_config.sinker {
-            SinkerConfig::Mysql {
+            } => TaskUtil::create_mongo_client(
                 url,
                 connection_auth,
-                disable_foreign_key_checks,
-                transaction_isolation,
+                *is_direct_connection,
+                Some(app_name.to_string()),
+                Some(extractor_max_connections),
+            )
+            .await
+            .map(ConnClient::MongoDB),
+            ExtractorConfig::MssqlSnapshot {
+                url,
+                connection_auth,
                 ..
-            } => {
-                let conn_settings = TaskUtil::build_mysql_conn_settings(
-                    *disable_foreign_key_checks,
+            } => MssqlConnectionPool::from_config(
+                url,
+                connection_auth,
+                task_config.extractor_basic.app_name.as_deref(),
+                extractor_max_connections,
+                extractor_connection_timeout_secs,
+            )
+            .await
+            .map(ConnClient::Mssql),
+            _ => Ok(ConnClient::None),
+        }
+        .endpoint(EndpointRole::Source)?;
+        let sinker_client = if matches!(task_config.sinker_basic.sink_type, SinkType::Check) {
+            Ok(ConnClient::None)
+        } else {
+            match &task_config.sinker {
+                SinkerConfig::Mysql {
+                    url,
+                    connection_auth,
+                    disable_foreign_key_checks,
                     transaction_isolation,
-                );
-                ConnClient::MySQL(
+                    ..
+                } => {
+                    let conn_settings = TaskUtil::build_mysql_conn_settings(
+                        *disable_foreign_key_checks,
+                        transaction_isolation,
+                    );
                     TaskUtil::create_mysql_conn_pool(
                         url,
                         &DbType::Mysql,
@@ -953,15 +1133,14 @@ impl ConnClient {
                         enable_sqlx_log,
                         conn_settings,
                     )
-                    .await?,
-                )
-            }
-            SinkerConfig::MysqlStruct {
-                url,
-                connection_auth,
-                ..
-            } => ConnClient::MySQL(
-                TaskUtil::create_mysql_conn_pool(
+                    .await
+                    .map(ConnClient::MySQL)
+                }
+                SinkerConfig::MysqlStruct {
+                    url,
+                    connection_auth,
+                    ..
+                } => TaskUtil::create_mysql_conn_pool(
                     url,
                     &DbType::Mysql,
                     connection_auth,
@@ -969,62 +1148,74 @@ impl ConnClient {
                     enable_sqlx_log,
                     None,
                 )
-                .await?,
-            ),
-            SinkerConfig::Pg {
-                url,
-                connection_auth,
-                disable_foreign_key_checks,
-                ..
-            } => ConnClient::PostgreSQL(
-                TaskUtil::create_pg_conn_pool(
+                .await
+                .map(ConnClient::MySQL),
+                SinkerConfig::Pg {
+                    url,
+                    connection_auth,
+                    disable_foreign_key_checks,
+                    ..
+                } => TaskUtil::create_pg_conn_pool(
                     url,
                     connection_auth,
                     sinker_max_connections,
                     enable_sqlx_log,
                     *disable_foreign_key_checks,
                 )
-                .await?,
-            ),
-            SinkerConfig::PgStruct {
-                url,
-                connection_auth,
-                ..
-            } => ConnClient::PostgreSQL(
-                TaskUtil::create_pg_conn_pool(
+                .await
+                .map(ConnClient::PostgreSQL),
+                SinkerConfig::PgStruct {
+                    url,
+                    connection_auth,
+                    ..
+                } => TaskUtil::create_pg_conn_pool(
                     url,
                     connection_auth,
                     sinker_max_connections,
                     enable_sqlx_log,
                     false,
                 )
-                .await?,
-            ),
-            SinkerConfig::Mongo {
-                url,
-                connection_auth,
-                is_direct_connection,
-                app_name,
-                ..
-            }
-            | SinkerConfig::MongoStruct {
-                url,
-                connection_auth,
-                is_direct_connection,
-                app_name,
-                ..
-            } => ConnClient::MongoDB(
-                TaskUtil::create_mongo_client(
+                .await
+                .map(ConnClient::PostgreSQL),
+                SinkerConfig::Mongo {
+                    url,
+                    connection_auth,
+                    is_direct_connection,
+                    app_name,
+                    ..
+                }
+                | SinkerConfig::MongoStruct {
+                    url,
+                    connection_auth,
+                    is_direct_connection,
+                    app_name,
+                    ..
+                } => TaskUtil::create_mongo_client(
                     url,
                     connection_auth,
                     *is_direct_connection,
                     Some(app_name.to_string()),
                     Some(sinker_max_connections),
                 )
-                .await?,
-            ),
-            _ => ConnClient::None,
-        };
+                .await
+                .map(ConnClient::MongoDB),
+                SinkerConfig::Mssql {
+                    url,
+                    connection_auth,
+                    ..
+                } => MssqlConnectionPool::from_config(
+                    url,
+                    connection_auth,
+                    task_config.sinker_basic.app_name.as_deref(),
+                    sinker_max_connections,
+                    sinker_connection_timeout_secs,
+                )
+                .await
+                .map(ConnClient::Mssql),
+                _ => Ok(ConnClient::None),
+            }
+        }
+        .endpoint(EndpointRole::Destination)?;
         Ok((extractor_client, sinker_client))
     }
 
@@ -1043,8 +1234,73 @@ impl ConnClient {
             ConnClient::MongoDB(client) => {
                 client.clone().shutdown().await;
             }
+            ConnClient::Mssql(connection_pool) => connection_pool.close().await?,
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dt_common::config::config_enums::DbType;
+
+    use super::{ConnClient, TaskUtil};
+
+    #[tokio::test]
+    async fn list_schemas_returns_empty_for_unsupported_types() {
+        let db_types = [
+            DbType::Kafka,
+            DbType::Redis,
+            DbType::ClickHouse,
+            DbType::StarRocks,
+            DbType::Doris,
+        ];
+
+        for db_type in db_types {
+            assert_eq!(
+                TaskUtil::list_schemas(&ConnClient::None, &db_type)
+                    .await
+                    .unwrap(),
+                Vec::<String>::new()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_schemas_requires_a_real_mssql_connection() {
+        assert!(TaskUtil::list_schemas(&ConnClient::None, &DbType::Mssql)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn list_tbs_returns_database_schema_table_tuples() {
+        let tbs = TaskUtil::list_tbs(&ConnClient::None, "namespace", &DbType::Kafka)
+            .await
+            .unwrap();
+        assert!(tbs.is_empty());
+
+        assert!(
+            TaskUtil::list_tbs(&ConnClient::None, "database", &DbType::Mssql)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mssql_estimate_sql_batches_databases_with_bound_labels() {
+        let sql = TaskUtil::build_mssql_estimate_sql(&["db1".to_string(), "db]2".to_string()]);
+
+        assert!(
+            sql.contains("CAST(@P1 AS nvarchar(128)) COLLATE DATABASE_DEFAULT AS database_name")
+        );
+        assert!(
+            sql.contains("CAST(@P2 AS nvarchar(128)) COLLATE DATABASE_DEFAULT AS database_name")
+        );
+        assert!(sql.contains("FROM [db1].sys.tables AS t"));
+        assert!(sql.contains("FROM [db]]2].sys.tables AS t"));
+        assert!(sql.contains("s.name COLLATE DATABASE_DEFAULT AS schema_name"));
+        assert_eq!(sql.matches(" UNION ALL ").count(), 1);
     }
 }

@@ -1,6 +1,10 @@
-use anyhow::Context;
-use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use anyhow::Context;
+use dt_common::meta::{position::Position, row_data::RowData, row_type::RowType};
+use dt_common::{log_info, log_warn};
+use openssl::sha::sha256;
+use serde::Serialize;
 
 use super::{
     BoundedLineBuffer, CheckEntry, CheckInconsistency, Checker, CheckerStoreKey, DataChecker,
@@ -8,18 +12,28 @@ use super::{
 };
 use crate::checker::check_log::{CheckLog, CheckSummaryLog, CheckTableSummaryLog};
 use crate::checker::state_store::{CheckerCheckpointCommit, CheckerStateRow};
-use dt_common::meta::{position::Position, row_data::RowData, row_type::RowType};
-use dt_common::{log_info, log_warn};
+
+type CheckTableKey = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Serialize)]
 struct IdentityJsonPayload<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db: Option<&'a str>,
     schema: &'a str,
     tb: &'a str,
     id_col_values: BTreeMap<&'a str, Option<&'a str>>,
 }
 
-pub(super) fn build_identity_json(entry: &CheckEntry) -> String {
-    serde_json::to_string(&IdentityJsonPayload {
+pub(super) fn build_identity_json(entry: &CheckEntry) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(&IdentityJsonPayload {
+        db: (!entry.log.db.is_empty()).then_some(entry.log.db.as_str()),
         schema: &entry.log.schema,
         tb: &entry.log.tb,
         id_col_values: entry
@@ -28,12 +42,11 @@ pub(super) fn build_identity_json(entry: &CheckEntry) -> String {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_deref()))
             .collect(),
-    })
-    .expect("identity json serialization should not fail")
+    })?)
 }
 
-pub(super) fn build_identity_key(entry: &CheckEntry) -> String {
-    hex::encode(openssl::sha::sha256(build_identity_json(entry).as_bytes()))
+pub(super) fn build_identity_key(entry: &CheckEntry) -> anyhow::Result<String> {
+    Ok(hex::encode(sha256(build_identity_json(entry)?.as_bytes())))
 }
 
 fn build_state_row(
@@ -42,7 +55,7 @@ fn build_state_row(
 ) -> anyhow::Result<CheckerStateRow> {
     Ok(CheckerStateRow {
         row_key: store_key.row_key,
-        identity_key: build_identity_key(entry),
+        identity_key: build_identity_key(entry)?,
         payload: serde_json::to_string(&entry.key)?,
     })
 }
@@ -81,18 +94,17 @@ impl<C: Checker> DataChecker<C> {
         let mut total_miss = 0usize;
         let mut total_diff = 0usize;
         let mut total_sql = 0usize;
-        let mut tables: HashMap<
-            (String, String, Option<String>, Option<String>),
-            CheckTableSummaryLog,
-        > = HashMap::new();
+        let mut tables: HashMap<CheckTableKey, CheckTableSummaryLog> = HashMap::new();
         for table in &self.ctx.summary.tables {
             let mut table = table.clone();
             table.miss_count = 0;
             table.diff_count = 0;
             tables.insert(
                 (
+                    table.db.clone(),
                     table.schema.clone(),
                     table.tb.clone(),
+                    table.target_db.clone(),
                     table.target_schema.clone(),
                     table.target_tb.clone(),
                 ),
@@ -104,16 +116,20 @@ impl<C: Checker> DataChecker<C> {
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         for (_, entry) in entries {
             let table_key = (
+                entry.log.db.clone(),
                 entry.log.schema.clone(),
                 entry.log.tb.clone(),
+                entry.log.target_db.clone(),
                 entry.log.target_schema.clone(),
                 entry.log.target_tb.clone(),
             );
             let table = tables
                 .entry(table_key)
                 .or_insert_with(|| CheckTableSummaryLog {
+                    db: entry.log.db.clone(),
                     schema: entry.log.schema.clone(),
                     tb: entry.log.tb.clone(),
+                    target_db: entry.log.target_db.clone(),
                     target_schema: entry.log.target_schema.clone(),
                     target_tb: entry.log.target_tb.clone(),
                     ..Default::default()
@@ -235,7 +251,7 @@ impl<C: Checker> DataChecker<C> {
                 )
             })?;
             let entry = self.build_restored_entry(key.clone());
-            let store_key = CheckerStoreKey::new(&key.schema, &key.tb, row.row_key);
+            let store_key = CheckerStoreKey::new(&key.db, &key.schema, &key.tb, row.row_key);
             self.store.insert(store_key, entry);
         }
         self.persisted_identity_keys = Some(persisted_identity_keys);
@@ -261,14 +277,17 @@ impl<C: Checker> DataChecker<C> {
                 .collect()
         })
         .unwrap_or_default();
+        let db_changed = source_row.db != lookup_row.db;
         let schema_changed =
-            source_row.schema != lookup_row.schema || source_row.tb != lookup_row.tb;
+            db_changed || source_row.schema != lookup_row.schema || source_row.tb != lookup_row.tb;
 
         CheckEntry {
             key,
             log: CheckLog {
+                db: source_row.db,
                 schema: source_row.schema,
                 tb: source_row.tb,
+                target_db: db_changed.then_some(lookup_row.db),
                 target_schema: schema_changed.then_some(lookup_row.schema),
                 target_tb: schema_changed.then_some(lookup_row.tb),
                 id_col_values,
@@ -298,10 +317,10 @@ impl<C: Checker> DataChecker<C> {
                 }
             })
             .collect::<Vec<_>>();
-        let mut grouped = HashMap::<(&str, &str), Vec<&RowData>>::new();
+        let mut grouped = HashMap::<(&str, &str, &str), Vec<&RowData>>::new();
         for row in &lookup_rows {
             grouped
-                .entry((row.schema.as_str(), row.tb.as_str()))
+                .entry((row.db.as_str(), row.schema.as_str(), row.tb.as_str()))
                 .or_default()
                 .push(row);
         }
@@ -367,10 +386,10 @@ impl<C: Checker> DataChecker<C> {
         );
         let batch_size = self.ctx.batch_size.max(1);
         for chunk in keys_for_recheck.chunks(batch_size) {
-            let mut grouped = HashMap::<(&str, &str), Vec<RecheckKey>>::new();
+            let mut grouped = HashMap::<(&str, &str, &str), Vec<RecheckKey>>::new();
             for key in chunk {
                 grouped
-                    .entry((key.schema.as_str(), key.tb.as_str()))
+                    .entry((key.db.as_str(), key.schema.as_str(), key.tb.as_str()))
                     .or_default()
                     .push(key.clone());
             }
@@ -423,7 +442,7 @@ impl<C: Checker> DataChecker<C> {
                                 .await?;
                                 self.store_entry(lookup_row, row_key, entry).await;
                             } else {
-                                self.remove_store_entry(lookup_row, row_key);
+                                self.remove_store_entry(lookup_row, row_key)?;
                             }
                         }
                         (Some(source_row), None) => {
@@ -442,7 +461,7 @@ impl<C: Checker> DataChecker<C> {
                             self.store_entry(lookup_row, row_key, entry).await;
                         }
                         (None, None) => {
-                            self.remove_store_entry(lookup_row, row_key);
+                            self.remove_store_entry(lookup_row, row_key)?;
                         }
                     }
                 }
@@ -560,18 +579,20 @@ impl<C: Checker> DataChecker<C> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CheckContext, Checker, CheckerIo, CheckerTbMeta, DataChecker};
-    use super::*;
-    use crate::checker::check_log::{CheckTableSummaryLog, DiffColValue};
-    use async_trait::async_trait;
-    use dt_common::{meta::col_value::ColValue, utils::limit_queue::LimitedQueue};
-    use opendal::{services::Memory, Operator};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use async_trait::async_trait;
+    use dt_common::{meta::col_value::ColValue, utils::limit_queue::LimitedQueue};
+    use opendal::{services::Memory, Operator};
     use tokio::sync::mpsc;
+
+    use super::super::{CheckContext, Checker, CheckerIo, CheckerTbMeta, DataChecker};
+    use super::*;
+    use crate::checker::check_log::{CheckTableSummaryLog, DiffColValue};
 
     struct NoopChecker;
 
@@ -629,12 +650,12 @@ mod tests {
                 s3_output,
                 ..Default::default()
             },
-            CheckerIo {
+            Some(CheckerIo {
                 batch_queue: Arc::new(std::sync::Mutex::new(LimitedQueue::new(1))),
                 batch_notify: Arc::new(tokio::sync::Notify::new()),
                 dropped_items: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 control_rx,
-            },
+            }),
             "unit-test",
         )
     }
@@ -710,19 +731,22 @@ mod tests {
         let op = build_memory_operator();
         let mut checker = build_cdc_checker(dir.clone(), Some((op.clone(), "prefix".to_string())));
 
-        let first_key = CheckerStoreKey::new("s1", "t1", 1);
+        let first_key = CheckerStoreKey::new("", "s1", "t1", 1);
         checker.store.insert(
             first_key,
             CheckEntry {
                 key: RecheckKey {
+                    db: String::new(),
                     schema: "s1".to_string(),
                     tb: "t1".to_string(),
                     is_delete: false,
                     pk: BTreeMap::from([("id".to_string(), ColValue::Long(1))]),
                 },
                 log: CheckLog {
+                    db: String::new(),
                     schema: "s1".to_string(),
                     tb: "t1".to_string(),
+                    target_db: None,
                     target_schema: None,
                     target_tb: None,
                     id_col_values: HashMap::from([("id".to_string(), Some("1".to_string()))]),
@@ -740,17 +764,20 @@ mod tests {
 
         checker.store.clear();
         checker.store.insert(
-            CheckerStoreKey::new("s1", "t1", 2),
+            CheckerStoreKey::new("", "s1", "t1", 2),
             CheckEntry {
                 key: RecheckKey {
+                    db: String::new(),
                     schema: "s1".to_string(),
                     tb: "t1".to_string(),
                     is_delete: false,
                     pk: BTreeMap::from([("id".to_string(), ColValue::Long(2))]),
                 },
                 log: CheckLog {
+                    db: String::new(),
                     schema: "s1".to_string(),
                     tb: "t1".to_string(),
+                    target_db: None,
                     target_schema: None,
                     target_tb: None,
                     id_col_values: HashMap::from([("id".to_string(), Some("2".to_string()))]),
@@ -786,17 +813,20 @@ mod tests {
             ..Default::default()
         });
         checker.store.insert(
-            CheckerStoreKey::new("s1", "t1", 1),
+            CheckerStoreKey::new("", "s1", "t1", 1),
             CheckEntry {
                 key: RecheckKey {
+                    db: String::new(),
                     schema: "s1".to_string(),
                     tb: "t1".to_string(),
                     is_delete: false,
                     pk: BTreeMap::from([("id".to_string(), ColValue::Long(1))]),
                 },
                 log: CheckLog {
+                    db: String::new(),
                     schema: "s1".to_string(),
                     tb: "t1".to_string(),
+                    target_db: None,
                     target_schema: None,
                     target_tb: None,
                     id_col_values: HashMap::from([("id".to_string(), Some("1".to_string()))]),

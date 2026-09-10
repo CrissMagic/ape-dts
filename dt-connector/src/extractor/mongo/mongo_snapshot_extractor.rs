@@ -2,8 +2,22 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
+use dt_common::{
+    config::config_enums::{DbType, RdbParallelType},
+    error::{DtError, DtErrorContextExt, Stage},
+    log_error, log_info,
+    meta::{
+        col_value::ColValue,
+        mongo::{mongo_constant::MongoConstants, mongo_key::MongoKey},
+        order_key::OrderKey,
+        position::Position,
+        row_data::RowData,
+        row_type::RowType,
+    },
+    rdb_filter::RdbFilter,
+};
 use mongodb::{
-    bson::{doc, Document},
+    bson::{doc, oid::ObjectId, raw::RawDocumentBuf, Document},
     options::FindOptions,
     Client,
 };
@@ -18,24 +32,11 @@ use crate::{
     },
     Extractor,
 };
-use dt_common::{
-    config::config_enums::{DbType, RdbParallelType},
-    log_error, log_info,
-    meta::{
-        col_value::ColValue,
-        mongo::{mongo_constant::MongoConstants, mongo_key::MongoKey},
-        order_key::OrderKey,
-        position::Position,
-        row_data::RowData,
-        row_type::RowType,
-    },
-    rdb_filter::RdbFilter,
-};
 
 pub struct MongoSnapshotExtractor {
     pub base_extractor: BaseExtractor,
     pub extract_state: ExtractState,
-    pub db_tbs: HashMap<String, Vec<String>>,
+    pub tbs: Vec<(String, String, String)>,
     pub parallel_type: RdbParallelType,
     pub parallel_size: usize,
     pub batch_size: u32,
@@ -43,16 +44,23 @@ pub struct MongoSnapshotExtractor {
     pub sample_rate: Option<u8>,
     pub recovery: Option<Arc<dyn Recovery + Send + Sync>>,
     pub filter: RdbFilter,
+    pub use_raw_document: bool,
 }
 
 #[async_trait]
 impl Extractor for MongoSnapshotExtractor {
     async fn extract(&mut self) -> anyhow::Result<()> {
         if self.parallel_size < 1 {
-            bail!("parallel_size must be greater than 0");
+            bail!(
+                DtError::InvalidConfig("parallel_size must be greater than 0".to_string(),)
+                    .stage(Stage::Bootstrap)
+            );
         }
         if matches!(self.parallel_type, RdbParallelType::Chunk) {
-            bail!("mongo snapshot extractor does not support parallel_type=chunk");
+            bail!(DtError::InvalidConfig(
+                "MongoDB snapshot extraction does not support parallel_type=chunk".to_string(),
+            )
+            .stage(Stage::Bootstrap));
         }
 
         let tables = self.collect_tables();
@@ -61,9 +69,9 @@ impl Extractor for MongoSnapshotExtractor {
             tables,
             self.parallel_size,
             "mongo table worker",
-            move |(db, tb)| {
+            move |(db, schema, tb)| {
                 let this = this.clone_for_dispatch();
-                async move { this.run_table_worker(db, tb).await }
+                async move { this.run_table_worker(db, schema, tb).await }
             },
         )
         .await?;
@@ -79,21 +87,15 @@ impl Extractor for MongoSnapshotExtractor {
 }
 
 impl MongoSnapshotExtractor {
-    fn collect_tables(&self) -> Vec<(String, String)> {
-        let mut tables = Vec::new();
-        for (db, tbs) in &self.db_tbs {
-            for tb in tbs {
-                tables.push((db.clone(), tb.clone()));
-            }
-        }
-        tables
+    fn collect_tables(&self) -> Vec<(String, String, String)> {
+        self.tbs.clone()
     }
 
     fn clone_for_dispatch(&self) -> Self {
         Self {
             base_extractor: self.base_extractor.clone(),
             extract_state: SnapshotDispatcher::fork_extract_state(&self.extract_state),
-            db_tbs: self.db_tbs.clone(),
+            tbs: self.tbs.clone(),
             parallel_type: self.parallel_type.clone(),
             parallel_size: self.parallel_size,
             batch_size: self.batch_size,
@@ -101,17 +103,19 @@ impl MongoSnapshotExtractor {
             sample_rate: self.sample_rate,
             recovery: self.recovery.clone(),
             filter: self.filter.clone(),
+            use_raw_document: self.use_raw_document,
         }
     }
 
-    async fn run_table_worker(&self, db: String, tb: String) -> anyhow::Result<()> {
+    async fn run_table_worker(&self, db: String, schema: String, tb: String) -> anyhow::Result<()> {
         let (mut extract_state, _guard) =
-            SnapshotDispatcher::fork_table_extract_state(&self.extract_state, &db, &tb).await;
+            SnapshotDispatcher::fork_table_extract_state(&self.extract_state, &db, &schema, &tb)
+                .await;
         let base_extractor = self.base_extractor.clone();
 
         log_info!(
             "MongoSnapshotExtractor starts, schema: {}, tb: {}, batch_size: {}",
-            db,
+            schema,
             tb,
             self.batch_size
         );
@@ -120,12 +124,14 @@ impl MongoSnapshotExtractor {
             if let Some(Position::RdbSnapshot {
                 order_key: Some(OrderKey::Single((_, Some(value)))),
                 ..
-            }) = handler.get_snapshot_resume_position(&db, &tb, false).await
+            }) = handler
+                .get_snapshot_resume_position(&db, &schema, &tb, false)
+                .await
             {
                 let key = Self::parse_resume_key(&value)?;
                 log_info!(
                     "[{}.{}] recovery from [{}]:[{}]",
-                    db,
+                    schema,
                     tb,
                     MongoConstants::ID,
                     key
@@ -138,7 +144,10 @@ impl MongoSnapshotExtractor {
             None
         };
 
-        let collection = self.mongo_client.database(&db).collection::<Document>(&tb);
+        let collection = self
+            .mongo_client
+            .database(&schema)
+            .collection::<Document>(&tb);
         let estimated_count = if self
             .sample_rate
             .filter(|rate| (1..100).contains(rate))
@@ -170,21 +179,31 @@ impl MongoSnapshotExtractor {
         let mut cursor = find.await?;
         let mut chunk_id_generator = SnapshotChunkIdGenerator::new(self.batch_size as usize);
         while cursor.advance().await? {
-            let doc = cursor.deserialize_current().map_err(|e| {
-                log_error!("error deserializing {}.{} document: {}", db, tb, e);
-                e
-            })?;
-
-            let key = MongoKey::from_doc(&doc).ok_or(anyhow!(
-                "skip {}.{} document without `_id`: {:?}",
-                db,
-                tb,
-                doc
-            ))?;
-
-            let after = Self::build_after_cols(&doc);
+            let (key, after) = if self.use_raw_document {
+                let raw_doc = cursor.current().to_owned();
+                let key = MongoKey::from_raw_doc(&raw_doc)?.ok_or(anyhow!(
+                    "skip {}.{} document without `_id`",
+                    schema,
+                    tb
+                ))?;
+                let after = Self::build_raw_after_cols(raw_doc, &key);
+                (key, after)
+            } else {
+                let doc = cursor.deserialize_current().inspect_err(|e| {
+                    log_error!("error deserializing {}.{} document: {}", schema, tb, e);
+                })?;
+                let key = MongoKey::from_doc(&doc).ok_or(anyhow!(
+                    "skip {}.{} document without `_id`: {:?}",
+                    schema,
+                    tb,
+                    doc
+                ))?;
+                let after = Self::build_after_cols(doc, &key);
+                (key, after)
+            };
             let row_data = RowData::new(
                 db.clone(),
+                schema.clone(),
                 tb.clone(),
                 chunk_id_generator.next_row_chunk_id(),
                 RowType::Insert,
@@ -193,7 +212,8 @@ impl MongoSnapshotExtractor {
             );
             let position = Position::RdbSnapshot {
                 db_type: DbType::Mongo.to_string(),
-                schema: db.clone(),
+                db: db.clone(),
+                schema: schema.clone(),
                 tb: tb.clone(),
                 order_key: Some(OrderKey::Single((
                     MongoConstants::ID.into(),
@@ -208,7 +228,7 @@ impl MongoSnapshotExtractor {
 
         log_info!(
             "end extracting data from {}.{}, all count: {}",
-            db,
+            schema,
             tb,
             extract_state.monitor.counters.pushed_record_count
         );
@@ -218,7 +238,8 @@ impl MongoSnapshotExtractor {
                 &mut extract_state,
                 Position::RdbSnapshotFinished {
                     db_type: DbType::Mongo.to_string(),
-                    schema: db.clone(),
+                    db,
+                    schema,
                     tb: tb.clone(),
                 },
             )
@@ -241,24 +262,30 @@ impl MongoSnapshotExtractor {
         }
     }
 
-    fn build_after_cols(doc: &Document) -> HashMap<String, ColValue> {
+    fn build_after_cols(doc: Document, key: &MongoKey) -> HashMap<String, ColValue> {
         let mut after = HashMap::new();
-        let id = MongoKey::from_doc(doc)
-            .map(|key| ColValue::String(key.to_string()))
-            .unwrap_or(ColValue::None);
-        after.insert(MongoConstants::ID.to_string(), id);
         after.insert(
-            MongoConstants::DOC.to_string(),
-            ColValue::MongoDoc(doc.clone()),
+            MongoConstants::ID.to_string(),
+            ColValue::String(key.to_string()),
         );
+        after.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
+        after
+    }
+
+    fn build_raw_after_cols(doc: RawDocumentBuf, key: &MongoKey) -> HashMap<String, ColValue> {
+        let mut after = HashMap::new();
+        after.insert(
+            MongoConstants::ID.to_string(),
+            ColValue::String(key.to_string()),
+        );
+        after.insert(MongoConstants::DOC.to_string(), ColValue::MongoRawDoc(doc));
         after
     }
 
     fn parse_resume_key(value: &str) -> anyhow::Result<MongoKey> {
-        serde_json::from_str::<MongoKey>(value).or_else(|_| {
-            mongodb::bson::oid::ObjectId::parse_str(value)
-                .map(MongoKey::ObjectId)
-                .map_err(Into::into)
-        })
+        if let Ok(key) = serde_json::from_str::<MongoKey>(value) {
+            return Ok(key);
+        }
+        Ok(MongoKey::ObjectId(ObjectId::parse_str(value)?))
     }
 }

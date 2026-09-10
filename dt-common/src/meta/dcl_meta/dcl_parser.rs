@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use anyhow::bail;
 use nom::branch::alt;
 use nom::bytes::complete::tag_no_case;
@@ -5,11 +7,10 @@ use nom::character::complete::{multispace0, multispace1};
 use nom::sequence::tuple;
 use nom::IResult;
 use regex::Regex;
-use std::borrow::Cow;
 
 use crate::{
     config::config_enums::DbType,
-    error::Error,
+    error::DtError,
     meta::dcl_meta::{
         dcl_data::DclData,
         dcl_statement::{DclStatement, OriginStatement},
@@ -48,15 +49,17 @@ impl DclParser {
                         format!("code: {:?}, input: {}", e.code, to_string(e.input))
                     }
                 };
-                bail! {Error::Unexpected(format!("failed to parse sql: {}, error: {}", sql, error))}
+                bail! {DtError::UnsupportedStatement(format!("failed to parse sql: {}, error: {}", sql, error))}
             }
         }
     }
 
     fn remove_comments(sql: &str) -> Cow<str> {
         // "create /*some comments,*/table/*some comments*/ `aaa`.`bbb`"
-        let regex = Regex::new(r"(/\*([^*]|\*+[^*/*])*\*+/)|(--[^\n]*\n)").unwrap();
-        regex.replace_all(sql, "")
+        match Regex::new(r"(/\*([^*]|\*+[^*/*])*\*+/)|(--[^\n]*\n)") {
+            Ok(regex) => regex.replace_all(sql, ""),
+            Err(_) => Cow::Borrowed(sql),
+        }
     }
 
     fn dcl_simple_judgment(sql: &str) -> bool {
@@ -188,6 +191,7 @@ impl DclParser {
         };
 
         let dcl = DclData {
+            default_db: String::new(),
             dcl_type: DclType::Grant,
             statement: DclStatement::Grant(statement),
             db_type: self.db_type.clone(),
@@ -204,6 +208,7 @@ impl DclParser {
         };
 
         let dcl = DclData {
+            default_db: String::new(),
             dcl_type: DclType::Revoke,
             statement: DclStatement::Revoke(statement),
             db_type: self.db_type.clone(),

@@ -1,15 +1,15 @@
 use async_trait::async_trait;
 use dt_common::config::{config_enums::DbType, filter_config::FilterConfig};
+use dt_common::error::DtError;
 use mongodb::bson::Bson;
 use regex::Regex;
 
+use super::traits::Prechecker;
 use crate::{
     config::precheck_config::PrecheckConfig,
     fetcher::{mongo::mongo_fetcher::MongoFetcher, traits::Fetcher},
     meta::{check_item::CheckItem, check_result::CheckResult},
 };
-
-use super::traits::Prechecker;
 
 const MONGO_SUPPORTED_VERSION_REGEX: &str = r"4.*|5.0.*|6.0.*|7.0.*";
 
@@ -23,12 +23,12 @@ pub struct MongoPrechecker {
 #[async_trait]
 impl Prechecker for MongoPrechecker {
     async fn build_connection(&mut self) -> anyhow::Result<CheckResult> {
-        self.fetcher.build_connection().await?;
+        let check_error = self.fetcher.build_connection().await.err();
         Ok(CheckResult::build_with_err(
             CheckItem::CheckDatabaseConnection,
             self.is_source,
             DbType::Mongo,
-            None,
+            check_error,
             None,
         ))
     }
@@ -37,12 +37,15 @@ impl Prechecker for MongoPrechecker {
         let mut check_error = None;
 
         let version = self.fetcher.fetch_version().await?;
-        let reg = Regex::new(MONGO_SUPPORTED_VERSION_REGEX).unwrap();
+        let reg = Regex::new(MONGO_SUPPORTED_VERSION_REGEX)?;
         if !reg.is_match(version.as_str()) {
-            check_error = Some(anyhow::Error::msg(format!(
-                "mongo version:[{}] is invalid.",
-                version
-            )));
+            check_error = Some(
+                DtError::UnsupportedDatabaseVersion(
+                    DbType::Mongo,
+                    format!("MongoDB version {version} is not supported"),
+                )
+                .into(),
+            );
         }
 
         Ok(CheckResult::build_with_err(
@@ -102,7 +105,7 @@ impl Prechecker for MongoPrechecker {
         }
 
         if !err_msg.is_empty() {
-            check_error = Some(anyhow::Error::msg(err_msg));
+            check_error = Some(DtError::CdcNotEnabled(err_msg.to_string()).into());
         }
 
         Ok(CheckResult::build_with_err(
@@ -130,9 +133,13 @@ impl Prechecker for MongoPrechecker {
         let invalid_dbs = vec!["admin", "local"];
         for db in invalid_dbs {
             if !self.fetcher.filter.filter_schema(db) {
-                check_error = Some(anyhow::Error::msg(
-                    "database 'admin' and 'local' are not supported as source and target.",
-                ));
+                check_error = Some(
+                    DtError::UnsupportedTableStructure(
+                        "MongoDB databases admin and local are not supported migration objects"
+                            .to_string(),
+                    )
+                    .into(),
+                );
                 break;
             }
         }

@@ -1,15 +1,11 @@
 use std::{cmp, collections::HashMap, str::FromStr};
 
-use anyhow::bail;
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Utc;
-use reqwest::{header, Client, Method, Response, StatusCode};
-use serde_json::Value;
-use tokio::time::Instant;
-
 use dt_common::{
     config::config_enums::DbType,
-    error::Error,
+    error::DtError,
     log_error,
     meta::{
         col_value::ColValue,
@@ -22,6 +18,9 @@ use dt_common::{
     },
     utils::{limit_queue::LimitedQueue, sql_util::SqlUtil},
 };
+use reqwest::{header, Client, Method, Response, StatusCode};
+use serde_json::Value;
+use tokio::time::Instant;
 
 use crate::{call_batch_fn, sinker::base_sinker::BaseSinker, Sinker};
 
@@ -157,7 +156,7 @@ impl StarRocksSinker {
         let start_time = Instant::now();
         let response = self.http_client.execute(request).await?;
         rts.push((start_time.elapsed().as_millis() as u64, 1));
-        let task_id = self.base_sinker.task_id_for_schema_tb(&db, &tb);
+        let task_id = self.base_sinker.task_id_for_db_schema_tb("", &db, &tb);
         self.base_sinker.ensure_monitor_for(&task_id);
         self.base_sinker
             .update_monitor_rt_for(&task_id, &rts)
@@ -281,10 +280,14 @@ impl StarRocksSinker {
         let status_code = response.status();
         let response_text = &response.text().await?;
         if status_code != StatusCode::OK {
-            bail! {Error::HttpError(format!(
-                "data load request failed, status_code: {}, response_text: {:?}",
-                status_code, response_text
-            ))}
+            return Err(DtError::HttpRejected {
+                status: status_code.as_u16(),
+                detail: format!(
+                    "the destination rejected the request with HTTP status {}",
+                    status_code.as_u16()
+                ),
+            }
+            .into());
         }
 
         // response example:
@@ -305,14 +308,22 @@ impl StarRocksSinker {
         //     "WriteDataTimeMs": 107,
         //     "CommitAndPublishTimeMs": 36
         // }
-        let json_value: Value = serde_json::from_str(response_text)?;
+        let json_value: Value =
+            serde_json::from_str(response_text).context(DtError::HttpRejected {
+                status: status_code.as_u16(),
+                detail: "the destination returned an invalid JSON response".to_string(),
+            })?;
         if json_value["Status"] != "Success" {
             let err = format!(
                 "stream load request failed, status_code: {}, load_result: {}",
                 status_code, response_text,
             );
             log_error!("{}", err);
-            bail! {Error::HttpError(err)}
+            return Err(DtError::HttpRejected {
+                status: status_code.as_u16(),
+                detail: "the destination rejected the data load request".to_string(),
+            }
+            .into());
         }
         Ok(())
     }

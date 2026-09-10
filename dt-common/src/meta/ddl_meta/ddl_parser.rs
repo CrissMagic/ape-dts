@@ -35,7 +35,8 @@ use super::{
         keyword_s_to_z,
     },
 };
-use crate::{config::config_enums::DbType, error::Error, utils::sql_util::SqlUtil};
+use crate::error::DtError;
+use crate::{config::config_enums::DbType, utils::sql_util::SqlUtil};
 
 type SchemaTable = (Option<Vec<u8>>, Vec<u8>);
 
@@ -69,15 +70,17 @@ impl DdlParser {
                         format!("code: {:?}, input: {}", e.code, to_string(e.input))
                     }
                 };
-                bail! {Error::Unexpected(format!("failed to parse sql: {}, error: {}", sql, error))}
+                bail! {DtError::UnsupportedStatement(format!("failed to parse sql: {}, error: {}", sql, error))}
             }
         }
     }
 
     fn remove_comments(sql: &str) -> Cow<str> {
         // "create /*some comments,*/table/*some comments*/ `aaa`.`bbb`"
-        let regex = Regex::new(r"(/\*([^*]|\*+[^*/*])*\*+/)|(--[^\n]*\n)").unwrap();
-        regex.replace_all(sql, "")
+        match Regex::new(r"(/\*([^*]|\*+[^*/*])*\*+/)|(--[^\n]*\n)") {
+            Ok(regex) => regex.replace_all(sql, ""),
+            Err(_) => Cow::Borrowed(sql),
+        }
     }
 
     fn ddl_simple_judgment(sql: &str) -> bool {
@@ -1039,9 +1042,8 @@ fn to_string(i: &[u8]) -> String {
 #[cfg(test)]
 mod test_mysql {
 
-    use crate::{config::config_enums::DbType, meta::ddl_meta::ddl_parser::DdlParser};
-
     use super::*;
+    use crate::{config::config_enums::DbType, meta::ddl_meta::ddl_parser::DdlParser};
 
     #[test]
     fn test_create_table_with_schema_mysql() {

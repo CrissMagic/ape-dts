@@ -1,13 +1,6 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use sqlx::{MySql, Pool};
-
-use crate::{
-    extractor::base_extractor::{BaseExtractor, ExtractState},
-    meta_fetcher::mysql::mysql_struct_fetcher::MysqlStructFetcher,
-    Extractor,
-};
 use dt_common::{
     config::task_config::DEFAULT_DB_BATCH_SIZE,
     log_info, log_warn,
@@ -16,6 +9,13 @@ use dt_common::{
         struct_meta::{statement::struct_statement::StructStatement, struct_data::StructData},
     },
     rdb_filter::RdbFilter,
+};
+use sqlx::{MySql, Pool};
+
+use crate::{
+    extractor::base_extractor::{BaseExtractor, ExtractState},
+    meta_fetcher::mysql::mysql_struct_fetcher::MysqlStructFetcher,
+    Extractor,
 };
 
 pub struct MysqlStructExtractor {
@@ -59,6 +59,7 @@ impl MysqlStructExtractor {
             dbs,
             filter: Some(self.filter.to_owned()),
             meta_manager,
+            allow_missing_databases: false,
         };
 
         // database
@@ -78,7 +79,9 @@ impl MysqlStructExtractor {
 
     pub async fn push_dt_data(&mut self, statement: StructStatement) -> anyhow::Result<()> {
         let struct_data = StructData {
+            db: String::new(),
             schema: "".to_string(),
+            tb: String::new(),
             statement,
         };
         self.base_extractor

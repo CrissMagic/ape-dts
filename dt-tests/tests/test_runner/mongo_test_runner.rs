@@ -1,4 +1,3 @@
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 
@@ -17,11 +16,11 @@ use mongodb::{
     Client,
 };
 use regex::{Captures, Regex};
+use serde_json::Value;
 use sqlx::types::chrono::Utc;
 
-use crate::test_config_util::TestConfigUtil;
-
 use super::base_test_runner::BaseTestRunner;
+use crate::test_config_util::TestConfigUtil;
 
 pub struct MongoTestRunner {
     pub base: BaseTestRunner,
@@ -1023,6 +1022,28 @@ impl MongoTestRunner {
         );
     }
 
+    pub async fn assert_dst_index_option_doc_contains(
+        &self,
+        db: &str,
+        tb: &str,
+        index_name: &str,
+        option: &str,
+        expected: Document,
+    ) {
+        let index = self.dst_index_doc(db, tb, index_name).await;
+        let value = index.get_document(option).unwrap();
+        assert!(
+            Self::document_contains(value, &expected),
+            "dst index option [{}] for {}.{} index {} should contain {:?}, actual: {:?}",
+            option,
+            db,
+            tb,
+            index_name,
+            expected,
+            value
+        );
+    }
+
     pub async fn assert_dst_collection_option_bool(
         &self,
         db: &str,
@@ -1367,8 +1388,9 @@ impl MongoTestRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::MongoTestRunner;
     use serde_json::Value;
+
+    use super::MongoTestRunner;
 
     #[test]
     fn normalize_doc_string_quotes_dollar_prefixed_keys() {

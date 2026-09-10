@@ -1,55 +1,39 @@
 # English | [中文](README_ZH.md)
 
-# Introduction
+# ApeDTS
 
-- ape-dts is a data migration tool enabling any-to-any data transfers.
-- It also provides data subscription and data processing.
-- It is lightweight, efficient and standalone, requiring no third-party components or extra storage.
-- Designed for cloud-native stateless component scenarios.
-- In Rust.
+**A production-ready Rust binary (~17 MB compressed) for multi-engine snapshot
+migration, CDC, and data validation.**
+
+ApeDTS is a lightweight, standalone data migration and CDC engine. It handles snapshot migration,
+continuous synchronization, data validation, correction, and in-flight transformation across
+databases, message queues, and analytical engines. Designed for cloud-native, stateless
+deployments.
 
 ## Key features
 
-- Supports data migration between various databases, both homogeneous and heterogeneous.
-- Supports snapshot and cdc tasks with resume from breakpoint.
-- Supports checking and revising data.
-- Supports filtering and routing at the database, table, and column levels.
-- Implements different parallel algorithms for different sources, targets, and task types to improve performance.
-- Allows loading user-defined Lua scripts to modify the data.
+- **Lightweight by design** — Runs as a single standalone process, with no external runtime
+  components or intermediate storage.
+- **Mature multi-engine coverage** — Supports currently validated homogeneous and heterogeneous
+  paths spanning MySQL, PostgreSQL, MongoDB, Redis, Kafka, TiDB, StarRocks, ClickHouse, and Doris.
+- **Production-ready reliability** — Provides checkpoint-based recovery for snapshot and CDC
+  tasks, Prometheus-compatible metrics, and task-level observability.
+- **Source- and task-specific parallelism** — Uses dedicated parallel strategies for different
+  sources, targets, and task types to improve throughput.
+- **Advanced data capabilities** — On supported paths, validates, corrects, and reviews data;
+  filters and routes at the database, table, and column levels; and applies lightweight Lua
+  transformations in flight.
 
 ## Supported task types
+
+Currently supported mature task types:
 
 |                          | mysql -> mysql | pg -> pg | mongo -> mongo | redis -> redis | mysql -> kafka | pg -> kafka | mysql -> starrocks | mysql -> clickhouse | mysql -> tidb | pg -> starrocks | pg -> clickhouse | mysql -> doris | pg -> doris |
 | :----------------------- | :------------- | :------- | :------------- | :------------- | :------------- | :---------- | :----------------- | :------------------ | :------------ | :-------------- | :--------------- | :------------- | :---------- |
 | Snapshot                 | &#10004;       | &#10004; | &#10004;       | &#10004;       | &#10004;       | &#10004;    | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
 | CDC                      | &#10004;       | &#10004; | &#10004;       | &#10004;       | &#10004;       | &#10004;    | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
 | Data check/revise/review | &#10004;       | &#10004; | &#10004;       |                |                |             |                    |                     | &#10004;      |                 |                  |                |             |
-| Structure migration      | &#10004;       | &#10004; |                |                |                |             | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
-
-# Advanced
-
-## Crate features
-
-The dt-main crate provides several optional components which can be enabled via `Cargo [features]`:
-
-- `metrics`: Enable Prometheus format task metrics HTTP service interface.
-  See the [task metrics reference](./docs/en/monitor/task_metrics.md) for metric
-  names, units, and semantics.
-  After enabling this feature, you can customize the metrics service with the following configuration:
-
-  ```
-  [metrics]
-  # http service host
-  http_host=127.0.0.1
-  # http service port
-  http_port=9090
-  # http service worker count
-  workers=2
-  # prometheus metrics const labels
-  labels=your_label1:your_value1,your_label2:your_value2
-  ```
-
-- TBD
+| Structure migration      | &#10004;       | &#10004; | &#10004;       |                |                |             | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
 
 ## Config source and startup arguments
 
@@ -65,14 +49,12 @@ Arguments:
 - `--nacos-dataid`: required when the source is `nacos`, mapped to the Nacos `dataId`
 - `--nacos-group`: optional when the source is `nacos`, default `DEFAULT_GROUP`
 
-Nacos filtering and cache behavior:
+Nacos filtering and failure behavior:
 
-- Only task configuration sections are loaded: `global`, `extractor`, `sinker`, `pipeline`, `parallelizer`, `runtime`, `filter`, `router`, `resumer`, `data_marker`, `processor`, `checker`, `metacenter`, `metrics`, `precheck`
-- Default cache directory: `.nacos_cache`, override with `NACOS_CACHE_DIR`
-- Default cache TTL: `300` seconds, override with `NACOS_CACHE_TTL_SECS`
+- Only task configuration sections are accepted: `global`, `extractor`, `sinker`, `pipeline`, `parallelizer`, `runtime`, `filter`, `router`, `resumer`, `data_marker`, `processor`, `checker`, `checker_cdc`, `checker_output`, `metacenter`, `metrics`, `precheck`, `tracing`
 - Default Nacos request timeout: `10` seconds, override with `NACOS_REQUEST_TIMEOUT_SECS`
-- When fetching fails, or the fetched content cannot be parsed as a valid task config, an existing cache is used. Expired cache is still used and a warning is printed
-- When fetching fails and no usable cache exists, startup fails
+- `NACOS_REQUEST_TIMEOUT_SECS` must be a positive integer when set; invalid values fail startup
+- Fetch failures, non-success HTTP responses, unknown sections, malformed INI, and invalid task configuration all report an error and fail startup immediately. No local or expired-cache fallback is used
 
 Examples:
 
@@ -129,6 +111,8 @@ Refer to [test docs](./dt-tests/README.md) for details.
 
 - Configurations
   - [config details](./docs/en/config.md)
+- Error handling
+  - [error codes](./docs/en/error_codes.md)
 - Structure tasks
   - [migration](./docs/en/structure/migration.md)
   - [check](./docs/en/structure/check.md)
@@ -186,12 +170,6 @@ Refer to [test docs](./dt-tests/README.md) for details.
 | ape_dts  | 4c8g       | 26287                | 18.2% / 5.2%                   | 685% / 6.5%                    |
 | debezium | 4c8g       | 2951                 | 20.4% / 5.2%                   | 98% / 6.5%                     |
 
-- Image size
-
-| ape_dts:2.0.25-alpha.1 | debezium/connect:2.7 |
-| :--------------------- | :------------------- |
-| 71.4 MB                | 1.38 GB              |
-
 - more benchmark [details](./docs/en/benchmark.md)
 
 # Contributing
@@ -212,6 +190,27 @@ Refer to [test docs](./dt-tests/README.md) for details.
 - dt-tests: integration tests
 
 - related sub module: [mysql binlog connector in rust](https://github.com/apecloud/mysql-binlog-connector-rust)
+
+## Crate features
+
+The dt-main crate provides several optional components which can be enabled via `Cargo [features]`:
+
+- `metrics`: Enable Prometheus format task metrics HTTP service interface.
+  See the [task metrics reference](./docs/en/monitor/task_metrics.md) for metric
+  names, units, and semantics.
+  After enabling this feature, you can customize the metrics service with the following configuration:
+
+  ```
+  [metrics]
+  # http service host
+  http_host=127.0.0.1
+  # http service port
+  http_port=9090
+  # http service worker count
+  workers=2
+  # prometheus metrics const labels
+  labels=your_label1:your_value1,your_label2:your_value2
+  ```
 
 ## Build
 

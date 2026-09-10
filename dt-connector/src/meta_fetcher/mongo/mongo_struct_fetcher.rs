@@ -1,12 +1,9 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
-use mongodb::{
-    bson::{doc, Bson, Document},
-    Client,
-};
-
 use dt_common::{
+    config::config_enums::DbType,
+    error::{DtError, DtErrorContextExt},
     meta::{
         mongo::mongo_shard::list_shard_collections,
         struct_meta::statement::{
@@ -15,6 +12,10 @@ use dt_common::{
         },
     },
     rdb_filter::RdbFilter,
+};
+use mongodb::{
+    bson::{doc, Bson, Document},
+    Client,
 };
 
 const STRUCT_CURSOR_BATCH_SIZE: i32 = 100;
@@ -188,7 +189,14 @@ impl MongoStructFetcher {
         if let Some(collection) = ns.strip_prefix(&prefix) {
             return Ok(collection);
         }
-        anyhow::bail!("namespace does not start with database prefix [{}]", prefix)
+        anyhow::bail!(DtError::DatabaseInvalidConfig(
+            DbType::Mongo,
+            format!(
+                "the returned MongoDB namespace does not belong to the configured database {db}"
+            )
+        )
+        .message("MongoDB returned data for a database other than the configured source")
+        .hint("Check the database name in the MongoDB source URL and task routing, then retry."))
     }
 
     fn is_system_collection(collection: &str) -> bool {

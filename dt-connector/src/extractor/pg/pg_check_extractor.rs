@@ -1,11 +1,6 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-
-use futures::TryStreamExt;
-
-use sqlx::{Pool, Postgres};
-
 use dt_common::{
     log_info,
     meta::{
@@ -18,6 +13,8 @@ use dt_common::{
     },
     rdb_filter::RdbFilter,
 };
+use futures::TryStreamExt;
+use sqlx::{Pool, Postgres};
 
 use crate::{
     checker::check_log::CheckLog,
@@ -80,7 +77,7 @@ impl BatchCheckExtractor for PgCheckExtractor {
 
         let mut rows = query.fetch(&self.conn_pool);
         while let Some(row) = rows.try_next().await? {
-            let mut row_data = RowData::from_pg_row(&row, &tb_meta, &ignore_cols, None);
+            let mut row_data = RowData::from_pg_row(&row, &tb_meta, &ignore_cols, None)?;
 
             if is_diff && self.replay_diff_as_update {
                 row_data.row_type = RowType::Update;

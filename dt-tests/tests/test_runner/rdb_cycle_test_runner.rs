@@ -1,12 +1,12 @@
+use std::collections::HashMap;
+
 use anyhow::Context;
 use dt_common::utils::time_util::TimeUtil;
 use dt_connector::data_marker::DataMarker;
-use std::collections::HashMap;
 use tokio::task::JoinHandle;
 
-use crate::{test_config_util::TestConfigUtil, test_runner::mongo_test_runner::SRC};
-
 use super::rdb_test_runner::RdbTestRunner;
+use crate::{test_config_util::TestConfigUtil, test_runner::mongo_test_runner::SRC};
 
 pub struct RdbCycleTestRunner {
     base: RdbTestRunner,
@@ -127,7 +127,7 @@ impl RdbCycleTestRunner {
             &self.base.base.src_prepare_sqls,
         )?;
         for i in 0..db_tbs.len() {
-            if db_tbs[i].0 == data_marker.marker_schema && db_tbs[i].1 == data_marker.marker_tb {
+            if db_tbs[i].1 == data_marker.marker_schema && db_tbs[i].2 == data_marker.marker_tb {
                 db_tbs.remove(i);
                 break;
             }
@@ -148,6 +148,7 @@ impl RdbCycleTestRunner {
             .base
             .fetch_data(
                 &(
+                    String::new(),
                     data_marker.marker_schema.to_string(),
                     data_marker.marker_tb.to_string(),
                 ),

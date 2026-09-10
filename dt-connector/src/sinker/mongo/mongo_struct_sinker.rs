@@ -2,13 +2,8 @@ use std::{cmp, collections::HashMap};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use mongodb::{bson::doc, Client};
-use tokio::time::Instant;
-
-use crate::{sinker::base_sinker::BaseSinker, Sinker};
 use dt_common::{
     config::config_enums::ConflictPolicyEnum,
-    error::Error,
     log_error, log_info,
     meta::{
         mongo::mongo_shard::{list_shard_collections, MongoShardCollection},
@@ -25,6 +20,10 @@ use dt_common::{
     rdb_filter::RdbFilter,
     utils::limit_queue::LimitedQueue,
 };
+use mongodb::{bson::doc, Client};
+use tokio::time::Instant;
+
+use crate::{sinker::base_sinker::BaseSinker, Sinker};
 
 #[derive(Clone)]
 pub struct MongoStructSinker {
@@ -125,10 +124,7 @@ impl MongoStructSinker {
             statement.database_name,
             statement.collection_name
         );
-        database
-            .run_command(command)
-            .await
-            .map_err(Error::MongodbError)?;
+        database.run_command(command).await?;
         log_info!("mongo create collection succeed");
         Ok(())
     }
@@ -153,8 +149,7 @@ impl MongoStructSinker {
         self.mongo_client
             .database(&statement.database_name)
             .run_command(command)
-            .await
-            .map_err(Error::MongodbError)?;
+            .await?;
         log_info!("mongo create indexes succeed");
         Ok(())
     }
@@ -194,8 +189,7 @@ impl MongoStructSinker {
         self.mongo_client
             .database("admin")
             .run_command(doc! { "enableSharding": db })
-            .await
-            .map_err(Error::MongodbError)?;
+            .await?;
 
         let command = doc! {
             "shardCollection": shard_collection.ns.clone(),
@@ -206,8 +200,7 @@ impl MongoStructSinker {
         self.mongo_client
             .database("admin")
             .run_command(command)
-            .await
-            .map_err(Error::MongodbError)?;
+            .await?;
         log_info!("mongo shard collection succeed");
         Ok(())
     }

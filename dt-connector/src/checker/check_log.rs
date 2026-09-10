@@ -1,13 +1,21 @@
 use std::{collections::HashMap, str::FromStr};
 
 use anyhow::Context;
-use dt_common::{error::Error, meta::col_value::ColValue, utils::serialize_util::SerializeUtil};
+use dt_common::{
+    error::{DtError, DtResultExt, Stage},
+    meta::col_value::ColValue,
+    utils::serialize_util::SerializeUtil,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CheckLog {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub db: String,
     pub schema: String,
     pub tb: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_db: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,8 +78,12 @@ pub struct CheckSummaryLog {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CheckTableSummaryLog {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub db: String,
     pub schema: String,
     pub tb: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_db: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,8 +125,10 @@ impl CheckSummaryLog {
 
     pub fn merge_table(&mut self, table: CheckTableSummaryLog) {
         if let Some(existing) = self.tables.iter_mut().find(|existing| {
-            existing.schema == table.schema
+            existing.db == table.db
+                && existing.schema == table.schema
                 && existing.tb == table.tb
+                && existing.target_db == table.target_db
                 && existing.target_schema == table.target_schema
                 && existing.target_tb == table.target_tb
         }) {
@@ -130,14 +144,18 @@ impl CheckSummaryLog {
     pub fn sort_tables(&mut self) {
         self.tables.sort_by(|a, b| {
             (
+                a.db.as_str(),
                 a.schema.as_str(),
                 a.tb.as_str(),
+                a.target_db.as_deref(),
                 a.target_schema.as_deref(),
                 a.target_tb.as_deref(),
             )
                 .cmp(&(
+                    b.db.as_str(),
                     b.schema.as_str(),
                     b.tb.as_str(),
+                    b.target_db.as_deref(),
                     b.target_schema.as_deref(),
                     b.target_tb.as_deref(),
                 ))
@@ -147,7 +165,7 @@ impl CheckSummaryLog {
 
 pub fn to_json_line<T: Serialize>(value: &T) -> Option<String> {
     serde_json::to_string(value)
-        .map_err(|e| {
+        .inspect_err(|e| {
             log::warn!(
                 "Skipping checker log output because serialization failed: {}",
                 e
@@ -176,18 +194,22 @@ impl StructCheckLog {
 }
 
 impl FromStr for CheckLog {
-    type Err = Error;
+    type Err = anyhow::Error;
     fn from_str(str: &str) -> Result<Self, Self::Err> {
         serde_json::from_str(str)
             .with_context(|| format!("invalid check log: [{}]", str))
-            .map_err(|e| Error::Unexpected(e.to_string()))
+            .dt_error(DtError::DataDecodeFailed(
+                "failed to parse checker log".to_string(),
+            ))
+            .stage(Stage::Checker)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn json_line<T: Serialize>(value: &T) -> serde_json::Value {
         serde_json::from_str(&to_json_line(value).unwrap()).unwrap()
@@ -196,8 +218,10 @@ mod tests {
     #[test]
     fn checker_logs_keep_expected_json_shape() {
         let log = CheckLog {
+            db: String::new(),
             schema: "src_s".to_string(),
             tb: "src_t".to_string(),
+            target_db: None,
             target_schema: Some("dst_s".to_string()),
             target_tb: Some("src_t".to_string()),
             id_col_values: HashMap::from([("id".to_string(), Some("1".to_string()))]),
@@ -237,6 +261,15 @@ mod tests {
                 }
             })
         );
+
+        let mut log_with_db = log;
+        log_with_db.db = "db1".to_string();
+        assert_eq!(json_line(&log_with_db)["db"], "db1");
+
+        let legacy =
+            CheckLog::from_str(r#"{"schema":"s1","tb":"t1","id_col_values":{"id":"1"}}"#).unwrap();
+        assert!(legacy.db.is_empty());
+        assert!(legacy.target_db.is_none());
 
         let struct_log = StructCheckLog::new(
             "index.s1.t1.idx_1",

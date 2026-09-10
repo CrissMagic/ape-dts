@@ -1,21 +1,14 @@
-use std::{
-    env, fs,
-    io::Write,
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{env, time::Duration};
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use clap::ValueEnum;
 use configparser::ini::Ini;
+use dt_common::error::DtError;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
 pub const DEFAULT_NACOS_GROUP: &str = "DEFAULT_GROUP";
 
-const ENV_NACOS_CACHE_DIR: &str = "NACOS_CACHE_DIR";
-const ENV_NACOS_CACHE_TTL_SECS: &str = "NACOS_CACHE_TTL_SECS";
 const ENV_NACOS_REQUEST_TIMEOUT_SECS: &str = "NACOS_REQUEST_TIMEOUT_SECS";
-const DEFAULT_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 const ALLOWED_SECTIONS: &[&str] = &[
@@ -31,9 +24,12 @@ const ALLOWED_SECTIONS: &[&str] = &[
     "data_marker",
     "processor",
     "checker",
+    "checker_cdc",
+    "checker_output",
     "metacenter",
     "metrics",
     "precheck",
+    "tracing",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -48,22 +44,19 @@ pub struct NacosConfig {
     group: String,
 }
 
-struct CachedConfig {
-    content: String,
-    expired: bool,
-}
-
 impl NacosConfig {
     pub fn new(address: &str, data_id: &str, group: &str) -> anyhow::Result<Self> {
         if address.trim().is_empty() {
-            return Err(anyhow!(
-                "--nacos-address is required when --config-source=nacos"
-            ));
+            return Err(DtError::invalid_config(
+                "--nacos-address is required when --config-source=nacos",
+            )
+            .into());
         }
         if data_id.trim().is_empty() {
-            return Err(anyhow!(
-                "--nacos-dataid is required when --config-source=nacos"
-            ));
+            return Err(DtError::invalid_config(
+                "--nacos-dataid is required when --config-source=nacos",
+            )
+            .into());
         }
 
         Ok(Self {
@@ -81,144 +74,62 @@ pub async fn load_nacos_config_string<F>(
 where
     F: Fn(&str) -> anyhow::Result<()>,
 {
-    let cached = load_cache(config);
-    match fetch_nacos(config).await {
-        Ok(fresh) => match prepare_config(&fresh, &validate_config) {
-            Ok(filtered) => {
-                if let Err(err) = save_cache(config, &filtered) {
-                    eprintln!("warn: save nacos cache failed: {err}");
-                }
-                Ok(filtered)
-            }
-            Err(err) => load_cached_config(cached, err, &validate_config),
-        },
-        Err(err) => load_cached_config(cached, err, &validate_config),
-    }
+    let content = fetch_nacos(config).await?;
+    prepare_config(&content, &validate_config)
 }
 
-fn cache_dir() -> PathBuf {
-    env::var(ENV_NACOS_CACHE_DIR)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(".nacos_cache"))
-}
-
-fn cache_ttl() -> Duration {
-    let secs = env::var(ENV_NACOS_CACHE_TTL_SECS)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_CACHE_TTL_SECS);
-    Duration::from_secs(secs)
-}
-
-fn request_timeout() -> Duration {
-    let secs = env::var(ENV_NACOS_REQUEST_TIMEOUT_SECS)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
-    Duration::from_secs(secs)
-}
-
-fn encode_cache_component(value: &str) -> String {
-    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
-}
-
-fn cache_key(config: &NacosConfig) -> String {
-    format!(
-        "nacos--{}--{}--{}",
-        encode_cache_component(&config.address),
-        encode_cache_component(&config.data_id),
-        encode_cache_component(&config.group)
-    )
-}
-
-fn load_cache(config: &NacosConfig) -> Option<CachedConfig> {
-    let path = cache_dir().join(cache_key(config));
-    let meta = fs::metadata(&path).ok()?;
-    let modified = meta.modified().ok()?;
-    let expired = SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age > cache_ttl())
-        .unwrap_or(false);
-    let content = fs::read_to_string(&path).ok()?;
-    Some(CachedConfig { content, expired })
-}
-
-fn save_cache(config: &NacosConfig, content: &str) -> anyhow::Result<()> {
-    let dir = cache_dir();
-    fs::create_dir_all(&dir).context("failed to create nacos cache dir")?;
-    let key = cache_key(config);
-    let path = dir.join(&key);
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let tmp_path = dir.join(format!("{key}.{}.tmp", suffix));
-    let mut file = fs::File::create(&tmp_path).context("failed to create nacos cache file")?;
-    if let Err(err) = file.write_all(content.as_bytes()) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err).context("failed to write nacos cache file");
-    }
-    if let Err(err) = file.sync_all() {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err).context("failed to sync nacos cache file");
-    }
-    drop(file);
-    if path.exists() {
-        fs::remove_file(&path).context("failed to replace nacos cache file")?;
-    }
-    if let Err(err) = fs::rename(&tmp_path, &path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err).context("failed to move nacos cache file into place");
-    }
-    Ok(())
+fn request_timeout() -> anyhow::Result<Duration> {
+    let secs = match env::var(ENV_NACOS_REQUEST_TIMEOUT_SECS) {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|secs| *secs > 0)
+            .ok_or_else(|| {
+                DtError::invalid_config(format!(
+                    "{ENV_NACOS_REQUEST_TIMEOUT_SECS} must be a positive integer"
+                ))
+            })?,
+        Err(env::VarError::NotPresent) => DEFAULT_REQUEST_TIMEOUT_SECS,
+        Err(error) => {
+            return Err(DtError::invalid_config(format!(
+                "failed to read {ENV_NACOS_REQUEST_TIMEOUT_SECS}: {error}"
+            ))
+            .into());
+        }
+    };
+    Ok(Duration::from_secs(secs))
 }
 
 fn prepare_config<F>(content: &str, validate_config: &F) -> anyhow::Result<String>
 where
     F: Fn(&str) -> anyhow::Result<()>,
 {
-    let filtered = filter_config_sections(content)?;
-    validate_config(&filtered).context("nacos config is not a valid task config")?;
-    Ok(filtered)
+    validate_config_sections(content)?;
+    validate_config(content).context("nacos config is not a valid task config")?;
+    Ok(content.to_string())
 }
 
-fn load_cached_config<F>(
-    cached: Option<CachedConfig>,
-    cause: anyhow::Error,
-    validate_config: &F,
-) -> anyhow::Result<String>
-where
-    F: Fn(&str) -> anyhow::Result<()>,
-{
-    let Some(cached) = cached else {
-        return Err(cause);
-    };
-    eprintln!(
-        "warn: fetch or validate nacos failed ({}), using {}cached config.",
-        cause,
-        if cached.expired { "expired " } else { "" },
-    );
-    prepare_config(&cached.content, validate_config)
-        .with_context(|| format!("cached nacos config is invalid after nacos failure: {cause}"))
-}
-
-fn filter_config_sections(content: &str) -> anyhow::Result<String> {
+fn validate_config_sections(content: &str) -> anyhow::Result<()> {
     let mut ini = Ini::new();
     ini.set_inline_comment_symbols(Some(&Vec::new()));
-    ini.read(content.to_string()).map_err(|e| anyhow!(e))?;
+    ini.read(content.to_string()).map_err(|error| {
+        DtError::invalid_config(format!("failed to parse Nacos config: {error}"))
+    })?;
 
-    let mut out = String::new();
-    for section in ALLOWED_SECTIONS {
-        if let Some(props) = ini.get_map_ref().get(*section) {
-            out.push_str(&format!("[{}]\n", section));
-            for (key, value) in props {
-                out.push_str(&format!("{}={}\n", key, value.as_deref().unwrap_or("")));
-            }
-            out.push('\n');
-        }
+    let mut unknown_sections = ini
+        .sections()
+        .into_iter()
+        .filter(|section| !ALLOWED_SECTIONS.contains(&section.as_str()))
+        .collect::<Vec<_>>();
+    unknown_sections.sort();
+    if !unknown_sections.is_empty() {
+        return Err(DtError::invalid_config(format!(
+            "Nacos config contains unknown sections: {}",
+            unknown_sections.join(", ")
+        ))
+        .into());
     }
-    Ok(out)
+    Ok(())
 }
 
 async fn fetch_nacos(config: &NacosConfig) -> anyhow::Result<String> {
@@ -229,7 +140,7 @@ async fn fetch_nacos(config: &NacosConfig) -> anyhow::Result<String> {
         utf8_percent_encode(&config.group, NON_ALPHANUMERIC),
     );
     let response = reqwest::Client::builder()
-        .timeout(request_timeout())
+        .timeout(request_timeout()?)
         .build()
         .context("failed to build nacos http client")?
         .get(&url)
@@ -237,10 +148,11 @@ async fn fetch_nacos(config: &NacosConfig) -> anyhow::Result<String> {
         .await
         .context("failed to request nacos")?;
     if !response.status().is_success() {
-        return Err(anyhow!(
-            "nacos returned non-success status: {}",
-            response.status()
-        ));
+        return Err(DtError::HttpRejected {
+            status: response.status().as_u16(),
+            detail: "Nacos config request was rejected".to_string(),
+        }
+        .into());
     }
     response
         .text()
@@ -251,16 +163,16 @@ async fn fetch_nacos(config: &NacosConfig) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::{
-        env, fs,
+        env,
         io::{Read, Write as _},
         net::TcpListener,
-        path::PathBuf,
         sync::{Mutex, MutexGuard},
         thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::Duration,
     };
 
     use anyhow::anyhow;
+    use dt_common::error::{ErrorCode, ErrorReport};
 
     use super::*;
 
@@ -268,45 +180,23 @@ mod tests {
 
     struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
-        cache_dir: PathBuf,
     }
 
     impl EnvGuard {
         fn new() -> Self {
             let lock = ENV_LOCK.lock().unwrap();
-            let suffix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let cache_dir = env::temp_dir().join(format!(
-                "ape-dts-nacos-cache-{}-{}",
-                std::process::id(),
-                suffix
-            ));
             unsafe {
-                env::set_var(ENV_NACOS_CACHE_DIR, &cache_dir);
                 env::set_var(ENV_NACOS_REQUEST_TIMEOUT_SECS, "1");
-                env::remove_var(ENV_NACOS_CACHE_TTL_SECS);
             }
-            Self {
-                _lock: lock,
-                cache_dir,
-            }
-        }
-
-        fn cache_path(&self, config: &NacosConfig) -> PathBuf {
-            self.cache_dir.join(cache_key(config))
+            Self { _lock: lock }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             unsafe {
-                env::remove_var(ENV_NACOS_CACHE_DIR);
                 env::remove_var(ENV_NACOS_REQUEST_TIMEOUT_SECS);
-                env::remove_var(ENV_NACOS_CACHE_TTL_SECS);
             }
-            let _ = fs::remove_dir_all(&self.cache_dir);
         }
     }
 
@@ -328,112 +218,154 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_uses_encoded_components_without_collisions() {
-        let left = NacosConfig::new("http://nacos/a", "b", "c").unwrap();
-        let right = NacosConfig::new("http://nacos", "a", "b_c").unwrap();
-
-        assert_ne!(cache_key(&left), cache_key(&right));
-        assert!(cache_key(&left).contains("http%3A%2F%2Fnacos%2Fa"));
-        assert!(cache_key(&right).contains("b%5Fc"));
-    }
-
-    #[test]
-    fn request_timeout_uses_positive_env_override() {
+    fn request_timeout_uses_default_and_positive_env_override() {
         let _env = EnvGuard::new();
+
+        unsafe {
+            env::remove_var(ENV_NACOS_REQUEST_TIMEOUT_SECS);
+        }
+        assert_eq!(
+            request_timeout().unwrap(),
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+        );
 
         unsafe {
             env::set_var(ENV_NACOS_REQUEST_TIMEOUT_SECS, "2");
         }
-        assert_eq!(request_timeout(), Duration::from_secs(2));
-
-        unsafe {
-            env::set_var(ENV_NACOS_REQUEST_TIMEOUT_SECS, "0");
-        }
-        assert_eq!(
-            request_timeout(),
-            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
-        );
+        assert_eq!(request_timeout().unwrap(), Duration::from_secs(2));
     }
 
     #[test]
-    fn filter_config_sections_keeps_allowed_sections_only() {
-        let filtered = filter_config_sections(
+    fn request_timeout_rejects_invalid_override() {
+        let _env = EnvGuard::new();
+
+        for value in ["0", "invalid"] {
+            unsafe {
+                env::set_var(ENV_NACOS_REQUEST_TIMEOUT_SECS, value);
+            }
+            let error = request_timeout().unwrap_err();
+
+            assert_eq!(
+                ErrorReport::from_anyhow(&error).code,
+                ErrorCode::InvalidConfig
+            );
+            assert_eq!(
+                error.root_cause().to_string(),
+                "NACOS_REQUEST_TIMEOUT_SECS must be a positive integer"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_config_sections_accepts_all_current_sections() {
+        validate_config_sections(
             r#"[extractor]
 db_type=mysql
 
-[ignored]
-foo=bar
+[checker_cdc]
+is_enabled=true
+
+[checker_output]
+output_type=logs
+
+[tracing]
+enabled=true
 
 [router]
 topic_map=*.*:topic_a
 "#,
         )
         .unwrap();
+    }
 
-        assert!(filtered.contains("[extractor]"));
-        assert!(filtered.contains("db_type=mysql"));
-        assert!(filtered.contains("[router]"));
-        assert!(!filtered.contains("[ignored]"));
-        assert!(!filtered.contains("foo=bar"));
+    #[test]
+    fn validate_config_sections_rejects_unknown_sections() {
+        let error = validate_config_sections(
+            r#"[extractor]
+db_type=mysql
+
+[unknown_section]
+foo=bar
+"#,
+        )
+        .expect_err("unknown Nacos sections must fail");
+
+        assert_eq!(
+            ErrorReport::from_anyhow(&error).code,
+            ErrorCode::InvalidConfig
+        );
+        assert_eq!(
+            error.root_cause().to_string(),
+            "Nacos config contains unknown sections: unknown_section"
+        );
     }
 
     #[tokio::test]
-    async fn load_nacos_config_saves_filtered_valid_config() {
-        let env = EnvGuard::new();
+    async fn load_nacos_config_preserves_valid_content() {
+        let _env = EnvGuard::new();
         let address = start_http_server(
             "200 OK",
             r#"[extractor]
 db_type=mysql
 
-[ignored]
-foo=bar
+[router]
+topic_map=*.*:topic_a
 "#,
         );
         let config = NacosConfig::new(&address, "task.ini", DEFAULT_NACOS_GROUP).unwrap();
 
         let loaded = load_nacos_config_string(&config, |_| Ok(())).await.unwrap();
 
-        assert!(loaded.contains("[extractor]"));
-        assert!(!loaded.contains("[ignored]"));
-        assert_eq!(fs::read_to_string(env.cache_path(&config)).unwrap(), loaded);
-    }
-
-    #[tokio::test]
-    async fn load_nacos_config_uses_cache_when_fetch_fails() {
-        let env = EnvGuard::new();
-        let config =
-            NacosConfig::new("http://127.0.0.1:1", "task.ini", DEFAULT_NACOS_GROUP).unwrap();
-        save_cache(&config, "[extractor]\ndb_type=mysql\n").unwrap();
-
-        let loaded = load_nacos_config_string(&config, |_| Ok(())).await.unwrap();
-
-        assert!(loaded.contains("db_type=mysql"));
         assert_eq!(
-            fs::read_to_string(env.cache_path(&config)).unwrap(),
-            "[extractor]\ndb_type=mysql\n"
+            loaded,
+            "[extractor]\ndb_type=mysql\n\n[router]\ntopic_map=*.*:topic_a\n"
         );
     }
 
     #[tokio::test]
-    async fn invalid_fresh_config_does_not_replace_cache() {
-        let env = EnvGuard::new();
+    async fn load_nacos_config_fails_when_fetch_fails() {
+        let _env = EnvGuard::new();
+        let config =
+            NacosConfig::new("http://127.0.0.1:1", "task.ini", DEFAULT_NACOS_GROUP).unwrap();
+
+        load_nacos_config_string(&config, |_| Ok(()))
+            .await
+            .expect_err("Nacos fetch failure must not fall back to cached content");
+    }
+
+    #[tokio::test]
+    async fn load_nacos_config_fails_when_validation_fails() {
+        let _env = EnvGuard::new();
         let address = start_http_server("200 OK", "[extractor]\ndb_type=bad\n");
         let config = NacosConfig::new(&address, "task.ini", DEFAULT_NACOS_GROUP).unwrap();
-        save_cache(&config, "[extractor]\ndb_type=good\n").unwrap();
 
-        let loaded = load_nacos_config_string(&config, |filtered| {
-            if filtered.contains("db_type=bad") {
+        let error = load_nacos_config_string(&config, |content| {
+            if content.contains("db_type=bad") {
                 Err(anyhow!("bad config"))
             } else {
                 Ok(())
             }
         })
         .await
-        .unwrap();
+        .expect_err("invalid Nacos config must fail without a fallback");
 
-        let cached = fs::read_to_string(env.cache_path(&config)).unwrap();
-        assert!(loaded.contains("db_type=good"));
-        assert!(cached.contains("db_type=good"));
-        assert!(!cached.contains("db_type=bad"));
+        assert_eq!(error.to_string(), "nacos config is not a valid task config");
+        assert_eq!(error.root_cause().to_string(), "bad config");
+    }
+
+    #[tokio::test]
+    async fn load_nacos_config_reports_non_success_http_status() {
+        let _env = EnvGuard::new();
+        let address = start_http_server("503 Service Unavailable", "unavailable");
+        let config = NacosConfig::new(&address, "task.ini", DEFAULT_NACOS_GROUP).unwrap();
+
+        let error = load_nacos_config_string(&config, |_| Ok(()))
+            .await
+            .expect_err("non-success Nacos response must fail");
+
+        assert_eq!(
+            error.root_cause().to_string(),
+            "HTTP request was rejected with status 503: Nacos config request was rejected"
+        );
     }
 }

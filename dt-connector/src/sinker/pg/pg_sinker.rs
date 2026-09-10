@@ -2,17 +2,6 @@ use std::{cmp, str::FromStr, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use sqlx::{
-    postgres::{PgConnectOptions, PgPoolOptions},
-    Executor, Pool, Postgres,
-};
-use tokio::{sync::RwLock, time::Instant};
-
-use crate::sinker::checkable_sinker::CheckableSink;
-use crate::{
-    call_batch_fn, data_marker::DataMarker, rdb_query_builder::RdbQueryBuilder,
-    rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker,
-};
 use dt_common::{
     config::connection_auth_config::ConnectionAuthConfig,
     log_error, log_info,
@@ -25,6 +14,17 @@ use dt_common::{
         row_type::RowType,
     },
     utils::limit_queue::LimitedQueue,
+};
+use sqlx::{
+    postgres::{PgConnectOptions, PgPoolOptions},
+    Executor, Pool, Postgres,
+};
+use tokio::{sync::RwLock, time::Instant};
+
+use crate::sinker::checkable_sinker::CheckableSink;
+use crate::{
+    call_batch_fn, data_marker::DataMarker, rdb_query_builder::RdbQueryBuilder,
+    rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker,
 };
 
 #[derive(Clone)]
@@ -84,6 +84,11 @@ impl Sinker for PgSinker {
                 &self.connection_auth,
             )?;
             let mut conn_options = PgConnectOptions::from_str(final_url.as_str())?;
+            let tcp_keepalive = conn_options
+                .get_tcp_keepalive()
+                .copied()
+                .unwrap_or_default();
+            conn_options = conn_options.tcp_keepalive(tcp_keepalive);
             let mut pool_options = PgPoolOptions::new().max_connections(1);
             if let Some(ssl) = self.connection_auth.ssl_config() {
                 conn_options = ssl.apply_pg(conn_options);

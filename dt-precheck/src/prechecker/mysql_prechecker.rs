@@ -3,16 +3,16 @@ use std::collections::HashSet;
 use anyhow::bail;
 use async_trait::async_trait;
 use dt_common::config::{config_enums::DbType, filter_config::FilterConfig};
+use dt_common::error::DtError;
 use regex::Regex;
 
+use super::traits::Prechecker;
 use crate::{
     config::precheck_config::PrecheckConfig,
     fetcher::{mysql::mysql_fetcher::MysqlFetcher, traits::Fetcher},
     meta::{check_item::CheckItem, check_result::CheckResult, db_table_model::DbTable},
     prechecker::basic::BasicPrechecker,
 };
-
-use super::traits::Prechecker;
 
 const MYSQL_SUPPORT_DB_VERSION_REGEX: &str = r"5\..*|8\..*";
 
@@ -26,12 +26,12 @@ pub struct MySqlPrechecker {
 #[async_trait]
 impl Prechecker for MySqlPrechecker {
     async fn build_connection(&mut self) -> anyhow::Result<CheckResult> {
-        self.fetcher.build_connection().await?;
+        let check_error = self.fetcher.build_connection().await.err();
         Ok(CheckResult::build_with_err(
             CheckItem::CheckDatabaseConnection,
             self.is_source,
             DbType::Mysql,
-            None,
+            check_error,
             None,
         ))
     }
@@ -44,14 +44,23 @@ impl Prechecker for MySqlPrechecker {
         match result {
             Ok(version) => {
                 if version.is_empty() {
-                    check_error = Some(anyhow::Error::msg("found no version info."));
+                    check_error = Some(
+                        DtError::UnsupportedDatabaseVersion(
+                            DbType::Mysql,
+                            "MySQL returned no version information".to_string(),
+                        )
+                        .into(),
+                    );
                 } else {
-                    let re = Regex::new(MYSQL_SUPPORT_DB_VERSION_REGEX).unwrap();
+                    let re = Regex::new(MYSQL_SUPPORT_DB_VERSION_REGEX)?;
                     if !re.is_match(version.as_str()) {
-                        check_error = Some(anyhow::Error::msg(format!(
-                            "mysql version:[{}] is invalid.",
-                            version
-                        )));
+                        check_error = Some(
+                            DtError::UnsupportedDatabaseVersion(
+                                DbType::Mysql,
+                                format!("MySQL version {version} is not supported"),
+                            )
+                            .into(),
+                        );
                     }
                 }
             }
@@ -132,7 +141,7 @@ impl Prechecker for MySqlPrechecker {
             Err(e) => bail! {e},
         }
         if !errs.is_empty() {
-            check_error = Some(anyhow::Error::msg(errs.join(";")))
+            check_error = Some(DtError::CdcNotEnabled(errs.join(";")).into())
         }
 
         Ok(CheckResult::build_with_err(
@@ -166,9 +175,12 @@ impl Prechecker for MySqlPrechecker {
                 self.is_source,
                 DbType::Mysql,
                 check_error,
-                Some(anyhow::Error::msg(
-                    "CheckIfStructExisted with filter in pattern is not supported.",
-                )),
+                Some(
+                    DtError::ObjectNotFound(
+                        "structure existence precheck does not support pattern filters".to_string(),
+                    )
+                    .into(),
+                ),
             ));
         }
 
@@ -179,7 +191,7 @@ impl Prechecker for MySqlPrechecker {
             DbTable::from_str(&self.filter_config.do_schemas, &mut models)
         }
 
-        let (dbs, tb_dbs, tbs) = DbTable::get_config_maps(&models).unwrap();
+        let (dbs, tb_dbs, tbs) = DbTable::get_config_maps(&models)?;
         let mut all_db_names = Vec::new();
         all_db_names.extend(&dbs);
         all_db_names.extend(&tb_dbs);
@@ -241,7 +253,7 @@ impl Prechecker for MySqlPrechecker {
         }
 
         if !err_msgs.is_empty() {
-            check_error = Some(anyhow::Error::msg(err_msgs.join(".")))
+            check_error = Some(DtError::ObjectNotFound(err_msgs.join(".")).into())
         }
 
         Ok(CheckResult::build_with_err(
@@ -275,9 +287,12 @@ impl Prechecker for MySqlPrechecker {
                 self.is_source,
                 DbType::Mysql,
                 check_error,
-                Some(anyhow::Error::msg(
-                    "CheckIfTableStructSupported with filter in pattern is not supported.",
-                )),
+                Some(
+                    DtError::UnsupportedTableStructure(
+                        "table structure precheck does not support pattern filters".to_string(),
+                    )
+                    .into(),
+                ),
             ));
         }
 
@@ -287,7 +302,7 @@ impl Prechecker for MySqlPrechecker {
         } else if !self.filter_config.do_schemas.is_empty() {
             DbTable::from_str(&self.filter_config.do_schemas, &mut models)
         }
-        let (dbs, tb_dbs, _) = DbTable::get_config_maps(&models).unwrap();
+        let (dbs, tb_dbs, _) = DbTable::get_config_maps(&models)?;
         let mut all_db_names = Vec::new();
         all_db_names.extend(&dbs);
         all_db_names.extend(&tb_dbs);
@@ -380,10 +395,10 @@ impl Prechecker for MySqlPrechecker {
             ))
         }
         if !err_msgs.is_empty() {
-            check_error = Some(anyhow::Error::msg(err_msgs.join(";")))
+            check_error = Some(DtError::UnsupportedTableStructure(err_msgs.join(";")).into())
         }
         if !warn_msgs.is_empty() {
-            warn_error = Some(anyhow::Error::msg(warn_msgs.join(";")))
+            warn_error = Some(DtError::UnsupportedTableStructure(warn_msgs.join(";")).into())
         }
 
         Ok(CheckResult::build_with_err(

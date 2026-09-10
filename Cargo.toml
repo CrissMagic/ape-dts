@@ -17,7 +17,7 @@ members = [
 assigning_clones = "allow"
 
 [workspace.dependencies]
-sqlx = {version = "0.8.6", features = ["runtime-async-std-rustls", "mysql", "postgres", "bigdecimal", "ipnetwork", "mac_address", "bit-vec", "time", "chrono", "json", "uuid"]}
+sqlx = {git = "https://github.com/apecloud/sqlx", branch = "release-0.8.6", features = ["runtime-async-std-rustls", "mysql", "postgres", "bigdecimal", "ipnetwork", "mac_address", "bit-vec", "time", "chrono", "json", "uuid"]}
 futures = "0.3.25"
 mysql-binlog-connector-rust = {git = "https://github.com/apecloud/mysql-binlog-connector-rust", tag = "v0.3.4", features = ["openssl-tls"]}
 serde = {version = "1", features = ["derive"]}
@@ -38,7 +38,11 @@ postgres-protocol = {git = "https://github.com/apecloud/rust-postgres"}
 postgres-types= {git = "https://github.com/apecloud/rust-postgres"}
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-metrics = { version = "0.5.1", default-features = false }
-tokio-util = {version = "0.7.7", features = ["rt"]}
+tokio-util = {version = "0.7.7", features = ["rt", "compat"]}
+tiberius = { version = "0.12.3", default-features = false, features = ["rustls", "tds73", "chrono", "bigdecimal"] }
+bb8 = "0.9"
+bb8-tiberius = { version = "0.16.0", default-features = false, features = ["with-tokio", "tls", "tds73", "chrono"] }
+connection-string = "0.2.0"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "registry", "std"] }
 bytes = "1.0"
 configparser = "3.0.2"
@@ -46,6 +50,7 @@ async-mutex = "1.4.0"
 project-root = "0.2.2"
 strum = { version = "0.25.0", features = ["derive"] }
 regex = "1.5.4"
+rtb-redact = "=0.6.0"
 rdkafka = { version = "0.38.0", features = ["cmake-build","libz-static"] }
 kafka = "0.10.0"
 reqwest = {git = "https://github.com/apecloud/reqwest", features = ["redirect-with-sensitive-headers"] }

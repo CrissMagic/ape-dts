@@ -1,13 +1,21 @@
-use std::env;
+use std::{
+    backtrace::Backtrace,
+    env, panic,
+    process::{exit, ExitCode},
+    time::Duration,
+};
 
 use clap::Parser;
-
 use config_source::{ConfigSourceKind, NacosConfig};
-use dt_common::config::task_config::TaskConfig;
-use dt_precheck::{
-    config::task_config::PrecheckTaskConfig, do_precheck, do_precheck_with_config_str,
+use dt_common::{
+    config::{ini_loader::IniLoader, task_config::TaskConfig},
+    error::{DtError, DtResultExt, ErrorReport, Stage},
+    log_error, log_error_report,
+    logger::TaskLogger,
 };
+use dt_precheck::{config::task_config::PrecheckTaskConfig, do_precheck};
 use dt_task::task_runner::TaskRunner;
+use tokio::{signal::ctrl_c, spawn, time::sleep};
 
 mod config_source;
 
@@ -95,14 +103,40 @@ impl Args {
 }
 
 fn validate_config_str(config: &str) -> anyhow::Result<()> {
-    if PrecheckTaskConfig::new_from_str(config).is_ok() {
-        return TaskConfig::new_from_str(config).map(|_| ());
-    }
-    TaskRunner::new_from_str(config).map(|_| ())
+    let loader = IniLoader::new_from_str(config)?;
+    parse_task_configs(&loader).map(|_| ())
+}
+
+fn parse_task_configs(
+    loader: &IniLoader,
+) -> anyhow::Result<(TaskConfig, Option<PrecheckTaskConfig>)> {
+    let task_config = TaskConfig::from_loader(loader)?;
+    let precheck_config = PrecheckTaskConfig::load_if_present(loader)?;
+    Ok((task_config, precheck_config))
+}
+
+async fn load_config(args: &Args) -> anyhow::Result<(TaskConfig, Option<PrecheckTaskConfig>)> {
+    let loader = match args.config_source {
+        ConfigSourceKind::Local => {
+            let config_path = args.config_path().ok_or_else(|| {
+                DtError::MissingConfig(
+                    "--config-path, --config, or positional CONFIG is required".to_string(),
+                )
+            })?;
+            IniLoader::new(config_path)?
+        }
+        ConfigSourceKind::Nacos => {
+            let nacos_config = args.nacos_config()?;
+            let config =
+                config_source::load_nacos_config_string(&nacos_config, validate_config_str).await?;
+            IniLoader::new_from_str(&config)?
+        }
+    };
+    parse_task_configs(&loader)
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     unsafe {
         env::set_var("RUST_BACKTRACE", "1");
     }
@@ -110,49 +144,93 @@ async fn main() {
     let args = Args::parse();
     if let Err(err) = args.validate() {
         eprintln!("{err}");
-        std::process::exit(2);
+        return ExitCode::from(2);
     }
     if args.version || matches!(args.legacy_config.as_deref(), Some("version")) {
         println!("dt-main {}", env!("CARGO_PKG_VERSION"));
-        return;
+        return ExitCode::SUCCESS;
     }
 
-    tokio::spawn(async {
-        tokio::signal::ctrl_c().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(
-            std::env::var(ENV_SHUTDOWN_TIMEOUT_SECS)
+    install_panic_hook();
+
+    match execute(&args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let report = ErrorReport::from_anyhow(&error);
+            eprintln!("{report}");
+            log_error!("{report}");
+            log_error_report!("{}", report.to_log_json());
+            log::logger().flush();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn execute(args: &Args) -> anyhow::Result<()> {
+    let (task_config, precheck_config) = load_config(args).await?;
+    TaskLogger::new(&task_config)
+        .init(precheck_config.is_some())
+        .await?;
+    run(task_config, precheck_config, args.init).await
+}
+
+async fn run(
+    task_config: TaskConfig,
+    precheck_config: Option<PrecheckTaskConfig>,
+    init: bool,
+) -> anyhow::Result<()> {
+    let task_id = task_config.global.task_id.clone();
+
+    spawn(async {
+        if ctrl_c().await.is_err() {
+            return;
+        }
+        sleep(Duration::from_secs(
+            env::var(ENV_SHUTDOWN_TIMEOUT_SECS)
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3),
         ))
         .await;
-        std::process::exit(0);
+        exit(0);
     });
 
-    match args.config_source {
-        ConfigSourceKind::Local => {
-            let config = args.config_path().unwrap();
-            if PrecheckTaskConfig::new(config).is_ok() {
-                do_precheck(config).await;
-            } else {
-                let runner = TaskRunner::new(config).unwrap();
-                runner.start_task(args.init).await.unwrap()
-            }
-        }
-        ConfigSourceKind::Nacos => {
-            let nacos_config = args.nacos_config().unwrap();
-            let config =
-                config_source::load_nacos_config_string(&nacos_config, validate_config_str)
-                    .await
-                    .unwrap();
-            if PrecheckTaskConfig::new_from_str(&config).is_ok() {
-                do_precheck_with_config_str(&config).await;
-            } else {
-                let runner = TaskRunner::new_from_str(&config).unwrap();
-                runner.start_task(args.init).await.unwrap()
-            }
+    run_config(task_config, precheck_config, init)
+        .await
+        .task_id(task_id)
+}
+
+async fn run_config(
+    task_config: TaskConfig,
+    precheck_config: Option<PrecheckTaskConfig>,
+    init: bool,
+) -> anyhow::Result<()> {
+    match precheck_config {
+        Some(precheck_config) => do_precheck(task_config, precheck_config)
+            .await
+            .stage(Stage::Precheck)?,
+        None => {
+            TaskRunner::new(task_config)
+                .stage(Stage::Bootstrap)?
+                .start_task(init)
+                .await
+                .stage(Stage::Task)?;
         }
     }
+    Ok(())
+}
+
+fn install_panic_hook() {
+    panic::set_hook(Box::new(|panic_info| {
+        let backtrace = Backtrace::capture();
+        let report = format!("panic: {panic_info}\nbacktrace:\n{backtrace}");
+        eprintln!("{report}");
+        log_error!("{report}");
+        log::logger().flush();
+        // A panic in a spawned task or worker thread would otherwise leave the process
+        // hanging, and the task would never be reported as failed.
+        exit(1);
+    }));
 }
 
 #[cfg(test)]

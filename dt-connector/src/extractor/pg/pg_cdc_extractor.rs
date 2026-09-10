@@ -9,7 +9,34 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use anyhow::Error;
 use async_trait::async_trait;
+use dt_common::{
+    config::{
+        config_enums::DbType, config_token_parser::ConfigTokenParser,
+        connection_auth_config::ConnectionAuthConfig,
+    },
+    error::{DtError, DtOptionExt, DtResultExt, ErrorObject},
+    log_error, log_info, log_warn,
+    meta::{
+        adaptor::pg_col_value_convertor::PgColValueConvertor,
+        col_value::ColValue,
+        ddl_meta::{
+            ddl_data::DdlData,
+            ddl_statement::{DdlStatement, PgTruncateTableStatement},
+            ddl_type::DdlType,
+        },
+        dt_data::DtData,
+        pg::{pg_meta_manager::PgMetaManager, pg_tb_meta::PgTbMeta},
+        position::Position,
+        rdb_tb_meta::RdbTbMeta,
+        row_data::RowData,
+        row_type::RowType,
+        syncer::Syncer,
+    },
+    rdb_filter::RdbFilter,
+    utils::time_util::TimeUtil,
+};
 use futures::StreamExt;
 use postgres_protocol::message::backend::{
     DeleteBody, InsertBody,
@@ -18,7 +45,7 @@ use postgres_protocol::message::backend::{
     },
     RelationBody,
     ReplicationMessage::*,
-    TupleData, UpdateBody,
+    TruncateBody, TupleData, UpdateBody,
 };
 use postgres_types::PgLsn;
 use sqlx::{postgres::PgArguments, query::Query, Pool, Postgres};
@@ -32,26 +59,6 @@ use crate::{
         resumer::recovery::Recovery,
     },
     Extractor,
-};
-use dt_common::{
-    config::{
-        config_enums::DbType, config_token_parser::ConfigTokenParser,
-        connection_auth_config::ConnectionAuthConfig,
-    },
-    log_error, log_info, log_warn,
-    meta::{
-        adaptor::pg_col_value_convertor::PgColValueConvertor,
-        col_value::ColValue,
-        dt_data::DtData,
-        pg::{pg_meta_manager::PgMetaManager, pg_tb_meta::PgTbMeta},
-        position::Position,
-        rdb_tb_meta::RdbTbMeta,
-        row_data::RowData,
-        row_type::RowType,
-        syncer::Syncer,
-    },
-    rdb_filter::RdbFilter,
-    utils::time_util::TimeUtil,
 };
 
 pub struct PgCdcExtractor {
@@ -197,7 +204,11 @@ impl PgCdcExtractor {
 
                         Origin(_origin) => {}
 
-                        Truncate(_truncate) => {}
+                        Truncate(truncate) => {
+                            if self.extract_state.time_filter.started {
+                                self.decode_ddl_truncate(&truncate, &position).await?;
+                            }
+                        }
 
                         Type(_typee) => {}
 
@@ -235,9 +246,20 @@ impl PgCdcExtractor {
                     log_info!("received unknown replication data: {:?}", data);
                 }
 
-                Some(Err(error)) => panic!("unexpected replication stream error: {}", error),
+                Some(Err(error)) => {
+                    return Err(Error::new(error).context(DtError::DatabaseConnectionFailed(
+                        DbType::Pg,
+                        "the PostgreSQL replication stream failed".to_string(),
+                    )));
+                }
 
-                None => panic!("unexpected replication stream end"),
+                None => {
+                    return Err(DtError::DatabaseConnectionFailed(
+                        DbType::Pg,
+                        "PostgreSQL replication stream ended unexpectedly".to_string(),
+                    )
+                    .into());
+                }
             }
         }
     }
@@ -247,16 +269,22 @@ impl PgCdcExtractor {
         stream: &mut Pin<&mut LogicalReplicationStream>,
         start_lsn: &str,
     ) -> anyhow::Result<()> {
-        let lsn: PgLsn =
+        let lsn_value =
             if let Position::PgCdc { lsn, .. } = &self.syncer.lock().await.committed_position {
                 if lsn.is_empty() {
-                    start_lsn.parse().unwrap()
+                    start_lsn.to_string()
                 } else {
-                    lsn.parse().unwrap()
+                    lsn.clone()
                 }
             } else {
-                start_lsn.parse().unwrap()
+                start_lsn.to_string()
             };
+        let lsn: PgLsn = lsn_value.parse().map_err(|_| {
+            DtError::DatabaseCheckpointReadFailed(
+                DbType::Pg,
+                "the saved PostgreSQL replication position is invalid".to_string(),
+            )
+        })?;
         log_info!("confirmed flush lsn: {}", lsn.to_string());
 
         // Postgres epoch is 2000-01-01T00:00:00Z
@@ -282,7 +310,8 @@ impl PgCdcExtractor {
         // if the tb is filtered, we won't try to get the tb_meta since we may get privilege errors,
         // but we need to keep the oid —— tb_meta map which may be used for decoding events,
         // the built-in object used by datamarker, although it is not in filter config, still needs to get tb_meta.
-        if self.filter.filter_tb(schema, tb) && !self.extract_state.is_data_marker_info(schema, tb)
+        if self.filter.filter_tb(schema, tb)
+            && !self.extract_state.is_data_marker_info("", schema, tb)
         {
             let tb_meta = Self::mock_pg_tb_meta(schema, tb, event.rel_id() as i32);
             self.meta_manager
@@ -294,14 +323,26 @@ impl PgCdcExtractor {
         let mut tb_meta = self.meta_manager.get_tb_meta(schema, tb).await?.to_owned();
         let mut col_names = Vec::new();
         for column in event.columns() {
+            let col_name = column.name()?;
             // todo: check type_id in oid_to_type
             let col_type = self
                 .meta_manager
                 .type_registry
                 .oid_to_type
                 .get(&column.type_id())
-                .unwrap();
-            let col_name = column.name()?;
+                .or_dt_error(DtError::DatabaseUnsupportedTableStructure(
+                    DbType::Pg,
+                    format!(
+                        "PostgreSQL type OID {} is not supported for column {col_name}",
+                        column.type_id()
+                    ),
+                ))
+                .object(ErrorObject {
+                    schema: Some(schema.to_string()),
+                    table: Some(tb.to_string()),
+                    column: Some(col_name.to_string()),
+                    ..Default::default()
+                })?;
             // update meta
             tb_meta
                 .col_type_map
@@ -334,6 +375,7 @@ impl PgCdcExtractor {
 
         let col_values = self.parse_row_data(&tb_meta, event.tuple().tuple_data())?;
         let row_data = RowData::new(
+            tb_meta.basic.db,
             tb_meta.basic.schema,
             tb_meta.basic.tb,
             0,
@@ -374,7 +416,28 @@ impl PgCdcExtractor {
         } else if !basic.id_cols.is_empty() {
             let mut col_values_tmp = HashMap::new();
             for col in basic.id_cols.iter() {
-                col_values_tmp.insert(col.to_string(), col_values_after.get(col).unwrap().clone());
+                let value = col_values_after
+                    .get(col)
+                    .cloned()
+                    .or_dt_error(DtError::DatabaseUnsupportedTableStructure(
+                        DbType::Pg,
+                        format!(
+                            "PostgreSQL update does not contain key column {col}; check replica identity"
+                        ),
+                    ))
+                    .message(
+                        "PostgreSQL update events do not contain the columns needed to identify rows",
+                    )
+                    .hint(
+                        "Configure a primary key or REPLICA IDENTITY FULL for the source table, then restart the task.",
+                    )
+                    .object(ErrorObject {
+                        schema: Some(basic.schema.clone()),
+                        table: Some(basic.tb.clone()),
+                        column: Some(col.to_string()),
+                        ..Default::default()
+                    })?;
+                col_values_tmp.insert(col.to_string(), value);
             }
             col_values_tmp
         } else {
@@ -382,6 +445,7 @@ impl PgCdcExtractor {
         };
 
         let row_data = RowData::new(
+            basic.db.clone(),
             basic.schema.clone(),
             basic.tb.clone(),
             0,
@@ -415,6 +479,7 @@ impl PgCdcExtractor {
         };
 
         let row_data = RowData::new(
+            tb_meta.basic.db,
             tb_meta.basic.schema,
             tb_meta.basic.tb,
             0,
@@ -480,6 +545,44 @@ impl PgCdcExtractor {
         Ok(())
     }
 
+    async fn decode_ddl_truncate(
+        &mut self,
+        truncate_body: &TruncateBody,
+        position: &Position,
+    ) -> anyhow::Result<()> {
+        if self.filter.filter_all_ddl() || self.filter.filter_spec_ddl(&DdlType::TruncateTable) {
+            return Ok(());
+        }
+
+        for rel_id in truncate_body.rel_ids() {
+            let tb_meta = self.meta_manager.get_tb_meta_by_oid(*rel_id as i32)?;
+            let schema = tb_meta.basic.schema;
+            let tb = tb_meta.basic.tb;
+            if self.filter.filter_tb(&schema, &tb) {
+                continue;
+            }
+
+            let statement = DdlStatement::PgTruncateTable(PgTruncateTableStatement {
+                schema: schema.clone(),
+                tb,
+                is_only: true,
+                unparsed: String::new(),
+            });
+            let ddl_data = DdlData {
+                default_db: String::new(),
+                default_schema: schema,
+                query: statement.to_sql(&DbType::Pg),
+                ddl_type: DdlType::TruncateTable,
+                db_type: DbType::Pg,
+                statement,
+            };
+            self.base_extractor
+                .push_ddl(&mut self.extract_state, ddl_data, position.clone())
+                .await?;
+        }
+        Ok(())
+    }
+
     fn parse_row_data(
         &mut self,
         tb_meta: &PgTbMeta,
@@ -537,7 +640,7 @@ impl PgCdcExtractor {
         let tb = &tb_meta.basic.tb;
         let filtered = self.filter.filter_event(schema, tb, &row_type);
         if filtered {
-            return !self.extract_state.is_data_marker_info(schema, tb);
+            return !self.extract_state.is_data_marker_info("", schema, tb);
         }
         filtered
     }
@@ -576,7 +679,7 @@ impl PgCdcExtractor {
             let mut start_time = Instant::now();
             while !shut_down.load(Ordering::Acquire) {
                 if start_time.elapsed().as_secs() >= heartbeat_interval_secs {
-                    Self::heartbeat(
+                    if let Err(error) = Self::heartbeat(
                         &slot_name,
                         &schema_tb[0],
                         &schema_tb[1],
@@ -584,7 +687,10 @@ impl PgCdcExtractor {
                         &conn_pool,
                     )
                     .await
-                    .unwrap();
+                    {
+                        log_error!("heartbeat failed: {error:#}");
+                        break;
+                    }
                     start_time = Instant::now();
                 }
                 TimeUtil::sleep_millis(1000 * heartbeat_interval_secs).await;

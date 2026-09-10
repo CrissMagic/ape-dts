@@ -1,8 +1,5 @@
-use super::{
-    base_test_runner::BaseTestRunner, check_util::CheckUtil, rdb_test_runner::RdbTestRunner,
-    rdb_util::RdbUtil,
-};
-use crate::test_config_util::TestConfigUtil;
+use std::{fs::File, path::Path};
+
 use anyhow::Context;
 use chrono::Utc;
 use dt_common::utils::time_util::TimeUtil;
@@ -22,7 +19,12 @@ use dt_connector::extractor::resumer::{
 };
 use serde_json::Value;
 use sqlx::{query, Row};
-use std::{fs::File, path::Path};
+
+use super::{
+    base_test_runner::BaseTestRunner, check_util::CheckUtil, rdb_test_runner::RdbTestRunner,
+    rdb_util::RdbUtil,
+};
+use crate::test_config_util::TestConfigUtil;
 
 pub struct CheckTestRunner {
     base: RdbTestRunner,
@@ -338,13 +340,14 @@ impl CheckTestRunner {
         // start task
         self.base.base.start_task().await?;
 
-        let default_check_log_file_size = CheckerConfig::default().check_log_file_size;
+        let default_checker = CheckerConfig::default();
+        let default_check_log_file_size = default_checker.log_file_size().to_string();
         let check_log_file_size = self
             .base
             .config
             .checker
             .as_ref()
-            .map(|cfg| cfg.check_log_file_size.clone())
+            .map(|cfg| cfg.log_file_size().to_string())
             .unwrap_or(default_check_log_file_size.clone());
         if check_log_file_size == default_check_log_file_size {
             CheckUtil::validate_check_log(&self.expect_check_log_dir, &self.dst_check_log_dir)?;
@@ -487,7 +490,7 @@ impl CheckTestRunner {
             .get_config()
             .checker
             .as_ref()
-            .map(|checker| checker.retry_interval_secs)
+            .map(|checker| checker.recheck_interval_secs)
             .unwrap_or(0);
         let delay_secs = std::cmp::max(1, retry_interval_secs / 2);
 

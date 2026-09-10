@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use byteorder::{BigEndian, ByteOrder};
-use dt_common::error::Error;
-use dt_common::meta::redis::redis_object::{RedisCmd, RedisString, StreamObject};
+use dt_common::{
+    error::{DtError, DtOptionExt},
+    meta::redis::redis_object::{RedisCmd, RedisString, StreamObject},
+};
 
 use crate::extractor::redis::rdb::reader::rdb_reader::RdbReader;
 
@@ -26,6 +28,12 @@ impl StreamParser {
             // Load key
             // key is streamId, like: 1612181627287-0
             let key = reader.read_string().await?;
+            if key.as_bytes().len() != 16 {
+                bail! {DtError::redis_rdb(format!(
+                    "invalid stream ID byte length: {}",
+                    key.as_bytes().len()
+                ))}
+            }
             let master_ms = BigEndian::read_i64(&key.as_bytes()[..8]); // ms
             let master_seq = BigEndian::read_i64(&key.as_bytes()[8..]);
 
@@ -35,17 +43,23 @@ impl StreamParser {
 
             // The front of stream listpack is master entry
             // Parse the master entry
-            let mut count = Self::next_integer(&mut inx, &elements); // count
-            let mut deleted = Self::next_integer(&mut inx, &elements); // deleted
-            let num_fields = Self::next_integer(&mut inx, &elements) as usize; // num-fields
+            let mut count = Self::next_integer(&mut inx, &elements)?; // count
+            let mut deleted = Self::next_integer(&mut inx, &elements)?; // deleted
+            let num_fields = Self::next_integer(&mut inx, &elements)? as usize; // num-fields
 
-            let fields = &elements[3..3 + num_fields]; // fields
+            let fields = elements
+                .get(3..3 + num_fields)
+                .or_dt_error(DtError::redis_rdb(
+                    "stream field definitions exceed the listpack length",
+                ))?; // fields
             inx = 3 + num_fields;
 
             // master entry end by zero
-            let last_entry = String::from(Self::next(&mut inx, &elements).clone());
+            let last_entry = String::try_from(Self::next(&mut inx, &elements)?.clone()).context(
+                DtError::redis_rdb("stream listpack marker is not valid UTF-8"),
+            )?;
             if last_entry != "0" {
-                bail! {Error::RedisRdbError(format!(
+                bail! {DtError::redis_rdb(format!(
                     "master entry not ends by zero. lastEntry=[{}]",
                     last_entry
                 ))}
@@ -53,9 +67,9 @@ impl StreamParser {
 
             // Parse entries
             while count != 0 || deleted != 0 {
-                let flags = Self::next_integer(&mut inx, &elements); // [is_same_fields|is_deleted]
-                let entry_ms = Self::next_integer(&mut inx, &elements);
-                let entry_seq = Self::next_integer(&mut inx, &elements);
+                let flags = Self::next_integer(&mut inx, &elements)?; // [is_same_fields|is_deleted]
+                let entry_ms = Self::next_integer(&mut inx, &elements)?;
+                let entry_seq = Self::next_integer(&mut inx, &elements)?;
                 let value = &format!("{}-{}", entry_ms + master_ms, entry_seq + master_seq);
 
                 let mut cmd = RedisCmd::new();
@@ -67,18 +81,24 @@ impl StreamParser {
                     // same fields, get field from master entry.
                     for field in fields.iter().take(num_fields) {
                         cmd.add_redis_arg(field);
-                        cmd.add_redis_arg(Self::next(&mut inx, &elements));
+                        cmd.add_redis_arg(Self::next(&mut inx, &elements)?);
                     }
                 } else {
                     // get field by lp.Next()
-                    let num = Self::next_integer(&mut inx, &elements) as usize;
-                    for ele in elements[inx..inx + num * 2].iter() {
+                    let num = Self::next_integer(&mut inx, &elements)? as usize;
+                    let values =
+                        elements
+                            .get(inx..inx + num * 2)
+                            .or_dt_error(DtError::redis_rdb(
+                                "stream entry fields exceed the listpack length",
+                            ))?;
+                    for ele in values {
                         cmd.add_redis_arg(ele);
                     }
                     inx += num * 2;
                 }
 
-                Self::next(&mut inx, &elements); // lp_count
+                Self::next(&mut inx, &elements)?; // lp_count
 
                 if flags & 1 == 1 {
                     // is_deleted
@@ -213,9 +233,19 @@ impl StreamParser {
                     cmd.add_str_arg("0");
                     cmd.add_str_arg(&stream_id);
                     cmd.add_str_arg("TIME");
-                    cmd.add_str_arg(map_id_to_time.get(&stream_id).unwrap());
+                    let Some(delivery_time) = map_id_to_time.get(&stream_id) else {
+                        bail! {DtError::redis_rdb(format!(
+                            "pending stream entry {stream_id} has no delivery time"
+                        ))}
+                    };
+                    cmd.add_str_arg(delivery_time);
                     cmd.add_str_arg("RETRYCOUNT");
-                    cmd.add_str_arg(map_id_to_count.get(&stream_id).unwrap());
+                    let Some(delivery_count) = map_id_to_count.get(&stream_id) else {
+                        bail! {DtError::redis_rdb(format!(
+                            "pending stream entry {stream_id} has no delivery count"
+                        ))}
+                    };
+                    cmd.add_str_arg(delivery_count);
                     cmd.add_str_arg("JUSTID");
                     cmd.add_str_arg("FORCE");
                     obj.cmds.push(cmd);
@@ -223,18 +253,58 @@ impl StreamParser {
             }
         }
 
+        // 3. IDMP (Idempotent Message Producer) config and entries.
+        // refer: https://github.com/redis/redis/blob/unstable/src/rdb.c, rdbLoadStreamIdmpEntries
+        if type_byte >= super::RDB_TYPE_STREAM_LISTPACKS_4 {
+            let _ = reader.read_length().await?; // idmp_duration
+            let _ = reader.read_length().await?; // idmp_max_entries
+
+            // IDMP dedup state can not be expressed as redis commands,
+            // so entries are only consumed to keep the reader in sync.
+            let n_producer = reader.read_length().await?;
+            if n_producer > 0 {
+                log::warn!(
+                    "stream [{}] has {} IDMP producers, their deduplication state will NOT be migrated",
+                    master_key,
+                    n_producer
+                );
+            }
+
+            for _ in 0..n_producer {
+                let _ = reader.read_string().await?; // producer id
+                let n_entry = reader.read_length().await?;
+                for _ in 0..n_entry {
+                    let _ = reader.read_string().await?; // iid
+                    let _ = reader.read_length().await?; // entry id ms
+                    let _ = reader.read_length().await?; // entry id seq
+                }
+            }
+
+            let _ = reader.read_length().await?; // iids_added
+            let _ = reader.read_length().await?; // iids_duplicates
+        }
+
         Ok(obj)
     }
 
-    fn next_integer(inx: &mut usize, elements: &[RedisString]) -> i64 {
-        let ele = &elements[*inx];
+    fn next_integer(inx: &mut usize, elements: &[RedisString]) -> anyhow::Result<i64> {
+        let ele = elements
+            .get(*inx)
+            .or_dt_error(DtError::redis_rdb("unexpected end of stream listpack"))?;
         *inx += 1;
-        String::from(ele.clone()).parse::<i64>().unwrap()
+        let value = String::try_from(ele.clone()).context(DtError::redis_rdb(
+            "stream listpack integer is not valid UTF-8",
+        ))?;
+        value
+            .parse::<i64>()
+            .context(DtError::redis_rdb("invalid integer in stream listpack"))
     }
 
-    fn next<'a>(inx: &mut usize, elements: &'a [RedisString]) -> &'a RedisString {
-        let ele = &elements[*inx];
+    fn next<'a>(inx: &mut usize, elements: &'a [RedisString]) -> anyhow::Result<&'a RedisString> {
+        let ele = elements
+            .get(*inx)
+            .or_dt_error(DtError::redis_rdb("unexpected end of stream listpack"))?;
         *inx += 1;
-        ele
+        Ok(ele)
     }
 }

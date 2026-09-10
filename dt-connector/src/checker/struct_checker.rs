@@ -1,15 +1,15 @@
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{bail, Context};
 use async_mutex::Mutex;
 use chrono::Local;
-use sqlx::{MySql, Pool, Postgres};
-use tokio::time::sleep;
-
 use dt_common::{
     config::config_enums::DbType,
+    error::{DtError, DtErrorContextExt, Stage},
     log_diff, log_info, log_miss, log_sql, log_summary,
     meta::struct_meta::{struct_data::StructData, structure::structure_type::StructureType},
     monitor::{
@@ -18,6 +18,8 @@ use dt_common::{
     },
     rdb_filter::RdbFilter,
 };
+use sqlx::{MySql, Pool, Postgres};
+use tokio::time::sleep;
 
 use crate::{
     checker::check_log::{to_json_line, CheckSummaryLog, CheckTableSummaryLog, StructCheckLog},
@@ -40,7 +42,7 @@ pub struct StructCheckerHandle {
     monitor: TaskMonitorHandle,
     monitor_task_id: String,
     src_sql_map: BTreeMap<String, String>,
-    dbs: HashSet<String>,
+    schemas: HashSet<String>,
     start_time: String,
 }
 
@@ -104,7 +106,7 @@ impl StructCheckerHandle {
             monitor,
             monitor_task_id,
             src_sql_map: BTreeMap::new(),
-            dbs: HashSet::new(),
+            schemas: HashSet::new(),
             start_time: Local::now().to_rfc3339(),
         }
     }
@@ -138,8 +140,8 @@ impl StructCheckerHandle {
         }
 
         for (key, sql) in sqls {
-            if let Some(db) = Self::schema_from_key(&key).filter(|db| !db.is_empty()) {
-                self.dbs.insert(db.to_string());
+            if let Some(schema) = Self::schema_from_key(&key).filter(|schema| !schema.is_empty()) {
+                self.schemas.insert(schema.to_string());
             }
             self.src_sql_map.insert(key, sql);
         }
@@ -148,7 +150,7 @@ impl StructCheckerHandle {
 
     async fn build_dst_sql_map(
         &self,
-        dbs: &HashSet<String>,
+        schemas: &HashSet<String>,
     ) -> anyhow::Result<BTreeMap<String, String>> {
         let mut dst_map = BTreeMap::new();
         match self.db_type {
@@ -165,9 +167,10 @@ impl StructCheckerHandle {
                     .await?;
                 let mut fetcher = MysqlStructFetcher {
                     conn_pool,
-                    dbs: dbs.clone(),
+                    dbs: schemas.clone(),
                     filter: Some(self.filter.clone()),
                     meta_manager,
+                    allow_missing_databases: true,
                 };
                 for stmt in fetcher.get_create_database_statements("").await? {
                     dst_map.extend(stmt.to_sqls(&self.filter)?);
@@ -184,8 +187,9 @@ impl StructCheckerHandle {
                     .clone();
                 let mut fetcher = PgStructFetcher {
                     conn_pool,
-                    schemas: dbs.clone(),
+                    schemas: schemas.clone(),
                     filter: Some(self.filter.clone()),
+                    allow_missing_schemas: true,
                 };
                 if !self.filter.filter_structure(&StructureType::Udt) {
                     for stmt in fetcher.get_udt_statements().await? {
@@ -209,7 +213,11 @@ impl StructCheckerHandle {
                     }
                 }
             }
-            _ => bail!("struct check not supported for db_type: {}", self.db_type),
+            _ => bail!(DtError::InvalidConfig(format!(
+                "structure checking is not supported for database type: {}",
+                self.db_type
+            ))
+            .stage(Stage::Bootstrap)),
         }
         Ok(dst_map)
     }
@@ -217,10 +225,10 @@ impl StructCheckerHandle {
     async fn compare_once(
         &self,
         src_sql_map: &BTreeMap<String, String>,
-        dbs: &HashSet<String>,
+        schemas: &HashSet<String>,
         log_enabled: bool,
     ) -> anyhow::Result<CheckSummaryLog> {
-        let dst_map = self.build_dst_sql_map(dbs).await?;
+        let dst_map = self.build_dst_sql_map(schemas).await?;
         Ok(Self::compare_sql_maps(
             src_sql_map,
             dst_map,
@@ -313,7 +321,7 @@ impl StructCheckerHandle {
         let mut retries_left = self.max_retries;
         let summary = loop {
             let summary = self
-                .compare_once(&self.src_sql_map, &self.dbs, false)
+                .compare_once(&self.src_sql_map, &self.schemas, false)
                 .await?;
             if summary.is_consistent {
                 log_info!("Structure check passed - all structures are consistent");
@@ -321,7 +329,7 @@ impl StructCheckerHandle {
             }
             if retries_left == 0 {
                 break self
-                    .compare_once(&self.src_sql_map, &self.dbs, true)
+                    .compare_once(&self.src_sql_map, &self.schemas, true)
                     .await?;
             }
             retries_left -= 1;
@@ -362,5 +370,41 @@ impl StructCheckerHandle {
             log_summary!("{}", log);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_target_database_and_table_are_reported_as_miss() {
+        let src_sql_map = BTreeMap::from([
+            (
+                "database.test_db".to_string(),
+                "CREATE DATABASE IF NOT EXISTS `test_db`".to_string(),
+            ),
+            (
+                "table.test_db.test_tb".to_string(),
+                "CREATE TABLE IF NOT EXISTS `test_db`.`test_tb` (`id` int)".to_string(),
+            ),
+        ]);
+
+        let summary = StructCheckerHandle::compare_sql_maps(
+            &src_sql_map,
+            BTreeMap::new(),
+            "start",
+            false,
+            false,
+        );
+
+        assert!(!summary.is_consistent);
+        assert_eq!(summary.checked_count, 2);
+        assert_eq!(summary.miss_count, 2);
+        assert_eq!(summary.diff_count, 0);
+        assert_eq!(summary.tables.len(), 1);
+        assert_eq!(summary.tables[0].schema, "test_db");
+        assert_eq!(summary.tables[0].tb, "test_tb");
+        assert_eq!(summary.tables[0].miss_count, 1);
     }
 }

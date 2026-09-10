@@ -1,6 +1,15 @@
 use std::str::FromStr;
 
-use anyhow::bail;
+use anyhow::Context;
+use dt_common::{
+    config::{
+        config_enums::DbType,
+        connection_auth_config::ConnectionAuthConfig,
+        ssl_config::{SslConfig, SslMode},
+    },
+    error::{DtError, DtOptionExt, DtResultExt},
+    log_info, log_warn,
+};
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use postgres_openssl::MakeTlsConnector;
 use postgres_types::PgLsn;
@@ -9,15 +18,6 @@ use tokio_postgres::{
     SimpleQueryMessage::Row,
 };
 use url::Url;
-
-use dt_common::{
-    config::{
-        connection_auth_config::ConnectionAuthConfig,
-        ssl_config::{SslConfig, SslMode},
-    },
-    error::Error,
-    log_info, log_warn,
-};
 
 pub struct PgCdcClient {
     pub url: String,
@@ -59,7 +59,11 @@ impl PgCdcClient {
 
     fn build_replication_config(&self) -> anyhow::Result<(Config, SslConfig)> {
         let (sanitized_url, url_ssl_config) = Self::parse_url_ssl_config(&self.url)?;
-        let mut config: Config = Config::from_str(&sanitized_url)?;
+        let mut config: Config =
+            Config::from_str(&sanitized_url).context(DtError::DatabaseInvalidConfig(
+                DbType::Pg,
+                "failed to parse PostgreSQL replication URL".to_string(),
+            ))?;
         config.replication_mode(ReplicationMode::Logical);
 
         let mut effective_ssl_config = url_ssl_config.unwrap_or_else(Self::disabled_ssl_config);
@@ -98,21 +102,35 @@ impl PgCdcClient {
     }
 
     fn build_tls_connector(ssl_config: &SslConfig) -> anyhow::Result<MakeTlsConnector> {
-        let mut builder = SslConnector::builder(SslMethod::tls())?;
+        let mut builder =
+            SslConnector::builder(SslMethod::tls()).context(DtError::DatabaseTlsFailed(
+                DbType::Pg,
+                "failed to create the PostgreSQL TLS connector".to_string(),
+            ))?;
 
         match ssl_config.ssl_mode {
-            SslMode::Disable => unreachable!("disable mode should use NoTls"),
+            SslMode::Disable => {
+                return Err(DtError::InvalidConfig(
+                    "TLS connector requested while PostgreSQL TLS is disabled".to_string(),
+                )
+                .into());
+            }
             SslMode::Require => {
                 builder.set_verify(SslVerifyMode::NONE);
             }
             SslMode::VerifyCa | SslMode::VerifyFull => {
                 if ssl_config.ssl_ca_path.is_empty() {
-                    bail!(
-                        "ssl_ca_path is required when ssl_mode={}",
-                        ssl_config.ssl_mode
-                    );
+                    return Err(DtError::InvalidConfig(
+                        "a CA certificate path is required by the selected TLS mode".to_string(),
+                    )
+                    .into());
                 }
-                builder.set_ca_file(&ssl_config.ssl_ca_path)?;
+                builder.set_ca_file(&ssl_config.ssl_ca_path).context(
+                    DtError::DatabaseTlsFailed(
+                        DbType::Pg,
+                        "failed to load the PostgreSQL CA certificate".to_string(),
+                    ),
+                )?;
                 builder.set_verify(SslVerifyMode::PEER);
             }
         }
@@ -129,7 +147,10 @@ impl PgCdcClient {
     }
 
     fn parse_url_ssl_config(url: &str) -> anyhow::Result<(String, Option<SslConfig>)> {
-        let mut parsed = Url::parse(url)?;
+        let mut parsed = Url::parse(url).context(DtError::DatabaseInvalidConfig(
+            DbType::Pg,
+            "the PostgreSQL CDC URL is invalid".to_string(),
+        ))?;
         let mut ssl_mode = None;
         let mut ssl_ca_path = None;
         let mut other_pairs = vec![];
@@ -166,7 +187,10 @@ impl PgCdcClient {
             "require" | "prefer" => Ok(SslMode::Require),
             "verify-ca" | "verify_ca" => Ok(SslMode::VerifyCa),
             "verify-full" | "verify_full" => Ok(SslMode::VerifyFull),
-            _ => bail!("unsupported postgres sslmode in url: {}", value),
+            _ => Err(DtError::InvalidConfig(
+                "the PostgreSQL CDC URL contains an unsupported TLS mode".to_string(),
+            )
+            .into()),
         }
     }
 
@@ -206,8 +230,8 @@ impl PgCdcClient {
                 log_warn!("start_lsn is empty, will use confirmed_flush_lsn");
                 start_lsn = confirmed_flush_lsn;
             } else {
-                let actual_lsn: PgLsn = confirmed_flush_lsn.parse().unwrap();
-                let input_lsn: PgLsn = start_lsn.parse().unwrap();
+                let actual_lsn: PgLsn = parse_lsn(&confirmed_flush_lsn)?;
+                let input_lsn: PgLsn = parse_lsn(&start_lsn)?;
                 if input_lsn < actual_lsn {
                     log_warn!("start_lsn: {} is order than confirmed_flush_lsn: {}, will use confirmed_flush_lsn", 
                         start_lsn, confirmed_flush_lsn);
@@ -236,14 +260,23 @@ impl PgCdcClient {
 
             let res = client.simple_query(&query).await?;
             // get the lsn for the newly created slot
-            start_lsn = if let Row(row) = &res[0] {
-                row.get("consistent_point").unwrap().to_string()
-            } else {
-                bail! {Error::ExtractorError(format!(
-                    "failed to create replication slot by query: {}",
-                    query
-                ))}
-            };
+            start_lsn = res
+                .iter()
+                .find_map(|message| match message {
+                    Row(row) => row.get("consistent_point").map(str::to_string),
+                    _ => None,
+                })
+                .or_dt_error(DtError::DatabaseStatementFailed(
+                        DbType::Pg,
+                        "the CREATE_REPLICATION_SLOT response is missing consistent_point"
+                            .to_string(),
+                    ))
+                .message(
+                    "PostgreSQL did not return a start position for the new replication slot",
+                )
+                .hint(
+                    "Remove the incomplete replication slot and restart the task. If it repeats, check PostgreSQL replication logs.",
+                )?;
 
             log_info!(
                 "slot created, returned start_sln: {}",
@@ -266,9 +299,13 @@ impl PgCdcClient {
 
         let mut confirmed_flush_lsn = String::new();
         if slot_exists {
-            if let Row(row) = &res[0] {
-                confirmed_flush_lsn = row.get("confirmed_flush_lsn").unwrap().to_string()
-            }
+            confirmed_flush_lsn = res
+                .iter()
+                .find_map(|message| match message {
+                    Row(row) => row.get("confirmed_flush_lsn").map(str::to_string),
+                    _ => None,
+                })
+                .unwrap_or_default();
             log_info!("slot confirmed_flush_lsn: {}", confirmed_flush_lsn);
         }
         Ok((slot_exists, confirmed_flush_lsn))
@@ -299,6 +336,16 @@ impl PgCdcClient {
         let stream = LogicalReplicationStream::new(copy_stream);
         Ok((stream, start_lsn))
     }
+}
+
+fn parse_lsn(value: &str) -> anyhow::Result<PgLsn> {
+    value.parse().map_err(|_| {
+        DtError::DatabaseCheckpointReadFailed(
+            DbType::Pg,
+            "a PostgreSQL replication position is invalid".to_string(),
+        )
+        .into()
+    })
 }
 
 #[cfg(test)]

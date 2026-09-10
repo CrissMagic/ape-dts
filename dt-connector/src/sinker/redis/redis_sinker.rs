@@ -2,26 +2,26 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use async_trait::async_trait;
-use dt_common::utils::limit_queue::LimitedQueue;
-use redis::Connection;
-use redis::ConnectionLike;
-use redis::Value;
+use dt_common::{
+    error::{DtError, DtOptionExt},
+    log_debug,
+    meta::{
+        col_value::ColValue,
+        dt_data::{DtData, DtItem},
+        rdb_meta_manager::RdbMetaManager,
+        redis::{
+            cluster_node::ClusterNode,
+            command::{cmd_encoder::CmdEncoder, key_parser::KeyParser},
+            redis_object::{RedisCmd, RedisObject},
+            redis_write_method::RedisWriteMethod,
+        },
+        row_data::RowData,
+        row_type::RowType,
+    },
+    utils::limit_queue::LimitedQueue,
+};
+use redis::{Connection, ConnectionLike, Value};
 use tokio::{sync::RwLock, time::Instant};
-
-use dt_common::error::Error;
-use dt_common::log_debug;
-use dt_common::meta::col_value::ColValue;
-use dt_common::meta::dt_data::DtData;
-use dt_common::meta::dt_data::DtItem;
-use dt_common::meta::rdb_meta_manager::RdbMetaManager;
-use dt_common::meta::redis::cluster_node::ClusterNode;
-use dt_common::meta::redis::command::cmd_encoder::CmdEncoder;
-use dt_common::meta::redis::command::key_parser::KeyParser;
-use dt_common::meta::redis::redis_object::RedisCmd;
-use dt_common::meta::redis::redis_object::RedisObject;
-use dt_common::meta::redis::redis_write_method::RedisWriteMethod;
-use dt_common::meta::row_data::RowData;
-use dt_common::meta::row_type::RowType;
 
 use super::entry_rewriter::EntryRewriter;
 use crate::{
@@ -160,7 +160,9 @@ impl RedisSinker {
                             let cmd = EntryRewriter::rewrite_as_restore(entry, self.version)?;
                             Ok(vec![cmd])
                         }
-                        _ => bail! {Error::SinkerError("rewrite not implemented".into())},
+                        _ => bail!(DtError::RedisResultError(
+                            "Redis object rewrite is not implemented".to_string()
+                        )),
                     }?;
                     if let Some(expire_cmd) = EntryRewriter::rewrite_expire(entry)? {
                         rewrite_cmds.push(expire_cmd)
@@ -219,15 +221,12 @@ impl RedisSinker {
     }
 
     async fn dml_to_redis_cmd(&mut self, row_data: &RowData) -> anyhow::Result<Option<RedisCmd>> {
-        if self.meta_manager.is_none() {
+        let Some(meta_manager) = self.meta_manager.as_mut() else {
             return Ok(None);
-        }
+        };
 
-        let tb_meta = self
-            .meta_manager
-            .as_mut()
-            .unwrap()
-            .get_tb_meta(&row_data.schema, &row_data.tb)
+        let tb_meta = meta_manager
+            .get_tb_meta(&row_data.db, &row_data.schema, &row_data.tb)
             .await?;
 
         // no single primary / unique key exists, do not sink to redis
@@ -323,10 +322,7 @@ impl RedisSinker {
 
         match result {
             Err(error) => {
-                bail! {Error::SinkerError(format!(
-                    "batch sink failed, error: {:?}",
-                    error
-                ))}
+                bail!(error)
             }
 
             Ok(values) => {
@@ -348,10 +344,10 @@ impl RedisSinker {
 
                     match v {
                         Value::ServerError(e) => {
-                            bail! {Error::SinkerError(format!(
+                            bail!(DtError::RedisResultError(format!(
                                 "sink failed, server error: [{:?}], result: [{:?}], cmd: [{}]",
                                 e, v, cmd
-                            ))}
+                            )))
                         }
                         _ => {
                             log_debug!("sink result: [{:?}], cmd: [{}]", v, cmd)
@@ -373,10 +369,24 @@ impl RedisSinker {
                     // find the hash_tag for the slot which cmd.keys[0] belongs to,
                     // otherwise we may get: (error) CROSSSLOT Keys in request don't hash to the same slot
                     let slot = KeyParser::calc_slot(cmd.keys[0].as_bytes());
-                    node.slot_hash_tag_map.get(&slot).unwrap()
+                    let missing_slot_error = DtError::RedisTopology(
+                        "A required Redis cluster slot has no master owner in the loaded topology"
+                            .to_string(),
+                    );
+                    node.slot_hash_tag_map
+                        .get(&slot)
+                        .or_dt_error(missing_slot_error)?
                 } else {
                     // if the redis cmd has no key, find a hash_tag for any slot in current node
-                    let (_, hash_tag) = node.slot_hash_tag_map.iter().next().unwrap();
+                    let missing_slot_error = DtError::RedisTopology(
+                        "A required Redis cluster slot has no master owner in the loaded topology"
+                            .to_string(),
+                    );
+                    let (_, hash_tag) = node
+                        .slot_hash_tag_map
+                        .iter()
+                        .next()
+                        .or_dt_error(missing_slot_error)?;
                     hash_tag
                 };
                 &format!("{}{{{}}}", data_marker.marker, hash_tag)

@@ -4,14 +4,17 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{mysql::MySqlRow, postgres::PgRow};
+use tiberius::Row as MssqlRow;
 
 use super::{
-    col_value::ColValue, mysql::mysql_tb_meta::MysqlTbMeta, pg::pg_tb_meta::PgTbMeta,
-    rdb_tb_meta::RdbTbMeta, row_type::RowType,
+    col_value::ColValue, mssql::mssql_tb_meta::MssqlTbMeta, mysql::mysql_tb_meta::MysqlTbMeta,
+    pg::pg_tb_meta::PgTbMeta, rdb_tb_meta::RdbTbMeta, row_type::RowType,
 };
 use crate::{
     config::config_enums::DbType,
+    error::{DtError, DtOptionExt, DtResultExt, ErrorObject},
     meta::adaptor::{
+        mssql_col_value_convertor::MssqlColValueConvertor,
         mysql_col_value_convertor::MysqlColValueConvertor,
         pg_col_value_convertor::PgColValueConvertor,
     },
@@ -19,6 +22,10 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RowData {
+    /// Physical database. Empty until database-aware extraction is enabled.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub db: String,
+    /// Existing first-level namespace. MySQL/MongoDB still store database here for compatibility.
     pub schema: String,
     pub tb: String,
     #[serde(skip)]
@@ -40,6 +47,7 @@ impl std::fmt::Display for RowData {
 
 impl RowData {
     pub fn new(
+        db: String,
         schema: String,
         tb: String,
         chunk_id: u64,
@@ -48,6 +56,7 @@ impl RowData {
         after: Option<HashMap<String, ColValue>>,
     ) -> Self {
         let mut me = Self {
+            db,
             schema,
             tb,
             chunk_id,
@@ -62,6 +71,7 @@ impl RowData {
     }
 
     pub fn new_no_origin(
+        db: String,
         schema: String,
         tb: String,
         chunk_id: u64,
@@ -69,7 +79,7 @@ impl RowData {
         before: Option<HashMap<String, ColValue>>,
         after: Option<HashMap<String, ColValue>>,
     ) -> Self {
-        let mut data = Self::new(schema, tb, chunk_id, row_type, before, after);
+        let mut data = Self::new(db, schema, tb, chunk_id, row_type, before, after);
         data.is_not_origin = true;
         data
     }
@@ -82,6 +92,7 @@ impl RowData {
         };
 
         Self {
+            db: self.db.clone(),
             schema: self.schema.clone(),
             tb: self.tb.clone(),
             chunk_id: self.chunk_id,
@@ -95,6 +106,7 @@ impl RowData {
 
     pub fn split_update_row_data(self) -> (RowData, RowData) {
         let delete = RowData::new_no_origin(
+            self.db.clone(),
             self.schema.clone(),
             self.tb.clone(),
             self.chunk_id,
@@ -104,6 +116,7 @@ impl RowData {
         );
 
         let insert = RowData::new_no_origin(
+            self.db,
             self.schema,
             self.tb,
             self.chunk_id,
@@ -119,7 +132,7 @@ impl RowData {
         tb_meta: &MysqlTbMeta,
         ignore_cols: &Option<&HashSet<String>>,
         chunk_id: Option<u64>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::from_mysql_compatible_row(row, tb_meta, ignore_cols, &DbType::Mysql, chunk_id)
     }
 
@@ -129,7 +142,7 @@ impl RowData {
         ignore_cols: &Option<&HashSet<String>>,
         db_type: &DbType,
         chunk_id: Option<u64>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let mut after = HashMap::new();
         for (col, col_type) in &tb_meta.col_type_map {
             if ignore_cols.as_ref().is_some_and(|cols| cols.contains(col)) {
@@ -139,14 +152,19 @@ impl RowData {
                 MysqlColValueConvertor::from_query_mysql_compatible(row, col, col_type, db_type)
                     .with_context(|| {
                         format!(
-                            "schema: {}, tb: {}, col: {}, col_type: {}",
-                            tb_meta.basic.schema, tb_meta.basic.tb, col, col_type
+                            "failed to convert column {}.{}.{}",
+                            tb_meta.basic.schema, tb_meta.basic.tb, col
                         )
                     })
-                    .unwrap();
+                    .object(ErrorObject {
+                        schema: Some(tb_meta.basic.schema.clone()),
+                        table: Some(tb_meta.basic.tb.clone()),
+                        column: Some(col.clone()),
+                        ..Default::default()
+                    })?;
             after.insert(col.to_string(), col_val);
         }
-        Self::build_insert_row_data(after, &tb_meta.basic, chunk_id)
+        Ok(Self::build_insert_row_data(after, &tb_meta.basic, chunk_id))
     }
 
     pub fn from_pg_row(
@@ -154,7 +172,7 @@ impl RowData {
         tb_meta: &PgTbMeta,
         ignore_cols: &Option<&HashSet<String>>,
         chunk_id: Option<u64>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let mut after = HashMap::new();
         for (col, col_type) in &tb_meta.col_type_map {
             if ignore_cols.as_ref().is_some_and(|cols| cols.contains(col)) {
@@ -164,14 +182,50 @@ impl RowData {
             let col_value = PgColValueConvertor::from_query(row, col, col_type)
                 .with_context(|| {
                     format!(
-                        "schema: {}, tb: {}, col: {}, col_type: {}",
-                        tb_meta.basic.schema, tb_meta.basic.tb, col, col_type
+                        "failed to convert column {}.{}.{}",
+                        tb_meta.basic.schema, tb_meta.basic.tb, col
                     )
                 })
-                .unwrap();
+                .object(ErrorObject {
+                    schema: Some(tb_meta.basic.schema.clone()),
+                    table: Some(tb_meta.basic.tb.clone()),
+                    column: Some(col.clone()),
+                    ..Default::default()
+                })?;
             after.insert(col.to_string(), col_value);
         }
-        Self::build_insert_row_data(after, &tb_meta.basic, chunk_id)
+        Ok(Self::build_insert_row_data(after, &tb_meta.basic, chunk_id))
+    }
+
+    pub fn from_mssql_row(
+        row: &MssqlRow,
+        tb_meta: &MssqlTbMeta,
+        ignore_cols: &Option<&HashSet<String>>,
+        chunk_id: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        let mut after = HashMap::new();
+        for col in &tb_meta.basic.cols {
+            if ignore_cols.as_ref().is_some_and(|cols| cols.contains(col)) {
+                continue;
+            }
+
+            let col_value =
+                MssqlColValueConvertor::from_query(row, col, tb_meta.get_col_type(col)?)
+                    .with_context(|| {
+                        format!(
+                            "failed to convert column {}.{}.{}",
+                            tb_meta.basic.schema, tb_meta.basic.tb, col
+                        )
+                    })
+                    .object(ErrorObject {
+                        schema: Some(tb_meta.basic.schema.clone()),
+                        table: Some(tb_meta.basic.tb.clone()),
+                        column: Some(col.clone()),
+                        ..Default::default()
+                    })?;
+            after.insert(col.clone(), col_value);
+        }
+        Ok(Self::build_insert_row_data(after, &tb_meta.basic, chunk_id))
     }
 
     pub fn build_insert_row_data(
@@ -180,6 +234,7 @@ impl RowData {
         chunk_id: Option<u64>,
     ) -> Self {
         Self::new(
+            tb_meta.db.clone(),
             tb_meta.schema.clone(),
             tb_meta.tb.clone(),
             chunk_id.unwrap_or(0),
@@ -199,39 +254,39 @@ impl RowData {
     }
 
     pub fn require_after(&self) -> anyhow::Result<&HashMap<String, ColValue>> {
-        self.after.as_ref().with_context(|| {
-            format!(
+        self.after
+            .as_ref()
+            .or_dt_error(DtError::InvariantViolated(format!(
                 "row_data after is missing, schema: {}, tb: {}",
                 self.schema, self.tb
-            )
-        })
+            )))
     }
 
     pub fn require_before(&self) -> anyhow::Result<&HashMap<String, ColValue>> {
-        self.before.as_ref().with_context(|| {
-            format!(
+        self.before
+            .as_ref()
+            .or_dt_error(DtError::InvariantViolated(format!(
                 "row_data before is missing, schema: {}, tb: {}",
                 self.schema, self.tb
-            )
-        })
+            )))
     }
 
     pub fn require_after_mut(&mut self) -> anyhow::Result<&mut HashMap<String, ColValue>> {
-        self.after.as_mut().with_context(|| {
-            format!(
+        self.after
+            .as_mut()
+            .or_dt_error(DtError::InvariantViolated(format!(
                 "row_data after is missing, schema: {}, tb: {}",
                 self.schema, self.tb
-            )
-        })
+            )))
     }
 
     pub fn require_before_mut(&mut self) -> anyhow::Result<&mut HashMap<String, ColValue>> {
-        self.before.as_mut().with_context(|| {
-            format!(
+        self.before
+            .as_mut()
+            .or_dt_error(DtError::InvariantViolated(format!(
                 "row_data before is missing, schema: {}, tb: {}",
                 self.schema, self.tb
-            )
-        })
+            )))
     }
 
     fn convert_raw_string_col_values(col_values: &mut HashMap<String, ColValue>) {
@@ -329,6 +384,7 @@ mod tests {
     #[test]
     fn test_convert_raw_string_prefers_utf8() {
         let mut row_data = RowData::new(
+            String::new(),
             "db".to_string(),
             "tb".to_string(),
             0,
@@ -345,6 +401,51 @@ mod tests {
         assert_eq!(
             row_data.require_after().unwrap().get("c1"),
             Some(&ColValue::String("ij".to_string()))
+        );
+    }
+
+    #[test]
+    fn legacy_json_defaults_db_to_empty() {
+        let row_data: RowData = serde_json::from_str(
+            r#"{"schema":"s1","tb":"t1","row_type":"Insert","before":null,"after":null,"data_size":0,"is_not_origin":false}"#,
+        )
+        .unwrap();
+
+        assert!(row_data.db.is_empty());
+        assert!(serde_json::to_value(&row_data).unwrap().get("db").is_none());
+
+        let mut row_data_with_db = row_data;
+        row_data_with_db.db = "db1".to_string();
+        assert_eq!(serde_json::to_value(row_data_with_db).unwrap()["db"], "db1");
+    }
+
+    #[test]
+    fn split_update_preserves_three_part_table_identity() {
+        let row_data = RowData::new(
+            "db1".to_string(),
+            "s1".to_string(),
+            "t1".to_string(),
+            0,
+            RowType::Update,
+            Some(HashMap::new()),
+            Some(HashMap::new()),
+        );
+        let (delete, insert) = row_data.split_update_row_data();
+        assert_eq!(
+            (
+                delete.db.as_str(),
+                delete.schema.as_str(),
+                delete.tb.as_str()
+            ),
+            ("db1", "s1", "t1")
+        );
+        assert_eq!(
+            (
+                insert.db.as_str(),
+                insert.schema.as_str(),
+                insert.tb.as_str()
+            ),
+            ("db1", "s1", "t1")
         );
     }
 }

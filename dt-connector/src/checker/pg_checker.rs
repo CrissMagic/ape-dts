@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
-use sqlx::{Pool, Postgres};
-
 use dt_common::meta::{
     ddl_meta::ddl_data::DdlData, pg::pg_meta_manager::PgMetaManager, row_data::RowData,
 };
+use futures::TryStreamExt;
+use sqlx::{Pool, Postgres};
 
 use crate::checker::base_checker::{Checker, CheckerTbMeta, CHECKER_MAX_QUERY_BATCH};
 use crate::rdb_query_builder::RdbQueryBuilder;
@@ -46,7 +45,7 @@ impl Checker for PgChecker {
             let query = qb.create_pg_query(&query_info)?;
             let mut rows = query.fetch(&self.conn_pool);
             while let Some(row) = rows.try_next().await? {
-                res.push(RowData::from_pg_row(&row, pg_meta, &None, None));
+                res.push(RowData::from_pg_row(&row, pg_meta, &None, None)?);
             }
         }
 
@@ -60,7 +59,12 @@ impl Checker for PgChecker {
         Ok(())
     }
 
-    async fn invalidate_meta_cache(&mut self, schema: &str, tb: &str) -> anyhow::Result<()> {
+    async fn invalidate_meta_cache(
+        &mut self,
+        _db: &str,
+        schema: &str,
+        tb: &str,
+    ) -> anyhow::Result<()> {
         self.meta_manager.invalidate_cache_for_table(schema, tb);
         Ok(())
     }

@@ -20,6 +20,7 @@ APE DTS 支持两类 Kafka 输出：RDB 数据编码后写入 Kafka，以及 Kaf
 - `offset` 必须为 `-1`，`ack_interval_secs` 必须显式配置为大于 `0`，并且不能配置 `[resumer]`。
 - `[sinker].required_acks` 只允许 `one` 或 `all`，默认 `one`；`none` 和其他值会在加载配置时失败。生产环境需要当前所有 ISR 副本确认时使用 `all`。
 - topic 名只支持字母、数字、`.`、`_`、`-`；空 target、重复 source/target、空白或其他分隔符都会配置失败。
+- 如果 extractor 和 sinker 使用规范化后相同的 Kafka bootstrap server 集合，target 列表不能包含 `[extractor].topic`，否则配置加载会拒绝该自循环。静态校验无法识别同一集群的不同主机别名。
 
 ### 位点与失败处理
 

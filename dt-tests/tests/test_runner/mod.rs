@@ -4,6 +4,8 @@ pub mod check_util;
 pub mod mock_data;
 pub mod mongo_check_test_runner;
 pub mod mongo_test_runner;
+mod mssql_ddl_scanner;
+pub mod mssql_test_endpoint;
 pub mod precheck_test_runner;
 pub mod rdb_clickhouse_test_runner;
 pub mod rdb_cycle_test_runner;

@@ -2,6 +2,17 @@ use std::sync::{atomic::Ordering, Arc};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use dt_common::{
+    config::{
+        config_enums::{DbType, ExtractType},
+        connection_auth_config::ConnectionAuthConfig,
+    },
+    error::DtError,
+    log_info, log_warn,
+    meta::{position::Position, redis::cluster_node::ClusterNode, syncer::Syncer},
+    rdb_filter::RdbFilter,
+    utils::redis_util::RedisUtil,
+};
 use tokio::{sync::Mutex, task::JoinSet};
 use url::Url;
 
@@ -16,14 +27,6 @@ use crate::{
         resumer::recovery::Recovery,
     },
     Extractor,
-};
-use dt_common::{
-    config::{config_enums::ExtractType, connection_auth_config::ConnectionAuthConfig},
-    error::Error,
-    log_info, log_warn,
-    meta::{position::Position, redis::cluster_node::ClusterNode, syncer::Syncer},
-    rdb_filter::RdbFilter,
-    utils::redis_util::RedisUtil,
 };
 
 pub struct RedisClusterPsyncExtractor {
@@ -66,9 +69,7 @@ impl Extractor for RedisClusterPsyncExtractor {
                 }
                 Err(err) => {
                     self.base_extractor.shut_down.store(true, Ordering::Release);
-                    bail!(Error::ExtractorError(format!(
-                        "redis cluster psync task failed: {err}"
-                    )));
+                    return Err(err.into());
                 }
             }
         }
@@ -88,8 +89,8 @@ impl RedisClusterPsyncExtractor {
         let mut conn = RedisUtil::create_redis_conn(&self.url, &self.connection_auth).await?;
         let nodes = RedisUtil::get_cluster_master_nodes(&mut conn)?;
         if nodes.is_empty() {
-            bail!(Error::MetadataError(
-                "source redis cluster has no master nodes".into()
+            bail!(DtError::RedisPrerequisiteNotMet(
+                "source Redis cluster has no master nodes".to_string()
             ));
         }
         Ok(nodes)
@@ -239,15 +240,25 @@ impl RedisClusterPsyncExtractor {
     }
 
     fn node_url(base_url: &str, node: &ClusterNode) -> anyhow::Result<String> {
-        let mut url = Url::parse(base_url)?;
+        let mut url = Url::parse(base_url).context(DtError::DatabaseInvalidConfig(
+            DbType::Redis,
+            "invalid source Redis URL".to_string(),
+        ))?;
         url.set_host(Some(&node.host)).map_err(|_| {
-            Error::ConfigError(format!("invalid redis cluster node host: {}", node.host))
+            DtError::DatabaseInvalidConfig(
+                DbType::Redis,
+                format!("invalid Redis cluster node host: {}", node.host),
+            )
         })?;
-        url.set_port(Some(node.port.parse().with_context(|| {
-            format!("invalid redis cluster node port: {}", node.port)
-        })?))
-        .map_err(|_| {
-            Error::ConfigError(format!("invalid redis cluster node port: {}", node.port))
+        let port = node.port.parse().context(DtError::DatabaseInvalidConfig(
+            DbType::Redis,
+            format!("invalid Redis cluster node port: {}", node.port),
+        ))?;
+        url.set_port(Some(port)).map_err(|_| {
+            DtError::DatabaseInvalidConfig(
+                DbType::Redis,
+                format!("invalid Redis cluster node port: {}", node.port),
+            )
         })?;
         Ok(url.to_string())
     }
@@ -258,9 +269,9 @@ mod tests {
     use std::collections::HashMap;
 
     use dt_common::meta::position::Position;
+    use dt_common::meta::redis::cluster_node::ClusterNode;
 
     use super::RedisClusterPsyncExtractor;
-    use dt_common::meta::redis::cluster_node::ClusterNode;
 
     fn node(id: &str, address: &str) -> ClusterNode {
         let (host, port) = address.split_once(':').unwrap();

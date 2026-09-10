@@ -1,20 +1,21 @@
 # [English](README.md) | 中文
 
-# 简介
+# ApeDTS
 
-- ape-dts 是一款旨在实现 any-to-any 的数据迁移工具，并具有数据订阅和数据加工能力。
-- 简单、轻量、高效，不依赖第三方组件和额外存储。
-- 面向云原生无状态组件场景设计
-- 使用 Rust。
+**一个约 17 MB 的生产级 Rust 程序，覆盖多引擎全量迁移、CDC 与数据校验。**
+
+ApeDTS 是一款轻量、独立运行的数据迁移与 CDC 引擎，面向数据库、消息队列和分析引擎，
+提供全量迁移、增量同步、数据校验、订正与流式加工能力。面向云原生无状态部署。
 
 ## 主要特性
 
-- 支持多种数据库间的同构、异构数据迁移和同步。
-- 支持全量、增量任务的断点续传。
-- 支持数据校验、订正。
-- 支持库、表、列级别的过滤和路由。
-- 针对不同源、目标、任务类型，实现不同的并发算法，提高性能。
-- 可加载用户 lua 脚本，编辑正在迁移/同步的数据。
+- **轻量设计** — 以单进程独立运行，无需外部运行时组件或中间存储。
+- **成熟的多引擎覆盖** — 当前已验证的同构和异构链路覆盖 MySQL、PostgreSQL、MongoDB、
+  Redis、Kafka、TiDB、StarRocks、ClickHouse 和 Doris。
+- **生产级可靠性** — 全量与 CDC 任务均支持断点续传，并提供 Prometheus 兼容指标和任务级可观测性。
+- **按链路选择并行策略** — 针对不同源、目标和任务类型采用专用并行算法，提高吞吐。
+- **丰富的高级能力** — 在已支持的链路上提供数据校验、订正和复查，库、表、列级过滤与路由，
+  以及基于轻量级 Lua 脚本的流式数据加工。
 
 ## 支持任务类型
 
@@ -25,31 +26,7 @@
 | 全量迁移           | &#10004;       | &#10004; | &#10004;       | &#10004;       | &#10004;       | &#10004;    | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
 | 增量同步           | &#10004;       | &#10004; | &#10004;       | &#10004;       | &#10004;       | &#10004;    | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
 | 数据校验/订正/复查 | &#10004;       | &#10004; | &#10004;       |                |                |             |                    |                     | &#10004;      |                 |                  |                |             |
-| 库表结构迁移       | &#10004;       | &#10004; |                |                |                |             | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
-
-# 高级选项
-
-## Crate features
-
-dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启用：
-
-- `metrics`: 启用 Prometheus 格式的任务指标 HTTP 服务接口。
-  指标名称、单位和语义请参阅 [Task metrics 指标说明](./docs/zh/monitor/task_metrics.md)。
-  启用此功能后，您可以通过以下配置自定义指标服务：
-
-  ```
-  [metrics]
-  # http服务host
-  http_host=127.0.0.1
-  # http服务port
-  http_port=9090
-  # http服务工作节点数量
-  workers=2
-  # prometheus指标静态标签
-  labels=your_label1:your_value1,your_label2:your_value2
-  ```
-
-- TBD
+| 库表结构迁移       | &#10004;       | &#10004; | &#10004;       |                |                |             | &#10004;           | &#10004;            | &#10004;      | &#10004;        | &#10004;         | &#10004;       | &#10004;    |
 
 ## 配置来源与启动参数
 
@@ -63,14 +40,12 @@ dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启�
 - `--nacos-dataid`：当来源为 `nacos` 时必需，对应 Nacos 配置的 `dataId`
 - `--nacos-group`：当来源为 `nacos` 时可选，默认 `DEFAULT_GROUP`
 
-Nacos 配置过滤与缓存：
+Nacos 配置过滤与失败处理：
 
-- 仅加载任务配置会使用的段：`global`, `extractor`, `sinker`, `pipeline`, `parallelizer`, `runtime`, `filter`, `router`, `resumer`, `data_marker`, `processor`, `checker`, `metacenter`, `metrics`, `precheck`
-- 默认缓存目录：`.nacos_cache`，可通过环境变量 `NACOS_CACHE_DIR` 覆盖
-- 默认缓存 TTL：`300` 秒，可通过环境变量 `NACOS_CACHE_TTL_SECS` 覆盖
+- 仅接受任务配置会使用的段：`global`, `extractor`, `sinker`, `pipeline`, `parallelizer`, `runtime`, `filter`, `router`, `resumer`, `data_marker`, `processor`, `checker`, `checker_cdc`, `checker_output`, `metacenter`, `metrics`, `precheck`, `tracing`
 - 默认 Nacos 请求超时：`10` 秒，可通过环境变量 `NACOS_REQUEST_TIMEOUT_SECS` 覆盖
-- 拉取失败，或拉取到的内容无法解析为有效任务配置时，如果本地存在缓存，会降级使用缓存；即使缓存已过期也会使用，并输出警告
-- 拉取失败且没有可用缓存时，任务启动失败
+- 设置 `NACOS_REQUEST_TIMEOUT_SECS` 时必须使用正整数；无效值会导致启动失败
+- 拉取失败、HTTP 非成功响应、未知 section、INI 解析失败或任务配置校验失败都会报错并立即终止启动，不使用本地缓存或过期缓存兜底
 
 使用示例：
 
@@ -126,6 +101,8 @@ Nacos 配置过滤与缓存：
 
 - 配置
   - [配置详解](./docs/zh/config.md)
+- 错误处理
+  - [错误码](./docs/zh/error_codes.md)
 - 库表结构任务
   - [结构迁移](./docs/zh/structure/migration.md)
   - [结构校验](./docs/zh/structure/check.md)
@@ -183,12 +160,6 @@ Nacos 配置过滤与缓存：
 | ape_dts  | 4c8g     | 26287                 | 18.2% / 5.2%              | 685% / 6.5%                 |
 | debezium | 4c8g     | 2951                  | 20.4% / 5.2%              | 98% / 6.5%                  |
 
-- 镜像对比
-
-| ape_dts:2.0.14 | debezium/connect:2.7 |
-| :------------- | :------------------- |
-| 86.4 MB        | 1.38 GB              |
-
 - 更多 benchmark [细节](./docs/zh/benchmark.md)
 
 # 开发
@@ -208,6 +179,26 @@ Nacos 配置过滤与缓存：
 - dt-common：通用基础模块，基础数据结构，元数据管理
 - dt-tests：集成测试
 - 关联子模块：[mysql binlog connector](https://github.com/apecloud/mysql-binlog-connector-rust)
+
+## Crate features
+
+dt-main crate 提供了几个可选组件，可以通过 `Cargo [features]` 启用：
+
+- `metrics`: 启用 Prometheus 格式的任务指标 HTTP 服务接口。
+  指标名称、单位和语义请参阅 [Task metrics 指标说明](./docs/zh/monitor/task_metrics.md)。
+  启用此功能后，您可以通过以下配置自定义指标服务：
+
+  ```
+  [metrics]
+  # http服务host
+  http_host=127.0.0.1
+  # http服务port
+  http_port=9090
+  # http服务工作节点数量
+  workers=2
+  # prometheus指标静态标签
+  labels=your_label1:your_value1,your_label2:your_value2
+  ```
 
 ## 编译
 

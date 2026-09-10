@@ -2,6 +2,13 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use dt_common::{
+    log_info, log_warn,
+    meta::{
+        avro::avro_converter::AvroConverter, dt_data::DtData, kafka::kafka_message::KafkaMessage,
+        position::Position, syncer::Syncer,
+    },
+};
 use rdkafka::{
     consumer::{CommitMode, Consumer, StreamConsumer},
     message::Headers,
@@ -18,13 +25,6 @@ use crate::{
         resumer::recovery::Recovery,
     },
     Extractor,
-};
-use dt_common::{
-    log_info, log_warn,
-    meta::{
-        avro::avro_converter::AvroConverter, dt_data::DtData, kafka::kafka_message::KafkaMessage,
-        position::Position, syncer::Syncer,
-    },
 };
 
 pub struct KafkaExtractor {
@@ -104,10 +104,7 @@ impl Extractor for KafkaExtractor {
 impl KafkaExtractor {
     async fn extract_avro(&mut self, consumer: &StreamConsumer) -> anyhow::Result<()> {
         loop {
-            let msg = consumer
-                .recv()
-                .await
-                .with_context(|| format!("KafkaCdcExtractor failed, topic: {}", self.topic))?;
+            let msg = consumer.recv().await?;
             if let Some(payload) = msg.payload() {
                 let dt_data = self
                     .avro_converter

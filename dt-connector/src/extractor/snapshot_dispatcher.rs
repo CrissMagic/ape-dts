@@ -1,9 +1,7 @@
 use std::{collections::VecDeque, future::Future, sync::Arc};
 
-use anyhow::{anyhow, bail};
+use dt_common::{error::DtError, monitor::task_monitor_handle::TaskMonitorHandle, runtime_trace};
 use tokio::task::JoinSet;
-
-use dt_common::{monitor::task_monitor_handle::TaskMonitorHandle, runtime_trace};
 
 use super::{
     base_extractor::ExtractState,
@@ -53,7 +51,10 @@ impl SnapshotDispatcher {
         OnDoneFut: Future<Output = anyhow::Result<State>>,
     {
         if parallel_size < 1 {
-            bail!("parallel_size must be greater than 0");
+            return Err(DtError::InvalidConfig(
+                "snapshot parallel size must be greater than zero".to_string(),
+            )
+            .into());
         }
         let run = Arc::new(run);
         let mut join_set = JoinSet::new();
@@ -71,7 +72,7 @@ impl SnapshotDispatcher {
         }
 
         while let Some(result) = join_set.join_next().await {
-            let result = result.map_err(|e| anyhow!("{} join error: {}", worker_name, e))??;
+            let result = result??;
             state = on_done(state, result).await?;
 
             while join_set.len() < parallel_size {
@@ -139,10 +140,11 @@ impl SnapshotDispatcher {
 
     pub async fn fork_table_extract_state(
         extract_state: &ExtractState,
+        db: &str,
         schema: &str,
         tb: &str,
     ) -> (ExtractState, TableMonitorGuard) {
-        let task_id = TaskMonitorHandle::task_id_from_schema_tb(schema, tb);
+        let task_id = TaskMonitorHandle::task_id_from_db_schema_tb(db, schema, tb);
         let monitor_handle = extract_state.monitor.monitor.clone();
         let monitor = monitor_handle.build_monitor("extractor", &task_id);
         monitor_handle.register_monitor(&task_id, monitor);

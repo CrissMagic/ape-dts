@@ -4,19 +4,18 @@ use dt_common::meta::col_value::ColValue;
 use dt_common::utils::redis_util::RedisUtil;
 use dt_common::{
     config::{sinker_config::SinkerConfig, task_config::TaskConfig},
-    error::Error,
+    error::{DtError, DtErrorContextExt, Stage},
     utils::time_util::TimeUtil,
 };
 use dt_task::task_util::TaskUtil;
 use redis::{Connection, Value};
 use sqlx::{MySql, Pool};
 
-use crate::test_runner::rdb_util::RdbUtil;
-
 use super::{
     base_test_runner::BaseTestRunner, rdb_test_runner::RdbTestRunner,
     redis_test_util::RedisTestUtil,
 };
+use crate::test_runner::rdb_util::{DbSchemaTb, RdbUtil};
 
 pub struct RdbRedisTestRunner {
     pub base: BaseTestRunner,
@@ -50,7 +49,8 @@ impl RdbRedisTestRunner {
                 .await
                 .unwrap(),
             _ => {
-                bail! {Error::ConfigError("unsupported sinker config".into())};
+                bail! {DtError::InvalidConfig("unsupported sinker config".to_string())
+                .stage(Stage::Bootstrap)};
             }
         };
         let redis_util = RedisTestUtil::new_default();
@@ -144,13 +144,13 @@ impl RdbRedisTestRunner {
         Ok(())
     }
 
-    pub async fn compare_data_for_tbs(&mut self, db_tbs: &Vec<(String, String)>) {
+    pub async fn compare_data_for_tbs(&mut self, db_tbs: &[DbSchemaTb]) {
         for db_tb in db_tbs {
             assert!(self.compare_tb_data(db_tb).await.unwrap())
         }
     }
 
-    async fn compare_tb_data(&mut self, db_tb: &(String, String)) -> anyhow::Result<bool> {
+    async fn compare_tb_data(&mut self, db_tb: &DbSchemaTb) -> anyhow::Result<bool> {
         if let Some(conn_pool) = &self.mysql_conn_pool {
             // mysql data
             let tb_meta = RdbUtil::get_tb_meta_mysql(conn_pool, db_tb).await?;
@@ -168,7 +168,7 @@ impl RdbRedisTestRunner {
                 };
 
                 // redis data
-                let redis_k = format!("{}.{}.{}", db_tb.0, db_tb.1, key);
+                let redis_k = format!("{}.{}.{}", db_tb.1, db_tb.2, key);
                 let redis_kvs = self
                     .redis_util
                     .get_hash_entry(&mut self.redis_conn, &redis_k);
@@ -181,7 +181,7 @@ impl RdbRedisTestRunner {
                         let redis_v_str = String::from_utf8(v.clone()).unwrap();
                         let expected = Self::redis_expected_value(db_v).unwrap_or_default();
                         if redis_v_str != expected {
-                            println!("compare db: {}, tb: {}, col: {}", db_tb.0, db_tb.1, col);
+                            println!("compare db: {}, tb: {}, col: {}", db_tb.1, db_tb.2, col);
                         }
                         assert_eq!(redis_v_str, expected)
                     }

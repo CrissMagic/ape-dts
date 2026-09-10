@@ -3,15 +3,14 @@ use std::io::Cursor;
 use anyhow::bail;
 use byteorder::{LittleEndian, ReadBytesExt};
 use chrono::{TimeZone, Utc};
-use sqlx::{mysql::MySqlRow, types::BigDecimal, Row};
-
 use mysql_binlog_connector_rust::column::{
     column_value::ColumnValue, json::json_binary::JsonBinary,
 };
+use sqlx::{mysql::MySqlRow, types::BigDecimal, Row};
 
 use crate::{
     config::config_enums::DbType,
-    error::Error,
+    error::DtError,
     meta::{
         col_value::ColValue, mysql::mysql_col_type::MysqlColType, time::dt_utc_time::DtNaiveTime,
     },
@@ -366,7 +365,7 @@ impl MysqlColValueConvertor {
                 | MysqlColType::Blob
                 | MysqlColType::LongBlob => ColValue::Blob(hex::decode(value_str)?),
                 MysqlColType::Unknown => {
-                    bail! {Error::Unexpected(format!(
+                    bail! {DtError::UnsupportedTableStructure(format!(
                         "unsupported column type: {:?}",
                         col_type
                     )) }

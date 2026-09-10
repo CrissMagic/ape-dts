@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::bail;
 
-use crate::error::Error;
-
 use super::{
-    ddl_meta::ddl_data::DdlData, mysql::mysql_meta_manager::MysqlMetaManager,
-    pg::pg_meta_manager::PgMetaManager, rdb_tb_meta::RdbTbMeta,
+    ddl_meta::ddl_data::DdlData, mssql::mssql_meta_manager::MssqlMetaManager,
+    mysql::mysql_meta_manager::MysqlMetaManager, pg::pg_meta_manager::PgMetaManager,
+    rdb_tb_meta::RdbTbMeta,
 };
+use crate::error::DtError;
 
 pub const RDB_PRIMARY_KEY_FLAG: &str = "primary";
 
@@ -15,6 +15,7 @@ pub const RDB_PRIMARY_KEY_FLAG: &str = "primary";
 pub struct RdbMetaManager {
     pub mysql_meta_manager: Option<MysqlMetaManager>,
     pub pg_meta_manager: Option<PgMetaManager>,
+    pub mssql_meta_manager: Option<MssqlMetaManager>,
 }
 
 impl RdbMetaManager {
@@ -22,6 +23,7 @@ impl RdbMetaManager {
         Self {
             mysql_meta_manager: Some(mysql_meta_manager),
             pg_meta_manager: Option::None,
+            mssql_meta_manager: Option::None,
         }
     }
 
@@ -29,6 +31,15 @@ impl RdbMetaManager {
         Self {
             mysql_meta_manager: Option::None,
             pg_meta_manager: Some(pg_meta_manager),
+            mssql_meta_manager: Option::None,
+        }
+    }
+
+    pub fn from_mssql(mssql_meta_manager: MssqlMetaManager) -> Self {
+        Self {
+            mysql_meta_manager: Option::None,
+            pg_meta_manager: Option::None,
+            mssql_meta_manager: Some(mssql_meta_manager),
         }
     }
 
@@ -39,11 +50,15 @@ impl RdbMetaManager {
         if let Some(pg_meta_manager) = &self.pg_meta_manager {
             pg_meta_manager.close().await?;
         }
+        if let Some(mssql_meta_manager) = &self.mssql_meta_manager {
+            mssql_meta_manager.close().await?;
+        }
         Ok(())
     }
 
     pub async fn get_tb_meta<'a>(
         &'a mut self,
+        db: &str,
         schema: &str,
         tb: &str,
     ) -> anyhow::Result<&'a RdbTbMeta> {
@@ -57,9 +72,13 @@ impl RdbMetaManager {
             return Ok(&tb_meta.basic);
         }
 
-        bail! {Error::Unexpected(
-            "no available meta_manager in partitioner".into(),
-        )}
+        if let Some(mssql_meta_manager) = self.mssql_meta_manager.as_mut() {
+            let tb_meta = mssql_meta_manager.get_tb_meta(db, schema, tb).await?;
+            return Ok(&tb_meta.basic);
+        }
+
+        bail! {DtError::InvariantViolated("no available meta_manager in partitioner".to_string())
+        }
     }
 
     pub fn invalidate_cache_by_ddl_data(&mut self, ddl_data: &DdlData) {
@@ -69,23 +88,32 @@ impl RdbMetaManager {
         if let Some(pg_meta_manager) = &mut self.pg_meta_manager {
             pg_meta_manager.invalidate_cache_by_ddl_data(ddl_data);
         }
+        if let Some(mssql_meta_manager) = &mut self.mssql_meta_manager {
+            mssql_meta_manager.invalidate_cache_by_ddl_data(ddl_data);
+        }
     }
 
-    pub fn invalidate_cache(&mut self, schema: &str, tb: &str) {
+    pub fn invalidate_cache(&mut self, db: &str, schema: &str, tb: &str) {
         if let Some(mysql_meta_manager) = &mut self.mysql_meta_manager {
             mysql_meta_manager.invalidate_cache(schema, tb);
         }
         if let Some(pg_meta_manager) = &mut self.pg_meta_manager {
             pg_meta_manager.invalidate_cache(schema, tb);
         }
+        if let Some(mssql_meta_manager) = &mut self.mssql_meta_manager {
+            mssql_meta_manager.invalidate_cache(db, schema, tb);
+        }
     }
 
-    pub fn invalidate_cache_for_table(&mut self, schema: &str, tb: &str) {
+    pub fn invalidate_cache_for_table(&mut self, db: &str, schema: &str, tb: &str) {
         if let Some(mysql_meta_manager) = &mut self.mysql_meta_manager {
             mysql_meta_manager.invalidate_cache_for_table(schema, tb);
         }
         if let Some(pg_meta_manager) = &mut self.pg_meta_manager {
             pg_meta_manager.invalidate_cache_for_table(schema, tb);
+        }
+        if let Some(mssql_meta_manager) = &mut self.mssql_meta_manager {
+            mssql_meta_manager.invalidate_cache_for_table(db, schema, tb);
         }
     }
 

@@ -79,7 +79,7 @@ impl BinlogUtil {
         let sql = "SHOW BINARY LOGS";
 
         let mut rows = sqlx::raw_sql(sql).fetch(conn_pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        while let Some(row) = rows.try_next().await? {
             let log_name = SqlUtil::try_get_mysql_string(&row, 0)?;
             binlogs.push(log_name)
         }

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use async_trait::async_trait;
-
 use dt_common::log_info;
 use dt_common::meta::{
     col_value::ColValue,
@@ -11,7 +10,6 @@ use dt_common::meta::{
     row_data::RowData,
     row_type::RowType,
 };
-
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, Document},
     Client,
@@ -96,6 +94,7 @@ impl BatchCheckExtractor for MongoCheckExtractor {
             after.insert(MongoConstants::ID.to_string(), ColValue::String(id));
             after.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
             let mut row_data = RowData::new(
+                String::new(),
                 schema.clone(),
                 tb.clone(),
                 0,

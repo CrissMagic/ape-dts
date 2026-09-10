@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use dt_common::log_info;
 use dt_common::meta::{
@@ -11,7 +13,6 @@ use dt_common::meta::{
 use dt_common::rdb_filter::RdbFilter;
 use futures::TryStreamExt;
 use sqlx::{MySql, Pool};
-use std::collections::HashMap;
 
 use crate::{
     checker::check_log::CheckLog,
@@ -74,7 +75,7 @@ impl BatchCheckExtractor for MysqlCheckExtractor {
 
         let mut rows = query.fetch(&self.conn_pool);
         while let Some(row) = rows.try_next().await? {
-            let mut row_data = RowData::from_mysql_row(&row, tb_meta, &ignore_cols, None);
+            let mut row_data = RowData::from_mysql_row(&row, tb_meta, &ignore_cols, None)?;
 
             if is_diff && self.replay_diff_as_update {
                 row_data.row_type = RowType::Update;

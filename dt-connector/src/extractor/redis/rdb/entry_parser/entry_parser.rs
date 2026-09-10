@@ -1,12 +1,15 @@
-use dt_common::meta::redis::redis_object::{RedisObject, RedisString};
-
-use crate::extractor::redis::rdb::reader::rdb_reader::RdbReader;
+use anyhow::bail;
+use dt_common::{
+    error::DtError,
+    meta::redis::redis_object::{RedisObject, RedisString},
+};
 
 use super::{
     hash_parser::HashParser, list_parser::ListParser, module2_parser::ModuleParser,
     set_parser::SetParser, stream_parser::StreamParser, string_parser::StringParser,
     zset_parser::ZsetParser,
 };
+use crate::extractor::redis::rdb::reader::rdb_reader::RdbReader;
 
 pub struct EntryParser {}
 
@@ -52,7 +55,8 @@ impl EntryParser {
 
             super::RDB_TYPE_STREAM_LISTPACKS
             | super::RDB_TYPE_STREAM_LISTPACKS_2
-            | super::RDB_TYPE_STREAM_LISTPACKS_3 => {
+            | super::RDB_TYPE_STREAM_LISTPACKS_3
+            | super::RDB_TYPE_STREAM_LISTPACKS_4 => {
                 RedisObject::Stream(StreamParser::load_from_buffer(reader, key, type_byte).await?)
             }
 
@@ -61,12 +65,13 @@ impl EntryParser {
             }
 
             _ => {
-                log::error!(
-                    "unknown type byte: {}, key: {}",
-                    type_byte,
-                    String::from(key)
-                );
-                RedisObject::Unknown
+                // The length of an entry can only be determined by parsing it, so an unknown
+                // type byte leaves the reader desynchronized. Continuing would silently yield
+                // corrupted data for every following entry, so abort the task instead.
+                bail! {DtError::redis_rdb(format!(
+                    "unsupported RDB type byte: {}, key: {}",
+                    type_byte, key
+                ))}
             }
         };
 

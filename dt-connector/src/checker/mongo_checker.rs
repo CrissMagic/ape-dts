@@ -3,6 +3,17 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use dt_common::{
+    error::{DtError, DtErrorContextExt, ErrorObject, Stage},
+    meta::{
+        col_value::ColValue,
+        mongo::{mongo_constant::MongoConstants, mongo_key::MongoKey},
+        rdb_tb_meta::RdbTbMeta,
+        row_data::RowData,
+        row_type::RowType,
+    },
+};
+use dt_common::{log_error, log_warn};
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, Document},
     Client,
@@ -10,14 +21,6 @@ use mongodb::{
 use serde_json::Value as JsonValue;
 
 use crate::checker::base_checker::{Checker, CheckerTbMeta, CHECKER_MAX_QUERY_BATCH};
-use dt_common::meta::{
-    col_value::ColValue,
-    mongo::{mongo_constant::MongoConstants, mongo_key::MongoKey},
-    rdb_tb_meta::RdbTbMeta,
-    row_data::RowData,
-    row_type::RowType,
-};
-use dt_common::{log_error, log_warn};
 
 pub struct MongoChecker {
     mongo_client: Client,
@@ -29,7 +32,7 @@ impl Checker for MongoChecker {
         &mut self,
         lookup_row: &RowData,
     ) -> anyhow::Result<Arc<CheckerTbMeta>> {
-        let mut meta = Self::mock_tb_meta(&lookup_row.schema, &lookup_row.tb);
+        let mut meta = Self::mock_tb_meta(&lookup_row.db, &lookup_row.schema, &lookup_row.tb);
         let first_row_cols = lookup_row.after.as_ref().or(lookup_row.before.as_ref());
         if let Some(cols) = first_row_cols {
             meta.cols = cols.keys().cloned().collect();
@@ -91,8 +94,13 @@ impl Checker for MongoChecker {
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 if let Some(key) = MongoKey::from_doc(&doc) {
-                    let row_data =
-                        Self::build_row_data(&basic_meta.schema, &basic_meta.tb, doc, &key);
+                    let row_data = Self::build_row_data(
+                        &basic_meta.db,
+                        &basic_meta.schema,
+                        &basic_meta.tb,
+                        doc,
+                        &key,
+                    );
                     dst_row_data_vec.push(row_data);
                 } else {
                     let id = doc.get(MongoConstants::ID);
@@ -115,8 +123,9 @@ impl MongoChecker {
         MongoKey::from_doc(&doc).is_some()
     }
 
-    fn mock_tb_meta(schema: &str, tb: &str) -> RdbTbMeta {
+    fn mock_tb_meta(db: &str, schema: &str, tb: &str) -> RdbTbMeta {
         RdbTbMeta {
+            db: db.to_string(),
             schema: schema.to_string(),
             tb: tb.to_string(),
             id_cols: vec![MongoConstants::ID.to_string()],
@@ -124,7 +133,7 @@ impl MongoChecker {
         }
     }
 
-    fn build_row_data(schema: &str, tb: &str, doc: Document, key: &MongoKey) -> RowData {
+    fn build_row_data(db: &str, schema: &str, tb: &str, doc: Document, key: &MongoKey) -> RowData {
         let mut dst_after = HashMap::new();
         dst_after.insert(
             MongoConstants::ID.to_string(),
@@ -132,6 +141,7 @@ impl MongoChecker {
         );
         dst_after.insert(MongoConstants::DOC.to_string(), ColValue::MongoDoc(doc));
         RowData::new(
+            db.to_string(),
             schema.to_string(),
             tb.to_string(),
             0,
@@ -176,6 +186,15 @@ impl MongoChecker {
                 return Ok(Bson::String(s.clone()));
             }
         }
-        anyhow::bail!("missing _id in row data")
+        anyhow::bail!(
+            DtError::InvariantViolated("MongoDB row data is missing _id".to_string())
+                .stage(Stage::Checker)
+                .object(ErrorObject {
+                    schema: Some(row.schema.clone()),
+                    table: Some(row.tb.clone()),
+                    column: Some(MongoConstants::ID.to_string()),
+                    ..Default::default()
+                })
+        )
     }
 }

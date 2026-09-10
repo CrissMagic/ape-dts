@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
-use sqlx::{MySql, Pool};
-
 use dt_common::meta::{
     ddl_meta::ddl_data::DdlData, mysql::mysql_meta_manager::MysqlMetaManager, row_data::RowData,
 };
+use futures::TryStreamExt;
+use sqlx::{MySql, Pool};
 
 use crate::checker::base_checker::{Checker, CheckerTbMeta, CHECKER_MAX_QUERY_BATCH};
 use crate::rdb_query_builder::RdbQueryBuilder;
@@ -46,7 +45,7 @@ impl Checker for MysqlChecker {
             let query = qb.create_mysql_query(&query_info)?;
             let mut rows = query.fetch(&self.conn_pool);
             while let Some(row) = rows.try_next().await? {
-                res.push(RowData::from_mysql_row(&row, mysql_meta, &None, None));
+                res.push(RowData::from_mysql_row(&row, mysql_meta, &None, None)?);
             }
         }
 
@@ -60,7 +59,12 @@ impl Checker for MysqlChecker {
         Ok(())
     }
 
-    async fn invalidate_meta_cache(&mut self, schema: &str, tb: &str) -> anyhow::Result<()> {
+    async fn invalidate_meta_cache(
+        &mut self,
+        _db: &str,
+        schema: &str,
+        tb: &str,
+    ) -> anyhow::Result<()> {
         self.meta_manager.invalidate_cache_for_table(schema, tb);
         Ok(())
     }

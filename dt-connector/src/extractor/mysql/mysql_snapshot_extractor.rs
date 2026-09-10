@@ -5,26 +5,10 @@ use std::{
 
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
-use futures::TryStreamExt;
-use sqlx::{MySql, Pool, Row};
-
-use crate::{
-    extractor::{
-        base_extractor::{BaseExtractor, ExtractState},
-        base_splitter::SnapshotChunk,
-        estimated_sample_limit,
-        mysql::mysql_snapshot_splitter::MySqlSnapshotSplitter,
-        rdb_snapshot_extract_statement::{OrderKeyPredicateType, RdbSnapshotExtractStatement},
-        resumer::recovery::Recovery,
-        snapshot_chunk_id_generator::SnapshotChunkIdGenerator,
-        snapshot_dispatcher::{SnapshotDispatcher, TableMonitorGuard},
-        snapshot_types::SnapshotTableId,
-    },
-    Extractor,
-};
 use dt_common::utils::sql_util::MYSQL_ESCAPE;
 use dt_common::{
     config::config_enums::{DbType, RdbParallelType},
+    error::{DtError, DtErrorContextExt, DtOptionExt, Stage},
     log_debug, log_info,
     meta::{
         adaptor::{mysql_col_value_convertor::MysqlColValueConvertor, sqlx_ext::SqlxMysqlExt},
@@ -42,14 +26,30 @@ use dt_common::{
     rdb_filter::RdbFilter,
     utils::serialize_util::SerializeUtil,
 };
-
+use futures::TryStreamExt;
 use quote_mysql as quote;
+use sqlx::{MySql, Pool, Row};
+
+use crate::{
+    extractor::{
+        base_extractor::{BaseExtractor, ExtractState},
+        base_splitter::SnapshotChunk,
+        estimated_sample_limit,
+        mysql::mysql_snapshot_splitter::MySqlSnapshotSplitter,
+        rdb_snapshot_extract_statement::{OrderKeyPredicateType, RdbSnapshotExtractStatement},
+        resumer::recovery::Recovery,
+        snapshot_chunk_id_generator::SnapshotChunkIdGenerator,
+        snapshot_dispatcher::{SnapshotDispatcher, TableMonitorGuard},
+        snapshot_types::SnapshotTableId,
+    },
+    Extractor,
+};
 
 pub struct MysqlSnapshotExtractor {
     pub shared: MysqlSnapshotShared,
     pub extract_state: ExtractState,
     pub parallel_size: usize,
-    pub db_tbs: HashMap<String, Vec<String>>,
+    pub tbs: Vec<(String, String, String)>,
 }
 
 #[derive(Clone)]
@@ -58,7 +58,7 @@ pub struct MysqlSnapshotShared {
     pub conn_pool: Pool<MySql>,
     pub meta_manager: MysqlMetaManager,
     pub filter: Arc<RdbFilter>,
-    pub partition_cols: Arc<HashMap<(String, String), String>>,
+    pub partition_cols: Arc<HashMap<(String, String, String), String>>,
     pub batch_size: usize,
     pub parallel_type: RdbParallelType,
     pub sample_rate: Option<u8>,
@@ -113,7 +113,10 @@ enum MysqlSnapshotWorkResult {
 impl Extractor for MysqlSnapshotExtractor {
     async fn extract(&mut self) -> anyhow::Result<()> {
         if self.parallel_size < 1 {
-            bail!("parallel_size must be greater than 0");
+            bail!(
+                DtError::InvalidConfig("parallel_size must be greater than 0".to_string(),)
+                    .stage(Stage::Bootstrap)
+            );
         }
 
         let tables = self.collect_tables();
@@ -155,16 +158,14 @@ impl Extractor for MysqlSnapshotExtractor {
 
 impl MysqlSnapshotExtractor {
     fn collect_tables(&self) -> Vec<SnapshotTableId> {
-        let mut tables = Vec::new();
-        for (db, tbs) in &self.db_tbs {
-            for tb in tbs {
-                tables.push(SnapshotTableId {
-                    schema: db.clone(),
-                    tb: tb.clone(),
-                });
-            }
-        }
-        tables
+        self.tbs
+            .iter()
+            .map(|(db, schema, tb)| SnapshotTableId {
+                db: db.clone(),
+                schema: schema.clone(),
+                tb: tb.clone(),
+            })
+            .collect()
     }
 
     async fn next_work(
@@ -306,9 +307,12 @@ impl MysqlSnapshotExtractor {
                         ),
                     };
 
-                    *running_chunks = running_chunks
-                        .checked_sub(1)
-                        .ok_or_else(|| anyhow!("mysql split chunk running count underflow"))?;
+                    *running_chunks =
+                        running_chunks
+                            .checked_sub(1)
+                            .or_dt_error(DtError::InvariantViolated(
+                                "MySQL split chunk running count underflow".to_string(),
+                            ))?;
 
                     if let Some(position) =
                         splitter.get_next_checkpoint_position(chunk_id, partition_col_value)
@@ -355,7 +359,12 @@ impl MysqlSnapshotExtractor {
                             table_id.tb
                         )
                     })?;
-                    let partition_col = finish_partition_col.clone().unwrap();
+                    let partition_col =
+                        finish_partition_col
+                            .clone()
+                            .or_dt_error(DtError::InvariantViolated(
+                                "finished MySQL split is missing its partition column".to_string(),
+                            ))?;
                     if active_table.tb_meta.basic.is_col_nullable(&partition_col) {
                         state.pending_works.push_back(MysqlSnapshotWork::NullChunk {
                             table_id: table_id.clone(),
@@ -427,7 +436,7 @@ impl MysqlSnapshotExtractor {
             partition_col_value =
                 MysqlColValueConvertor::from_query(&row, &partition_col, &partition_col_type)?;
             let row_data =
-                RowData::from_mysql_row(&row, &tb_meta, &ignore_cols.as_ref(), Some(chunk_id));
+                RowData::from_mysql_row(&row, &tb_meta, &ignore_cols.as_ref(), Some(chunk_id))?;
             shared
                 .base_extractor
                 .push_row(&mut extract_state, row_data, Position::None)
@@ -515,6 +524,7 @@ impl MysqlSnapshotDispatchState {
                 &mut active_table.extract_state,
                 Position::RdbSnapshotFinished {
                     db_type: DbType::Mysql.to_string(),
+                    db: table_id.db.clone(),
                     schema: schema.clone(),
                     tb: tb.clone(),
                 },
@@ -530,7 +540,11 @@ impl MysqlSnapshotDispatchState {
         let user_defined_partition_col = self
             .shared
             .partition_cols
-            .get(&(table_id.schema.clone(), table_id.tb.clone()))
+            .get(&(
+                table_id.db.clone(),
+                table_id.schema.clone(),
+                table_id.tb.clone(),
+            ))
             .cloned()
             .unwrap_or_default();
         let mut table_ctx = MysqlTableCtx {
@@ -541,6 +555,7 @@ impl MysqlSnapshotDispatchState {
         };
         let (extract_state, monitor_guard) = SnapshotDispatcher::fork_table_extract_state(
             &self.root_extract_state,
+            &table_id.db,
             &table_id.schema,
             &table_id.tb,
         )
@@ -635,7 +650,9 @@ impl MysqlSnapshotDispatchState {
         let work = self
             .pending_works
             .remove(index)
-            .ok_or_else(|| anyhow!("failed to remove pending mysql snapshot work"))?;
+            .or_dt_error(DtError::InvariantViolated(
+                "pending MySQL snapshot work is missing".to_string(),
+            ))?;
         self.mark_work_started(&work)?;
         Ok(Some(work))
     }
@@ -695,7 +712,9 @@ impl MysqlSnapshotDispatchState {
         };
         *queued_chunks = queued_chunks
             .checked_sub(1)
-            .ok_or_else(|| anyhow!("mysql split chunk queued count underflow"))?;
+            .or_dt_error(DtError::InvariantViolated(
+                "MySQL split chunk queued count underflow".to_string(),
+            ))?;
         *running_chunks += 1;
         Ok(())
     }
@@ -837,7 +856,12 @@ impl MysqlTableCtx {
                 order_key: Some(order_key),
                 ..
             }) = handler
-                .get_snapshot_resume_position(&self.table_id.schema, &self.table_id.tb, check_point)
+                .get_snapshot_resume_position(
+                    &self.table_id.db,
+                    &self.table_id.schema,
+                    &self.table_id.tb,
+                    check_point,
+                )
                 .await
             {
                 if schema != self.table_id.schema || tb != self.table_id.tb {
@@ -935,7 +959,8 @@ impl MysqlTableCtx {
         let mut chunk_id_generator = SnapshotChunkIdGenerator::new(self.shared.batch_size);
         while let Some(row) = rows.try_next().await? {
             let row_chunk_id = chunk_id_generator.next_row_chunk_id();
-            let row_data = RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id));
+            let row_data =
+                RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id))?;
             self.shared
                 .base_extractor
                 .push_row(extract_state, row_data, Position::None)
@@ -1039,7 +1064,7 @@ impl MysqlTableCtx {
                     let row_chunk_id = chunk_id_generator.next_row_chunk_id();
 
                     let row_data =
-                        RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id));
+                        RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id))?;
                     let position = tb_meta.basic.build_position_for_single_col(
                         &DbType::Mysql,
                         order_col,
@@ -1097,7 +1122,7 @@ impl MysqlTableCtx {
                     let row_chunk_id = chunk_id_generator.next_row_chunk_id();
 
                     let row_data =
-                        RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id));
+                        RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id))?;
                     let position = tb_meta.basic.build_position(&DbType::Mysql, &start_values);
                     self.shared
                         .base_extractor
@@ -1175,7 +1200,8 @@ impl MysqlTableCtx {
         while let Some(row) = rows.try_next().await? {
             extracted_count += 1;
             let row_chunk_id = chunk_id_generator.next_row_chunk_id();
-            let row_data = RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id));
+            let row_data =
+                RowData::from_mysql_row(&row, tb_meta, &ignore_cols, Some(row_chunk_id))?;
             self.shared
                 .base_extractor
                 .push_row(extract_state, row_data, Position::None)
@@ -1229,7 +1255,7 @@ LIMIT 1";
             return Ok(None);
         };
 
-        row.try_get(0).map_err(Into::into)
+        Ok(row.try_get(0)?)
     }
 
     async fn estimate_filtered_sample_row_count(

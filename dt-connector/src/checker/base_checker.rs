@@ -1,18 +1,43 @@
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+};
+
+use anyhow::{Context, Result};
 use async_mutex::Mutex;
 use async_trait::async_trait;
 use chrono::Local;
+use dt_common::{
+    error::{DtError, DtOptionExt, DtResultExt, Stage},
+    log_error, log_info, log_summary, log_warn,
+    meta::{
+        col_value::ColValue,
+        ddl_meta::ddl_data::DdlData,
+        dt_data::{DtData, DtItem},
+        mysql::mysql_tb_meta::MysqlTbMeta,
+        pg::pg_tb_meta::PgTbMeta,
+        position::Position,
+        rdb_meta_manager::RdbMetaManager,
+        rdb_tb_meta::RdbTbMeta,
+        row_data::RowData,
+        row_type::RowType,
+        struct_meta::struct_data::StructData,
+    },
+    monitor::task_monitor_handle::TaskMonitorHandle,
+    utils::limit_queue::LimitedQueue,
+};
 use indexmap::{IndexMap, IndexSet};
 use opendal::Operator;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex as StdMutex,
+use tokio::{
+    sync::{mpsc, Notify},
+    task::JoinHandle,
+    time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, Notify};
-use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant};
 
 use super::struct_checker::StructCheckerHandle;
 use crate::{
@@ -25,22 +50,15 @@ use crate::{
     sinker::base_sinker::BaseSinker,
     sinker::mongo::mongo_cmd,
 };
-use dt_common::meta::dt_data::{DtData, DtItem};
-use dt_common::meta::{
-    col_value::ColValue, ddl_meta::ddl_data::DdlData, mysql::mysql_tb_meta::MysqlTbMeta,
-    pg::pg_tb_meta::PgTbMeta, position::Position, rdb_meta_manager::RdbMetaManager,
-    rdb_tb_meta::RdbTbMeta, row_data::RowData, row_type::RowType,
-    struct_meta::struct_data::StructData,
-};
-use dt_common::{
-    log_error, log_info, log_summary, log_warn, monitor::task_monitor_handle::TaskMonitorHandle,
-    utils::limit_queue::LimitedQueue,
-};
 
 #[path = "cdc_state.rs"]
 mod cdc_state;
 #[path = "checker_engine.rs"]
 mod checker_engine;
+#[path = "retry_buffer.rs"]
+mod retry_buffer;
+
+use retry_buffer::RetryBuffer;
 
 pub const CHECKER_MAX_QUERY_BATCH: usize = 1000;
 
@@ -64,7 +82,7 @@ impl CheckerTbMeta {
         }
     }
 
-    fn build_miss_sql(&self, src_row_data: &RowData) -> anyhow::Result<Option<String>> {
+    fn build_miss_sql(&self, src_row_data: &RowData) -> Result<Option<String>> {
         let after = match &src_row_data.after {
             Some(after) if !after.is_empty() => after.clone(),
             _ => return Ok(None),
@@ -73,6 +91,7 @@ impl CheckerTbMeta {
             return Ok(mongo_cmd::build_insert_cmd(src_row_data));
         }
         let mut insert_row = RowData::new(
+            src_row_data.db.clone(),
             src_row_data.schema.clone(),
             src_row_data.tb.clone(),
             0,
@@ -84,7 +103,7 @@ impl CheckerTbMeta {
         self.build_rdb_query(&insert_row, false)
     }
 
-    fn build_delete_sql(&self, dst_row_data: &RowData) -> anyhow::Result<Option<String>> {
+    fn build_delete_sql(&self, dst_row_data: &RowData) -> Result<Option<String>> {
         if matches!(self, CheckerTbMeta::Mongo(_)) {
             return Ok(mongo_cmd::build_delete_cmd(dst_row_data));
         }
@@ -93,6 +112,7 @@ impl CheckerTbMeta {
             _ => return Ok(None),
         };
         let mut delete_row = RowData::new(
+            dst_row_data.db.clone(),
             dst_row_data.schema.clone(),
             dst_row_data.tb.clone(),
             0,
@@ -110,7 +130,7 @@ impl CheckerTbMeta {
         dst_row_data: &RowData,
         diff_col_values: &HashMap<String, DiffColValue>,
         match_full_row: bool,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> Result<Option<String>> {
         if diff_col_values.is_empty() {
             return Ok(None);
         }
@@ -139,6 +159,7 @@ impl CheckerTbMeta {
         };
 
         let mut update_row = RowData::new(
+            src_row_data.db.clone(),
             src_row_data.schema.clone(),
             src_row_data.tb.clone(),
             0,
@@ -150,11 +171,7 @@ impl CheckerTbMeta {
         self.build_rdb_query(&update_row, match_full_row)
     }
 
-    fn build_rdb_query(
-        &self,
-        row_data: &RowData,
-        match_full_row: bool,
-    ) -> anyhow::Result<Option<String>> {
+    fn build_rdb_query(&self, row_data: &RowData, match_full_row: bool) -> Result<Option<String>> {
         macro_rules! build_query {
             ($meta:expr, $builder:ident) => {{
                 let meta_cow = if match_full_row {
@@ -192,6 +209,8 @@ pub struct CheckContext {
     pub sample_rate: Option<u8>,
     pub retry_interval_secs: u64,
     pub max_retries: u32,
+    pub retry_buffer_max_rows: usize,
+    pub retry_buffer_max_bytes: usize,
     pub is_cdc: bool,
     pub check_log_dir: String,
     pub cdc_check_log_max_file_size: u64,
@@ -220,6 +239,8 @@ impl Default for CheckContext {
             sample_rate: None,
             retry_interval_secs: 0,
             max_retries: 0,
+            retry_buffer_max_rows: 10_000,
+            retry_buffer_max_bytes: 256 * 1024 * 1024,
             is_cdc: false,
             check_log_dir: String::new(),
             cdc_check_log_max_file_size: 1,
@@ -262,20 +283,34 @@ impl CheckContext {
     }
 
     fn record_row_table_counts(&mut self, row: &RowData, checked_count: usize, skip_count: usize) {
+        self.record_table_counts(&row.db, &row.schema, &row.tb, checked_count, skip_count);
+    }
+
+    fn record_table_counts(
+        &mut self,
+        target_db: &str,
+        target_schema: &str,
+        target_tb: &str,
+        checked_count: usize,
+        skip_count: usize,
+    ) {
         if checked_count == 0 && skip_count == 0 {
             return;
         }
         self.summary.checked_count += checked_count;
-        let (schema, tb) = match &self.router {
-            Some(router) => router.reverse_get_tb_map(&row.schema, &row.tb),
-            None => (row.schema.as_str(), row.tb.as_str()),
+        let (db, schema, tb) = match &self.router {
+            Some(router) => router.reverse_get_tb_map_with_db(target_db, target_schema, target_tb),
+            None => (target_db, target_schema, target_tb),
         };
-        let has_target = row.schema != schema || row.tb != tb;
+        let has_target_db = target_db != db;
+        let has_target = has_target_db || target_schema != schema || target_tb != tb;
         self.summary.merge_table(CheckTableSummaryLog {
+            db: db.to_string(),
             schema: schema.to_string(),
             tb: tb.to_string(),
-            target_schema: has_target.then(|| row.schema.clone()),
-            target_tb: has_target.then(|| row.tb.clone()),
+            target_db: has_target_db.then(|| target_db.to_string()),
+            target_schema: has_target.then(|| target_schema.to_string()),
+            target_tb: has_target.then(|| target_tb.to_string()),
             checked_count,
             skip_count,
             ..Default::default()
@@ -291,8 +326,10 @@ impl CheckContext {
             return;
         };
         self.summary.merge_table(CheckTableSummaryLog {
+            db: entry.log.db.clone(),
             schema: entry.log.schema.clone(),
             tb: entry.log.tb.clone(),
+            target_db: entry.log.target_db.clone(),
             target_schema: entry.log.target_schema.clone(),
             target_tb: entry.log.target_tb.clone(),
             miss_count,
@@ -304,14 +341,16 @@ impl CheckContext {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct CheckerStoreKey {
+    db: String,
     schema: String,
     tb: String,
     row_key: u128,
 }
 
 impl CheckerStoreKey {
-    fn new(schema: &str, tb: &str, row_key: u128) -> Self {
+    fn new(db: &str, schema: &str, tb: &str, row_key: u128) -> Self {
         Self {
+            db: db.to_string(),
             schema: schema.to_string(),
             tb: tb.to_string(),
             row_key,
@@ -321,17 +360,16 @@ impl CheckerStoreKey {
 
 #[async_trait]
 pub trait Checker: Send + Sync + 'static {
-    async fn load_table_meta(&mut self, lookup_row: &RowData)
-        -> anyhow::Result<Arc<CheckerTbMeta>>;
+    async fn load_table_meta(&mut self, lookup_row: &RowData) -> Result<Arc<CheckerTbMeta>>;
     async fn fetch_rows_by_keys(
         &mut self,
         table_meta: Arc<CheckerTbMeta>,
         lookup_rows: &[&RowData],
-    ) -> anyhow::Result<Vec<RowData>>;
-    async fn refresh_meta(&mut self, _data: &[DdlData]) -> anyhow::Result<()> {
+    ) -> Result<Vec<RowData>>;
+    async fn refresh_meta(&mut self, _data: &[DdlData]) -> Result<()> {
         Ok(())
     }
-    async fn invalidate_meta_cache(&mut self, _schema: &str, _tb: &str) -> anyhow::Result<()> {
+    async fn invalidate_meta_cache(&mut self, _db: &str, _schema: &str, _tb: &str) -> Result<()> {
         Ok(())
     }
 }
@@ -356,12 +394,35 @@ struct DataCheckerShared {
 #[derive(Clone)]
 pub struct DataCheckerHandle {
     shared: DataCheckerShared,
-    join_handle: Arc<Mutex<Option<JoinHandle<anyhow::Result<()>>>>>,
+    join_handle: Arc<Mutex<Option<JoinHandle<Result<()>>>>>,
 }
 
-pub enum CheckerHandle {
-    Data(DataCheckerHandle),
+#[async_trait]
+trait DirectDataChecker: Send {
+    async fn check_batch(&mut self, data: Vec<RowData>, batch: bool) -> Result<()>;
+    async fn refresh_meta(&mut self, data: &[DdlData]) -> Result<()>;
+    async fn handle_control_item(&mut self, item: &DtItem) -> Result<()>;
+    async fn close(&mut self) -> Result<()>;
+}
+
+enum DirectChecker {
+    Data(Box<dyn DirectDataChecker>),
     Struct(StructCheckerHandle),
+}
+
+struct DirectCheckerState {
+    checker: Option<DirectChecker>,
+}
+
+#[derive(Clone)]
+pub struct DirectCheckerHandle {
+    state: Arc<Mutex<DirectCheckerState>>,
+}
+
+#[derive(Clone)]
+pub enum CheckerHandle {
+    Direct(DirectCheckerHandle),
+    Async(DataCheckerHandle),
 }
 
 impl DataCheckerHandle {
@@ -382,12 +443,12 @@ impl DataCheckerHandle {
             checker,
             task_id,
             ctx,
-            CheckerIo {
+            Some(CheckerIo {
                 batch_queue: batch_queue.clone(),
                 batch_notify: batch_notify.clone(),
                 dropped_items: dropped_items.clone(),
                 control_rx,
-            },
+            }),
             name,
         );
         let join_handle = tokio::spawn(async move { check_job.run().await });
@@ -405,12 +466,16 @@ impl DataCheckerHandle {
         }
     }
 
-    pub async fn enqueue_check(&self, data: Vec<RowData>) -> anyhow::Result<()> {
+    pub async fn enqueue_check(&self, data: Vec<RowData>) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
         let dropped = {
-            let mut queue = self.shared.batch_queue.lock().unwrap();
+            let mut queue = self
+                .shared
+                .batch_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             queue.push_with_eviction(data)
         };
         if let Some(dropped) = dropped {
@@ -430,7 +495,7 @@ impl DataCheckerHandle {
         Ok(())
     }
 
-    pub async fn close_with_position(&mut self, position: Option<&Position>) -> anyhow::Result<()> {
+    pub async fn close_with_position(&self, position: Option<&Position>) -> Result<()> {
         if self
             .shared
             .control_tx
@@ -452,7 +517,7 @@ impl DataCheckerHandle {
         Ok(())
     }
 
-    pub async fn record_checkpoint(&self, position: &Position) -> anyhow::Result<()> {
+    pub async fn record_checkpoint(&self, position: &Position) -> Result<()> {
         if !self.shared.is_cdc {
             return Ok(());
         }
@@ -470,7 +535,7 @@ impl DataCheckerHandle {
         Ok(())
     }
 
-    pub async fn refresh_meta(&self, data: Vec<DdlData>) -> anyhow::Result<()> {
+    pub async fn refresh_meta(&self, data: Vec<DdlData>) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -485,7 +550,7 @@ impl DataCheckerHandle {
         Ok(())
     }
 
-    pub async fn handle_control_item(&self, item: &DtItem) -> anyhow::Result<()> {
+    pub async fn handle_control_item(&self, item: &DtItem) -> Result<()> {
         if self.shared.is_cdc {
             return Ok(());
         }
@@ -504,39 +569,115 @@ impl DataCheckerHandle {
     }
 }
 
+impl DirectCheckerHandle {
+    pub fn data<C: Checker>(checker: C, task_id: String, ctx: CheckContext, name: &str) -> Self {
+        let checker = DataChecker::new(checker, task_id, ctx, None, name);
+        Self {
+            state: Arc::new(Mutex::new(DirectCheckerState {
+                checker: Some(DirectChecker::Data(Box::new(checker))),
+            })),
+        }
+    }
+
+    pub fn structure(checker: StructCheckerHandle) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DirectCheckerState {
+                checker: Some(DirectChecker::Struct(checker)),
+            })),
+        }
+    }
+
+    pub async fn check_dml(&self, data: Vec<RowData>, batch: bool) -> Result<()> {
+        let mut state = self.state.lock().await;
+        match state.checker.as_mut() {
+            Some(DirectChecker::Data(checker)) => checker.check_batch(data, batch).await,
+            Some(DirectChecker::Struct(_)) => Ok(()),
+            None => Ok(()),
+        }
+    }
+
+    pub async fn check_struct(&self, data: Vec<StructData>) -> Result<()> {
+        let mut state = self.state.lock().await;
+        match state.checker.as_mut() {
+            Some(DirectChecker::Struct(checker)) => checker.check_struct(data).await,
+            Some(DirectChecker::Data(_)) | None => Ok(()),
+        }
+    }
+
+    pub async fn refresh_meta(&self, data: Vec<DdlData>) -> Result<()> {
+        let mut state = self.state.lock().await;
+        match state.checker.as_mut() {
+            Some(DirectChecker::Data(checker)) => checker.refresh_meta(&data).await,
+            Some(DirectChecker::Struct(_)) | None => Ok(()),
+        }
+    }
+
+    pub async fn handle_control_item(&self, item: &DtItem) -> Result<()> {
+        let mut state = self.state.lock().await;
+        match state.checker.as_mut() {
+            Some(DirectChecker::Data(checker)) => checker.handle_control_item(item).await,
+            Some(DirectChecker::Struct(_)) | None => Ok(()),
+        }
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let Some(checker) = state.checker.as_mut() else {
+            return Ok(());
+        };
+        match checker {
+            DirectChecker::Data(checker) => checker.close().await?,
+            DirectChecker::Struct(checker) => checker.close().await?,
+        }
+        state.checker = None;
+        Ok(())
+    }
+}
+
 impl CheckerHandle {
-    pub async fn close_with_position(&mut self, position: Option<&Position>) -> anyhow::Result<()> {
+    pub fn is_async(&self) -> bool {
+        matches!(self, Self::Async(_))
+    }
+
+    pub async fn check_dml(&self, data: Vec<RowData>, batch: bool) -> Result<()> {
         match self {
-            Self::Data(handle) => handle.close_with_position(position).await,
-            Self::Struct(handle) => handle.close().await,
+            Self::Direct(handle) => handle.check_dml(data, batch).await,
+            Self::Async(handle) => handle.enqueue_check(data).await,
         }
     }
 
-    pub async fn record_checkpoint(&self, position: &Position) -> anyhow::Result<()> {
+    pub async fn close_with_position(&self, position: Option<&Position>) -> Result<()> {
         match self {
-            Self::Data(handle) => handle.record_checkpoint(position).await,
-            Self::Struct(_) => Ok(()),
+            Self::Direct(handle) => handle.close().await,
+            Self::Async(handle) => handle.close_with_position(position).await,
         }
     }
 
-    pub async fn refresh_meta(&self, data: Vec<DdlData>) -> anyhow::Result<()> {
+    pub async fn record_checkpoint(&self, position: &Position) -> Result<()> {
         match self {
-            Self::Data(handle) => handle.refresh_meta(data).await,
-            Self::Struct(_) => Ok(()),
+            Self::Async(handle) => handle.record_checkpoint(position).await,
+            Self::Direct(_) => Ok(()),
         }
     }
 
-    pub async fn handle_control_item(&self, item: &DtItem) -> anyhow::Result<()> {
+    pub async fn refresh_meta(&self, data: Vec<DdlData>) -> Result<()> {
         match self {
-            CheckerHandle::Data(handle) => handle.handle_control_item(item).await,
-            CheckerHandle::Struct(_) => Ok(()),
+            Self::Direct(handle) => handle.refresh_meta(data).await,
+            Self::Async(handle) => handle.refresh_meta(data).await,
         }
     }
 
-    pub async fn check_struct(&mut self, data: Vec<StructData>) -> anyhow::Result<()> {
+    pub async fn handle_control_item(&self, item: &DtItem) -> Result<()> {
         match self {
-            Self::Data(_) => Ok(()),
-            Self::Struct(handle) => handle.check_struct(data).await,
+            Self::Direct(handle) => handle.handle_control_item(item).await,
+            Self::Async(handle) => handle.handle_control_item(item).await,
+        }
+    }
+
+    pub async fn check_struct(&self, data: Vec<StructData>) -> Result<()> {
+        match self {
+            Self::Direct(handle) => handle.check_struct(data).await,
+            Self::Async(_) => Ok(()),
         }
     }
 }
@@ -548,6 +689,8 @@ enum CheckInconsistency {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct RecheckKey {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    db: String,
     schema: String,
     tb: String,
     is_delete: bool,
@@ -564,7 +707,7 @@ pub(crate) struct CheckEntry {
 }
 
 impl RecheckKey {
-    fn from_row_data(row_data: &RowData, id_cols: &[String]) -> anyhow::Result<Self> {
+    fn from_row_data(row_data: &RowData, id_cols: &[String]) -> Result<Self> {
         let values = match row_data.row_type {
             RowType::Delete => row_data.require_before()?,
             _ => row_data.require_after()?,
@@ -576,10 +719,14 @@ impl RecheckKey {
                     .get(col)
                     .cloned()
                     .map(|value| (col.clone(), value))
-                    .ok_or_else(|| anyhow::anyhow!("missing id col value: {col}"))
+                    .or_dt_error(DtError::InvariantViolated(format!(
+                        "missing ID column value: {col}"
+                    )))
+                    .stage(Stage::Checker)
             })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+            .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self {
+            db: row_data.db.clone(),
             schema: row_data.schema.clone(),
             tb: row_data.tb.clone(),
             is_delete: row_data.row_type == RowType::Delete,
@@ -595,6 +742,7 @@ impl RecheckKey {
             .collect::<HashMap<_, _>>();
         if self.is_delete {
             RowData::new(
+                self.db.clone(),
                 self.schema.clone(),
                 self.tb.clone(),
                 0,
@@ -604,6 +752,7 @@ impl RecheckKey {
             )
         } else {
             RowData::new(
+                self.db.clone(),
                 self.schema.clone(),
                 self.tb.clone(),
                 0,
@@ -623,12 +772,6 @@ impl CheckEntry {
     fn counts_as_diff(&self) -> bool {
         self.diff_cols.is_some()
     }
-}
-
-struct RetryItem {
-    row: RowData,
-    retries_left: u32,
-    next_retry_at: Instant,
 }
 
 struct BoundedLineBuffer {
@@ -698,15 +841,15 @@ struct DataChecker<C: Checker> {
     checker: C,
     task_id: String,
     ctx: CheckContext,
-    retry_queue: VecDeque<RetryItem>,
+    retry_buffer: RetryBuffer,
     retry_next_at: Option<Instant>,
     store: IndexMap<CheckerStoreKey, CheckEntry>,
     dirty_upserts: IndexSet<CheckerStoreKey>,
     dirty_deletes: IndexMap<CheckerStoreKey, String>,
-    batch_queue: Arc<StdMutex<LimitedQueue<Vec<RowData>>>>,
-    batch_notify: Arc<Notify>,
+    batch_queue: Option<Arc<StdMutex<LimitedQueue<Vec<RowData>>>>>,
+    batch_notify: Option<Arc<Notify>>,
     dropped_items: Arc<AtomicU64>,
-    control_rx: mpsc::UnboundedReceiver<CheckerControlMsg>,
+    control_rx: Option<mpsc::UnboundedReceiver<CheckerControlMsg>>,
     pending_controls: VecDeque<CheckerControlMsg>,
     name: String,
     // Tracks store changes since the last DB checkpoint and is cleared by `record_checkpoint`.
@@ -728,30 +871,34 @@ struct CheckerIo {
 }
 
 impl<C: Checker> DataChecker<C> {
-    pub fn new(
+    fn new(
         checker: C,
         task_id: String,
         mut ctx: CheckContext,
-        io: CheckerIo,
+        io: Option<CheckerIo>,
         name: &str,
     ) -> Self {
         if ctx.summary.start_time.is_empty() {
             ctx.summary.start_time = Local::now().to_rfc3339();
         }
         let persisted_identity_keys = ctx.state_store.as_ref().map(|_| BTreeSet::new());
+        let retry_buffer = RetryBuffer::new(ctx.retry_buffer_max_rows, ctx.retry_buffer_max_bytes);
         Self {
             checker,
             task_id,
             ctx,
-            retry_queue: VecDeque::new(),
+            retry_buffer,
             retry_next_at: None,
             store: IndexMap::new(),
             dirty_upserts: IndexSet::new(),
             dirty_deletes: IndexMap::new(),
-            batch_queue: io.batch_queue,
-            batch_notify: io.batch_notify,
-            dropped_items: io.dropped_items,
-            control_rx: io.control_rx,
+            batch_queue: io.as_ref().map(|io| io.batch_queue.clone()),
+            batch_notify: io.as_ref().map(|io| io.batch_notify.clone()),
+            dropped_items: io
+                .as_ref()
+                .map(|io| io.dropped_items.clone())
+                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
+            control_rx: io.map(|io| io.control_rx),
             pending_controls: VecDeque::new(),
             name: name.to_string(),
             store_dirty: false,
@@ -775,8 +922,11 @@ impl<C: Checker> DataChecker<C> {
             .saturating_add(usize::try_from(delta).unwrap_or(usize::MAX));
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         log_info!("Checker [{}] started.", self.name);
+        debug_assert!(self.batch_queue.is_some());
+        debug_assert!(self.batch_notify.is_some());
+        debug_assert!(self.control_rx.is_some());
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         if let Err(err) = self.init_cdc_state().await {
             log_error!(
@@ -792,23 +942,23 @@ impl<C: Checker> DataChecker<C> {
 
         loop {
             if self.close_requested {
-                self.drain_pending_batches().await;
+                self.drain_pending_batches().await?;
                 break;
             }
 
             tokio::select! {
                 biased;
-                msg = self.control_rx.recv() => {
+                msg = self.control_rx.as_mut().context("worker control channel is not initialized")?.recv() => {
                     match msg {
                         Some(msg) => {
                             self.pending_controls.push_back(msg);
-                            self.drain_pending_batches().await;
+                            self.drain_pending_batches().await?;
                         }
                         None => self.close_requested = true,
                     }
                 }
-                _ = self.batch_notify.notified() => {
-                    self.drain_pending_batches().await;
+                _ = self.batch_notify.as_ref().context("worker batch notifier is not initialized")?.notified() => {
+                    self.drain_pending_batches().await?;
                 }
                 _ = interval.tick() => {
                     if let Err(err) = self.process_due_retries().await {
@@ -859,42 +1009,56 @@ impl<C: Checker> DataChecker<C> {
         }
     }
 
-    async fn handle_control_item(&mut self, item: &DtItem) -> anyhow::Result<()> {
-        if let (DtData::Commit { .. }, Position::RdbSnapshotFinished { schema, tb, .. }) =
+    async fn handle_control_item(&mut self, item: &DtItem) -> Result<()> {
+        if let (DtData::Commit { .. }, Position::RdbSnapshotFinished { db, schema, tb, .. }) =
             (&item.dt_data, &item.position)
         {
-            let task_id = TaskMonitorHandle::task_id_from_schema_tb(schema, tb);
+            let task_id = TaskMonitorHandle::task_id_from_db_schema_tb(db, schema, tb);
             self.ctx.monitor.unregister_monitor(&task_id);
 
             if let Some(meta_manager) = self.ctx.extractor_meta_manager.as_mut() {
-                meta_manager.invalidate_cache_for_table(schema, tb);
+                meta_manager.invalidate_cache_for_table(db, schema, tb);
             }
 
-            let (target_schema, target_tb) = match &self.ctx.router {
-                Some(router) => router.get_tb_map(schema, tb),
-                None => (schema.as_str(), tb.as_str()),
+            let (target_db, target_schema, target_tb) = match &self.ctx.router {
+                Some(router) => router.get_tb_map_with_db(db, schema, tb),
+                None => (db.as_str(), schema.as_str(), tb.as_str()),
             };
-            let (target_schema, target_tb) = (target_schema.to_string(), target_tb.to_string());
+            let (target_db, target_schema, target_tb) = (
+                target_db.to_string(),
+                target_schema.to_string(),
+                target_tb.to_string(),
+            );
             self.checker
-                .invalidate_meta_cache(&target_schema, &target_tb)
+                .invalidate_meta_cache(&target_db, &target_schema, &target_tb)
                 .await?;
         }
         Ok(())
     }
 
-    fn collect_pending_controls(&mut self) {
-        while let Ok(msg) = self.control_rx.try_recv() {
+    fn collect_pending_controls(&mut self) -> Result<()> {
+        let control_rx = self
+            .control_rx
+            .as_mut()
+            .context("worker control channel is not initialized")?;
+        while let Ok(msg) = control_rx.try_recv() {
             self.pending_controls.push_back(msg);
         }
+        Ok(())
     }
 
-    async fn drain_pending_batches(&mut self) {
+    async fn drain_pending_batches(&mut self) -> Result<()> {
         loop {
             self.account_dropped_item_skips();
-            self.collect_pending_controls();
+            self.collect_pending_controls()?;
 
             let batch = {
-                let mut queue = self.batch_queue.lock().unwrap();
+                let mut queue = self
+                    .batch_queue
+                    .as_ref()
+                    .context("worker batch queue is not initialized")?
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 queue.pop()
             };
             let Some(batch) = batch else {
@@ -902,16 +1066,16 @@ impl<C: Checker> DataChecker<C> {
                     self.handle_control_msg(msg).await;
                     continue;
                 }
-                return;
+                return Ok(());
             };
 
-            if let Err(err) = self.check_batch(&batch, true).await {
+            if let Err(err) = self.check_batch(batch, true).await {
                 log_error!("Checker [{}] batch failed: {}", self.name, err);
             }
         }
     }
 
-    async fn shutdown(&mut self) -> anyhow::Result<()> {
+    async fn shutdown(&mut self) -> Result<()> {
         if self.ctx.is_cdc {
             if self.store_dirty {
                 if let Some(position) = self.last_checkpoint_position.clone() {
@@ -935,7 +1099,7 @@ impl<C: Checker> DataChecker<C> {
         Ok(())
     }
 
-    async fn finish_summary_and_meta(&mut self) -> anyhow::Result<()> {
+    async fn finish_summary_and_meta(&mut self) -> Result<()> {
         self.account_dropped_item_skips();
         self.finish_local_summary();
         let common = &mut self.ctx;
@@ -961,7 +1125,7 @@ impl<C: Checker> DataChecker<C> {
         summary.sort_tables();
     }
 
-    async fn init_cdc_state(&mut self) -> anyhow::Result<()> {
+    async fn init_cdc_state(&mut self) -> Result<()> {
         if !self.ctx.is_cdc {
             return Ok(());
         }
@@ -973,17 +1137,42 @@ impl<C: Checker> DataChecker<C> {
     }
 }
 
+#[async_trait]
+impl<C: Checker> DirectDataChecker for DataChecker<C> {
+    async fn check_batch(&mut self, data: Vec<RowData>, batch: bool) -> Result<()> {
+        if let Err(err) = self.process_due_retries().await {
+            log_error!("Checker [{}] retry failed: {}", self.name, err);
+        }
+        DataChecker::check_batch(self, data, batch).await
+    }
+
+    async fn refresh_meta(&mut self, data: &[DdlData]) -> Result<()> {
+        self.checker.refresh_meta(data).await
+    }
+
+    async fn handle_control_item(&mut self, item: &DtItem) -> Result<()> {
+        DataChecker::handle_control_item(self, item).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.shutdown().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use dt_common::meta::row_type::RowType;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    use anyhow::bail;
+    use async_trait::async_trait;
+    use dt_common::meta::row_type::RowType;
     use tokio::{
         sync::{mpsc, Notify},
         time::{timeout, Duration},
     };
+
+    use super::*;
 
     #[derive(Clone)]
     struct BlockingFetchChecker {
@@ -992,15 +1181,16 @@ mod tests {
     }
 
     struct CaptureInvalidateChecker {
-        invalidated: Arc<StdMutex<Vec<(String, String)>>>,
+        invalidated: Arc<StdMutex<Vec<(String, String, String)>>>,
+    }
+
+    struct RetryFailureChecker {
+        loaded_ids: Arc<StdMutex<Vec<i32>>>,
     }
 
     #[async_trait]
     impl Checker for BlockingFetchChecker {
-        async fn load_table_meta(
-            &mut self,
-            _lookup_row: &RowData,
-        ) -> anyhow::Result<Arc<CheckerTbMeta>> {
+        async fn load_table_meta(&mut self, _lookup_row: &RowData) -> Result<Arc<CheckerTbMeta>> {
             Ok(Arc::new(CheckerTbMeta::Mongo(RdbTbMeta {
                 schema: "s1".to_string(),
                 tb: "t1".to_string(),
@@ -1013,7 +1203,7 @@ mod tests {
             &mut self,
             _table_meta: Arc<CheckerTbMeta>,
             _lookup_rows: &[&RowData],
-        ) -> anyhow::Result<Vec<RowData>> {
+        ) -> Result<Vec<RowData>> {
             let _ = self.fetch_started.send(());
             self.fetch_gate.notified().await;
             Err(anyhow::anyhow!("unit-test fetch failure"))
@@ -1022,10 +1212,7 @@ mod tests {
 
     #[async_trait]
     impl Checker for CaptureInvalidateChecker {
-        async fn load_table_meta(
-            &mut self,
-            _lookup_row: &RowData,
-        ) -> anyhow::Result<Arc<CheckerTbMeta>> {
+        async fn load_table_meta(&mut self, _lookup_row: &RowData) -> Result<Arc<CheckerTbMeta>> {
             unreachable!("control item test should not load table meta")
         }
 
@@ -1033,16 +1220,45 @@ mod tests {
             &mut self,
             _table_meta: Arc<CheckerTbMeta>,
             _lookup_rows: &[&RowData],
-        ) -> anyhow::Result<Vec<RowData>> {
+        ) -> Result<Vec<RowData>> {
             unreachable!("control item test should not fetch rows")
         }
 
-        async fn invalidate_meta_cache(&mut self, schema: &str, tb: &str) -> anyhow::Result<()> {
-            self.invalidated
-                .lock()
-                .unwrap()
-                .push((schema.to_string(), tb.to_string()));
+        async fn invalidate_meta_cache(&mut self, db: &str, schema: &str, tb: &str) -> Result<()> {
+            self.invalidated.lock().unwrap().push((
+                db.to_string(),
+                schema.to_string(),
+                tb.to_string(),
+            ));
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Checker for RetryFailureChecker {
+        async fn load_table_meta(&mut self, lookup_row: &RowData) -> Result<Arc<CheckerTbMeta>> {
+            let id = match lookup_row.require_after()?.get("id") {
+                Some(ColValue::Long(id)) => *id,
+                value => bail!("unexpected id value: {value:?}"),
+            };
+            self.loaded_ids.lock().unwrap().push(id);
+            if id == 1 {
+                bail!("simulated retry failure");
+            }
+            Ok(Arc::new(CheckerTbMeta::Mongo(RdbTbMeta {
+                schema: "s1".to_string(),
+                tb: "t1".to_string(),
+                id_cols: vec!["id".to_string()],
+                ..Default::default()
+            })))
+        }
+
+        async fn fetch_rows_by_keys(
+            &mut self,
+            _table_meta: Arc<CheckerTbMeta>,
+            _lookup_rows: &[&RowData],
+        ) -> Result<Vec<RowData>> {
+            Ok(Vec::new())
         }
     }
 
@@ -1054,6 +1270,7 @@ mod tests {
 
     fn build_row(id: i32) -> RowData {
         RowData::new(
+            String::new(),
             "s1".to_string(),
             "t1".to_string(),
             0,
@@ -1104,7 +1321,7 @@ mod tests {
             4,
             "unit-test",
         );
-        let mut handle = handle;
+        let handle = handle;
 
         handle.enqueue_check(vec![build_row(1)]).await.unwrap();
         timeout(Duration::from_secs(1), fetch_started_rx.recv())
@@ -1138,8 +1355,16 @@ mod tests {
         let invalidated = Arc::new(StdMutex::new(Vec::new()));
         let mut tb_map = HashMap::new();
         tb_map.insert(
-            ("src_schema".to_string(), "src_tb".to_string()),
-            ("dst_schema".to_string(), "dst_tb".to_string()),
+            (
+                String::new(),
+                "src_schema".to_string(),
+                "src_tb".to_string(),
+            ),
+            (
+                String::new(),
+                "dst_schema".to_string(),
+                "dst_tb".to_string(),
+            ),
         );
         let router =
             RdbRouter::from_maps_for_test(HashMap::new(), tb_map, HashMap::new(), HashMap::new());
@@ -1152,12 +1377,12 @@ mod tests {
                 router: Some(router),
                 ..Default::default()
             },
-            CheckerIo {
+            Some(CheckerIo {
                 batch_queue: Arc::new(StdMutex::new(LimitedQueue::new(1))),
                 batch_notify: Arc::new(Notify::new()),
                 dropped_items: Arc::new(AtomicU64::new(0)),
                 control_rx,
-            },
+            }),
             "unit-test",
         );
 
@@ -1165,6 +1390,7 @@ mod tests {
             dt_data: DtData::Commit { xid: String::new() },
             position: Position::RdbSnapshotFinished {
                 db_type: "mysql".to_string(),
+                db: String::new(),
                 schema: "src_schema".to_string(),
                 tb: "src_tb".to_string(),
             },
@@ -1175,7 +1401,66 @@ mod tests {
 
         assert_eq!(
             invalidated.lock().unwrap().as_slice(),
-            &[("dst_schema".to_string(), "dst_tb".to_string())]
+            &[((
+                String::new(),
+                "dst_schema".to_string(),
+                "dst_tb".to_string(),
+            ))]
         );
+    }
+
+    #[tokio::test]
+    async fn direct_checker_retry_failure_does_not_skip_current_batch() {
+        let loaded_ids = Arc::new(StdMutex::new(Vec::new()));
+        let mut checker = DataChecker::new(
+            RetryFailureChecker {
+                loaded_ids: loaded_ids.clone(),
+            },
+            "task-1".to_string(),
+            build_ctx(),
+            None,
+            "unit-test",
+        );
+        checker
+            .retry_buffer
+            .try_push(retry_buffer::RetryItem {
+                row: build_row(1),
+                retries_left: 1,
+                next_retry_at: Instant::now(),
+            })
+            .unwrap();
+        checker.retry_next_at = Some(Instant::now());
+
+        DirectDataChecker::check_batch(&mut checker, vec![build_row(2)], true)
+            .await
+            .unwrap();
+
+        assert_eq!(loaded_ids.lock().unwrap().as_slice(), &[1, 2]);
+    }
+
+    #[tokio::test]
+    async fn retry_query_failure_keeps_item_until_attempts_are_exhausted() {
+        let mut checker = DataChecker::new(
+            RetryFailureChecker {
+                loaded_ids: Arc::new(StdMutex::new(Vec::new())),
+            },
+            "task-1".to_string(),
+            build_ctx(),
+            None,
+            "unit-test",
+        );
+        checker
+            .retry_buffer
+            .try_push(retry_buffer::RetryItem {
+                row: build_row(1),
+                retries_left: 2,
+                next_retry_at: Instant::now(),
+            })
+            .unwrap();
+        checker.retry_next_at = Some(Instant::now());
+
+        assert!(checker.process_due_retries().await.is_err());
+        assert_eq!(checker.retry_buffer.len(), 1);
+        assert_eq!(checker.retry_buffer.iter().next().unwrap().retries_left, 1);
     }
 }

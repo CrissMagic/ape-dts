@@ -1,13 +1,14 @@
 use clickhouse::{Client, Row};
 use dt_common::{meta::col_value::ColValue, utils::time_util::TimeUtil};
-use dt_task::task_runner::TaskRunner;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 
 use super::{
+    base_test_runner::BaseTestRunner,
     rdb_struct_test_runner::RdbStructTestRunner,
     rdb_test_runner::{RdbTestRunner, SRC},
+    rdb_util::DbSchemaTb,
 };
 
 pub struct RdbClickHouseTestRunner {
@@ -46,14 +47,14 @@ impl RdbClickHouseTestRunner {
 
         let expect_ddl_sqls = self.rdb_struct_test_runner.load_expect_ddl_sqls().await;
         let (_, dst_db_tbs) = self.rdb_test_runner.get_compare_db_tbs().unwrap();
-        for (db, tb) in dst_db_tbs.iter() {
-            let sql = format!("SHOW CREATE TABLE `{}`.`{}`", db, tb);
+        for (_, schema, tb) in dst_db_tbs.iter() {
+            let sql = format!("SHOW CREATE TABLE `{}`.`{}`", schema, tb);
 
             let mut cursor = self.client.query(&sql).fetch()?;
             let dst_ddl_sql: String = cursor.next().await?.unwrap();
             println!("dst_ddl_sql: {}\n", dst_ddl_sql);
 
-            let key = format!("{}.{}", db, tb);
+            let key = format!("{}.{}", schema, tb);
             let expect_ddl_sql = expect_ddl_sqls.get(&key).unwrap().to_owned();
             println!("expect_ddl_sql: {}\n", expect_ddl_sql);
 
@@ -123,9 +124,7 @@ impl RdbClickHouseTestRunner {
 
         // migrate database/table structures to target if needed
         if !basic.struct_task_config_file.is_empty() {
-            TaskRunner::new(&basic.struct_task_config_file)?
-                .start_task(false)
-                .await?;
+            BaseTestRunner::start_task_with_config_file(&basic.struct_task_config_file).await?;
         }
         Ok(())
     }
@@ -143,18 +142,18 @@ impl RdbClickHouseTestRunner {
 
     async fn compare_tb_data<'a, T: Row + Serialize + for<'b> Deserialize<'b>>(
         &self,
-        src_db_tb: &(String, String),
-        dst_db_tb: &(String, String),
+        src_db_tb: &DbSchemaTb,
+        dst_db_tb: &DbSchemaTb,
     ) -> anyhow::Result<()> {
         let src_data = self.rdb_test_runner.fetch_data(src_db_tb, SRC).await?;
 
-        let sql = format!("OPTIMIZE TABLE {}.{} FINAL", dst_db_tb.0, dst_db_tb.1);
+        let sql = format!("OPTIMIZE TABLE {}.{} FINAL", dst_db_tb.1, dst_db_tb.2);
         self.client.query(&sql).execute().await?;
         // Must use `SELECT ?fields` instead of `SELECT *`, otherwise the results is unpredictable.
         let src_tb_cols = self.rdb_test_runner.get_tb_cols(src_db_tb, SRC).await?;
         let sql = format!(
             "SELECT ?fields FROM {}.{} WHERE _ape_dts_is_deleted=0 ORDER BY {}",
-            dst_db_tb.0, dst_db_tb.1, src_tb_cols[0]
+            dst_db_tb.1, dst_db_tb.2, src_tb_cols[0]
         );
         let dst_data = self.client.query(&sql).fetch_all::<T>().await?;
 

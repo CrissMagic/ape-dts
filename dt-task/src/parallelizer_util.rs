@@ -1,9 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 
-use super::task_util::TaskUtil;
-use anyhow::anyhow;
 use dt_common::{
     config::{config_enums::ParallelType, task_config::TaskConfig},
+    error::{DtError, DtOptionExt},
     meta::redis::command::key_parser::KeyParser,
     monitor::task_monitor_handle::TaskMonitorHandle,
     utils::redis_util::RedisUtil,
@@ -15,6 +14,8 @@ use dt_parallelizer::{
     serial_parallelizer::SerialParallelizer, snapshot_parallelizer::SnapshotParallelizer,
     table_parallelizer::TableParallelizer, Merger, Parallelizer,
 };
+
+use super::task_util::TaskUtil;
 
 pub struct ParallelizerUtil {}
 
@@ -37,7 +38,9 @@ impl ParallelizerUtil {
                 chunk_partitioner_rebalance: config
                     .parallelizer
                     .chunk_partitioner_rebalance()
-                    .expect("snapshot parallelizer should have rebalance config")
+                    .or_dt_error(DtError::InvalidConfig(
+                        "snapshot parallelizer rebalance configuration is missing".to_string(),
+                    ))?
                     .clone(),
             }),
 
@@ -81,7 +84,7 @@ impl ParallelizerUtil {
                     base_parallelizer,
                     parallel_size,
                     slot_node_map,
-                    key_parser: KeyParser::new(),
+                    key_parser: KeyParser::new()?,
                     node_sinker_index_map: HashMap::new(),
                 })
             }
@@ -94,16 +97,26 @@ impl ParallelizerUtil {
     ) -> anyhow::Result<Box<dyn Merger + Send + Sync>> {
         let rdb_meta_manager = TaskUtil::create_rdb_meta_manager(config)
             .await?
-            .ok_or_else(|| anyhow!("failed to create RDB meta manager for merger target"))?;
+            .or_dt_error(DtError::InvalidConfig(
+                "the selected merger requires a relational database endpoint".to_string(),
+            ))?;
 
-        let rdb_merger = RdbMerger { rdb_meta_manager };
+        let allow_missing_meta = config
+            .task_type()
+            .is_some_and(|task_type| task_type.is_standalone_snapshot_check());
+        let rdb_merger = RdbMerger {
+            rdb_meta_manager,
+            allow_missing_meta,
+        };
         Ok(Box::new(rdb_merger))
     }
 
     async fn create_rdb_partitioner(config: &TaskConfig) -> anyhow::Result<RdbPartitioner> {
         let meta_manager = TaskUtil::create_rdb_meta_manager(config)
             .await?
-            .ok_or_else(|| anyhow!("failed to create RDB meta manager for partitioner target"))?;
+            .or_dt_error(DtError::InvalidConfig(
+                "the selected partitioner requires a relational database endpoint".to_string(),
+            ))?;
         Ok(RdbPartitioner { meta_manager })
     }
 

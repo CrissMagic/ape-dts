@@ -20,6 +20,7 @@ Raw forwarding preserves the source key, payload, and headers, including a null 
 - `offset` must be `-1`, `ack_interval_secs` must be explicitly greater than `0`, and no `[resumer]` section may be configured.
 - `[sinker].required_acks` accepts only `one` or `all` and defaults to `one`; `none` and other values fail during config loading. Use `all` when production durability requires acknowledgements from all current in-sync replicas.
 - Topic names support letters, digits, `.`, `_`, and `-`; empty targets, duplicate sources/targets, whitespace, and other delimiters are rejected.
+- If extractor and sinker use the same normalized Kafka bootstrap-server set, the target list must not contain `[extractor].topic`; configuration loading rejects this self-loop. Different aliases for the same cluster cannot be detected statically.
 
 ### Position and failure handling
 

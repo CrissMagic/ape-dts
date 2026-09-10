@@ -1,13 +1,13 @@
-use futures::TryStreamExt;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Ok};
+use futures::TryStreamExt;
 use sqlx::{mysql::MySqlRow, MySql, Pool, Row};
 
 use super::{mysql_col_type::MysqlColType, mysql_tb_meta::MysqlTbMeta};
 use crate::{
     config::config_enums::DbType,
-    error::Error,
+    error::{DtError, DtErrorContextExt, DtOptionExt, DtResultExt, ErrorObject},
     meta::{
         ddl_meta::ddl_data::DdlData, foreign_key::ForeignKey, rdb_meta_manager::RdbMetaManager,
         rdb_meta_manager::RDB_PRIMARY_KEY_FLAG, rdb_tb_meta::RdbTbMeta, row_data::RowData,
@@ -96,6 +96,7 @@ impl MysqlMetaFetcher {
             //     Self::get_foreign_keys(&self.conn_pool, &self.db_type, schema, tb).await?;
 
             let basic = RdbTbMeta {
+                db: String::new(),
                 schema: schema.to_string(),
                 tb: tb.to_string(),
                 cols,
@@ -114,7 +115,20 @@ impl MysqlMetaFetcher {
             };
             self.cache.insert(full_name.clone(), tb_meta);
         }
-        Ok(self.cache.get(&full_name).unwrap())
+        self.cache
+            .get(&full_name)
+            .or_dt_error(DtError::DatabaseObjectNotFound(self.db_type.clone(), format!(
+                "Ape-DTS could not find the previously loaded definition for source table {full_name}"
+            )))
+            .message("The source table definition could not be loaded")
+            .hint(
+                "Verify that the source table still exists and is readable, then restart the task.",
+            )
+            .object(ErrorObject {
+                schema: Some(schema.to_string()),
+                table: Some(tb.to_string()),
+                ..Default::default()
+            })
     }
 
     async fn parse_cols(
@@ -168,10 +182,15 @@ impl MysqlMetaFetcher {
         }
 
         if cols.is_empty() {
-            bail! {Error::MetadataError(format!(
-                    "failed to get table metadata for: `{}`.`{}`",
-                    schema, tb
-            )) }
+            bail! {DtError::DatabaseObjectNotFound(db_type.clone(), format!(
+                "failed to get table metadata for: `{}`.`{}`",
+                schema, tb
+            ))
+            .object(ErrorObject {
+                schema: Some(schema.to_string()),
+                table: Some(tb.to_string()),
+                ..Default::default()
+            }) }
         }
         Ok((cols, col_origin_type_map, col_type_map, nullable_cols))
     }
@@ -414,9 +433,11 @@ impl MysqlMetaFetcher {
             let ref_tb = SqlUtil::try_get_mysql_string(&row, "REFERENCED_TABLE_NAME")?;
             let ref_col = SqlUtil::try_get_mysql_string(&row, "REFERENCED_COLUMN_NAME")?;
             let key = ForeignKey {
+                db: String::new(),
                 schema: my_schema,
                 tb: my_tb,
                 col: my_col,
+                ref_db: String::new(),
                 ref_schema,
                 ref_tb,
                 ref_col,
@@ -440,6 +461,9 @@ impl MysqlMetaFetcher {
             self.version = version.trim().into();
             return Ok(());
         }
-        bail! {Error::MetadataError("failed to init mysql version".into())}
+        bail! {DtError::UnsupportedDatabaseVersion(
+            self.db_type.clone(),
+            "failed to initialize the database version".to_string(),
+        )}
     }
 }

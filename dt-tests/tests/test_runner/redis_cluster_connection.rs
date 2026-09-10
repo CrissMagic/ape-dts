@@ -1,10 +1,11 @@
+use std::collections::{HashMap, HashSet};
+
 use dt_common::utils::redis_util::RedisUtil;
 use dt_common::{
     config::connection_auth_config::ConnectionAuthConfig,
     meta::redis::command::key_parser::KeyParser,
 };
 use redis::Connection;
-use std::collections::{HashMap, HashSet};
 use url::Url;
 
 pub struct RedisClusterConnection {
@@ -46,7 +47,7 @@ impl RedisClusterConnection {
             slot_node_map,
             node_conn_map,
             default_conn: conn,
-            key_parser: KeyParser::new(),
+            key_parser: KeyParser::new()?,
         })
     }
 

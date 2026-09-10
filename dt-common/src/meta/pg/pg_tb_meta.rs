@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
-use anyhow::Context;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::meta::rdb_tb_meta::RdbTbMeta;
-
 use super::pg_col_type::PgColType;
+use crate::meta::rdb_tb_meta::RdbTbMeta;
+use crate::{
+    config::config_enums::DbType,
+    error::{DtError, DtOptionExt, DtResultExt, ErrorObject},
+};
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PgTbMeta {
@@ -24,11 +26,21 @@ impl std::fmt::Display for PgTbMeta {
 impl PgTbMeta {
     #[inline(always)]
     pub fn get_col_type(&self, col: &str) -> anyhow::Result<&PgColType> {
-        let col_type = self
-            .col_type_map
+        self.col_type_map
             .get(col)
-            .with_context(|| format!("col: [{}] not exists in tb_meta: [{}]", col, self))
-            .unwrap();
-        Ok(col_type)
+            .or_dt_error(DtError::DatabaseObjectNotFound(DbType::Pg, format!(
+                "column {col} is missing from the PostgreSQL definition for {}.{}",
+                self.basic.schema, self.basic.tb
+            )))
+            .message("A required source column was not found in the loaded table definition")
+            .hint(
+                "Check configured column names and whether the source table changed, then restart the task to reload its definition.",
+            )
+            .object(ErrorObject {
+                schema: Some(self.basic.schema.clone()),
+                table: Some(self.basic.tb.clone()),
+                column: Some(col.to_string()),
+                ..Default::default()
+            })
     }
 }
