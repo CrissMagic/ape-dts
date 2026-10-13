@@ -6,7 +6,9 @@ mod test {
     use dt_common::config::config_enums::DbType;
     use serial_test::serial;
 
-    use crate::test_runner::test_base::TestBase;
+    use crate::test_runner::{
+        test_base::TestBase, test_cases::rdb_order_key_test::run_order_key_test,
+    };
 
     #[tokio::test]
     #[serial]
@@ -16,9 +18,8 @@ mod test {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "requires SSL-enabled MySQL instances and configured ssl_ca_path"]
-    async fn snapshot_ssl_test() {
-        TestBase::run_snapshot_test("mysql_to_mysql/snapshot/ssl_test").await;
+    async fn snapshot_order_key_test() -> anyhow::Result<()> {
+        run_order_key_test(DbType::Mysql).await
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ mod test {
     use crate::test_runner::{
         rdb_test_runner::{RdbTestRunner, DST},
         test_base::TestBase,
+        test_cases::rdb_order_key_test::run_order_key_test,
     };
 
     async fn run_resume_test(test_dir: &str, expected_counts: &[(&str, usize)]) {
@@ -31,8 +32,8 @@ mod test {
 
     #[tokio::test]
     #[serial]
-    async fn snapshot_ssl_test() {
-        TestBase::run_snapshot_test("mssql_to_mssql/snapshot/ssl_test").await;
+    async fn snapshot_order_key_test() -> anyhow::Result<()> {
+        run_order_key_test(DbType::Mssql).await
     }
 
     #[tokio::test]

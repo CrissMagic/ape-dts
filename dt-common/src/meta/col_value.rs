@@ -33,6 +33,7 @@ pub enum ColValue {
     Timestamp(String),
     Year(u16),
     String(String),
+    Spatial { srid: i32, wkt: String },
     RawString(Vec<u8>),
     Blob(Vec<u8>),
     Bit(u64),
@@ -177,6 +178,19 @@ impl ColValue {
         }
     }
 
+    pub fn is_same_raw_value(&self, other: &ColValue) -> bool {
+        if self.is_integer() && other.is_integer() {
+            return match (
+                self.convert_into_integer_128(),
+                other.convert_into_integer_128(),
+            ) {
+                (Ok(v1), Ok(v2)) => v1 == v2,
+                _ => false,
+            };
+        }
+        return self.is_same_value(other);
+    }
+
     pub fn hash_code(&self) -> anyhow::Result<u64> {
         if matches!(self, ColValue::None | ColValue::UnchangedToast) {
             return Ok(0);
@@ -226,6 +240,7 @@ impl ColValue {
             ColValue::Timestamp(_) => "Timestamp",
             ColValue::Year(_) => "Year",
             ColValue::String(_) => "String",
+            ColValue::Spatial { .. } => "Spatial",
             ColValue::RawString(_) => "RawString",
             ColValue::Blob(_) => "Blob",
             ColValue::Bit(_) => "Bit",
@@ -261,6 +276,7 @@ impl ColValue {
             ColValue::Timestamp(v) => Some(v.to_string()),
             ColValue::Year(v) => Some(v.to_string()),
             ColValue::String(v) => Some(v.to_string()),
+            ColValue::Spatial { srid, wkt } => Some(format!("{srid}|{wkt}")),
             ColValue::RawString(v) => Some(hex::encode(v)),
             ColValue::Bit(v) => Some(v.to_string()),
             ColValue::Set(v) => Some(v.to_string()),
@@ -329,6 +345,7 @@ impl ColValue {
             | ColValue::Set2(v)
             | ColValue::Enum2(v)
             | ColValue::Json2(v) => v.len(),
+            ColValue::Spatial { wkt, .. } => std::mem::size_of::<i32>() + wkt.len(),
             ColValue::Json(v) | ColValue::Blob(v) | ColValue::RawString(v) => v.len(),
             ColValue::Json3(v) => v.to_string().len(),
             ColValue::MongoDoc(v) => Self::get_bson_size_doc(v),
@@ -404,6 +421,7 @@ impl Serialize for ColValue {
             ColValue::Timestamp(v) => serializer.serialize_str(v),
             ColValue::Year(v) => serializer.serialize_u16(*v),
             ColValue::String(v) => serializer.serialize_str(v),
+            ColValue::Spatial { srid, wkt } => serializer.serialize_str(&format!("{srid}|{wkt}")),
             ColValue::RawString(v) => serializer.serialize_bytes(v),
             ColValue::Blob(v) => serializer.serialize_bytes(v),
             ColValue::Bit(v) => serializer.serialize_u64(*v),
@@ -456,6 +474,8 @@ impl From<Bson> for ColValue {
 mod tests {
     use std::collections::BTreeMap;
 
+    use serde::Deserialize;
+
     use super::*;
     use crate::meta::tagged_col_value_map;
     use crate::meta::tagged_col_value_map::TaggedColValueDef as MetaTaggedColValueDef;
@@ -471,6 +491,88 @@ mod tests {
         assert!(v2.is_same_value(&ColValue::Double(f64::NAN)));
         assert!(v3.is_same_value(&ColValue::None));
         assert!(v4.is_same_value(&ColValue::Long(7)));
+    }
+
+    #[test]
+    fn test_is_same_raw_value() {
+        let integers = [
+            ColValue::Tiny(7),
+            ColValue::UnsignedTiny(7),
+            ColValue::Short(7),
+            ColValue::UnsignedShort(7),
+            ColValue::Long(7),
+            ColValue::UnsignedLong(7),
+            ColValue::LongLong(7),
+            ColValue::UnsignedLongLong(7),
+        ];
+        for left in &integers {
+            for right in &integers {
+                assert!(left.is_same_raw_value(right), "{left:?} != {right:?}");
+            }
+            assert!(!left.is_same_raw_value(&ColValue::LongLong(8)));
+        }
+
+        let cases = [
+            (ColValue::Tiny(-1), ColValue::LongLong(-1), true),
+            (ColValue::Tiny(0), ColValue::UnsignedLongLong(0), true),
+            (ColValue::Tiny(-1), ColValue::UnsignedTiny(u8::MAX), false),
+            (
+                ColValue::LongLong(-1),
+                ColValue::UnsignedLongLong(u64::MAX),
+                false,
+            ),
+            (
+                ColValue::LongLong(i64::MAX),
+                ColValue::UnsignedLongLong(i64::MAX as u64),
+                true,
+            ),
+            (
+                ColValue::LongLong(i64::MIN),
+                ColValue::UnsignedLongLong(i64::MAX as u64 + 1),
+                false,
+            ),
+            (
+                ColValue::UnsignedLongLong(u64::MAX),
+                ColValue::UnsignedLongLong(u64::MAX),
+                true,
+            ),
+            (ColValue::Long(7), ColValue::String("7".into()), false),
+            (ColValue::Long(7), ColValue::Double(7.0), false),
+            (ColValue::Float(f32::NAN), ColValue::Float(f32::NAN), true),
+            (ColValue::Double(f64::NAN), ColValue::Double(f64::NAN), true),
+            (ColValue::Float(7.0), ColValue::Double(7.0), false),
+            (
+                ColValue::RawString(b"test".to_vec()),
+                ColValue::String("test".into()),
+                true,
+            ),
+            (
+                ColValue::RawString(b"test".to_vec()),
+                ColValue::String("other".into()),
+                false,
+            ),
+            (
+                ColValue::RawString(vec![0xff]),
+                ColValue::String("\u{fffd}".into()),
+                false,
+            ),
+            (ColValue::None, ColValue::None, true),
+            (ColValue::None, ColValue::Long(0), false),
+            (ColValue::UnchangedToast, ColValue::UnchangedToast, true),
+            (ColValue::None, ColValue::UnchangedToast, false),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(
+                left.is_same_raw_value(&right),
+                expected,
+                "{left:?} vs {right:?}"
+            );
+            assert_eq!(
+                right.is_same_raw_value(&left),
+                expected,
+                "{right:?} vs {left:?}"
+            );
+        }
     }
 
     #[test]
@@ -540,5 +642,29 @@ mod tests {
             ColValue::RawString(vec![0xff, 0xfe]).to_utf8_or_hex_string(),
             Some("fffe".to_string())
         );
+    }
+
+    #[test]
+    fn test_spatial_value_serialization() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct TaggedValues {
+            #[serde(with = "tagged_col_value_map")]
+            values: BTreeMap<String, ColValue>,
+        }
+
+        let value = ColValue::Spatial {
+            srid: 4326,
+            wkt: "POINT (-122.36 47.656)".to_string(),
+        };
+        let transfer_value = "4326|POINT (-122.36 47.656)";
+        assert_eq!(value.to_option_string().as_deref(), Some(transfer_value));
+        assert_eq!(serde_json::to_value(&value).unwrap(), transfer_value);
+
+        let expected = TaggedValues {
+            values: BTreeMap::from([("shape".to_string(), value)]),
+        };
+        let serialized = serde_json::to_string(&expected).unwrap();
+        let actual: TaggedValues = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(actual, expected);
     }
 }
