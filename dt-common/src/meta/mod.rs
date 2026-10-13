@@ -9,6 +9,7 @@ pub mod dt_data;
 pub mod dt_queue;
 pub mod foreign_key;
 pub mod kafka;
+pub mod json;
 pub mod mongo;
 pub mod mssql;
 pub mod mysql;

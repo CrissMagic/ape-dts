@@ -73,6 +73,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 openssl-sys = { version = "0.9", features = ["vendored"]}
 actix-web = "=4.12.1"
 hex = "0.4.3"
+base64 = "0.22.1"
 clickhouse = "0.13.1"
 dashmap = "6.1.0"
 percent-encoding = "2.3.1"

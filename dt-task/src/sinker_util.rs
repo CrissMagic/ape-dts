@@ -6,6 +6,7 @@ use dt_common::{
     error::{DtError, DtOptionExt},
     meta::{
         avro::avro_converter::AvroConverter,
+        json::json_converter::JsonConverter,
         mongo::mongo_shard::{is_mongos, list_shard_collections},
         mssql::mssql_meta_manager::MssqlMetaManager,
         mysql::mysql_meta_manager::MysqlMetaManager,
@@ -307,6 +308,8 @@ impl SinkerUtil {
                 ack_timeout_secs,
                 required_acks,
                 with_field_defs,
+                message_format,
+                json_template,
                 skip_confirmed_noop_updates,
             } => {
                 let router = RdbRouter::from_config_for_topic(
@@ -316,7 +319,23 @@ impl SinkerUtil {
                 )?;
                 // kafka sinker may need meta data from RDB extractor
                 let meta_manager = ExtractorUtil::get_extractor_meta_manager(config).await?;
-                let avro_converter = AvroConverter::new(meta_manager, with_field_defs)?;
+                let avro_converter = AvroConverter::new(meta_manager.clone(), with_field_defs)?;
+                let database_name =
+                    Url::parse(&config.extractor_basic.url)
+                        .ok()
+                        .and_then(|source_url| {
+                            let db = source_url
+                                .path()
+                                .trim_start_matches('/')
+                                .split('/')
+                                .next()?;
+                            (!db.is_empty()).then(|| db.to_string())
+                        });
+                let json_converter = JsonConverter::new_with_template(
+                    meta_manager,
+                    message_format.json_template(json_template),
+                    database_name,
+                );
 
                 let brokers = vec![url.to_string()];
                 let acks = match required_acks.as_str() {
@@ -357,6 +376,8 @@ impl SinkerUtil {
                         raw_producer,
                         raw_queue_timeout_secs: ack_timeout_secs,
                         avro_converter: avro_converter.clone(),
+                        json_converter: json_converter.clone(),
+                        message_format: message_format.clone(),
                         source_db_type: config.extractor_basic.db_type.clone(),
                         skip_confirmed_noop_updates,
                         base_sinker: BaseSinker::new(monitor.clone(), monitor_interval),

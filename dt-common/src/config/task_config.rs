@@ -1007,6 +1007,8 @@ impl TaskConfig {
                     "one".to_string(),
                 )?,
                 with_field_defs: loader.get_with_default(SINKER, "with_field_defs", true)?,
+                message_format: loader.get_optional(SINKER, "message_format")?,
+                json_template: loader.get_optional(SINKER, "json_template")?,
                 skip_confirmed_noop_updates: loader.get_with_default(
                     SINKER,
                     "skip_confirmed_noop_updates",
@@ -2235,6 +2237,128 @@ parallel_type=serial
 parallel_size=1
 "#
         )
+    }
+
+    #[tokio::test]
+    async fn pg_kafka_ini_selects_cloudcanal_json_output() {
+        use std::collections::HashMap;
+
+        use crate::config::message_format::MessageFormat;
+        use crate::meta::{
+            col_value::ColValue, json::json_converter::JsonConverter, row_data::RowData,
+            row_type::RowType,
+        };
+
+        let config = TaskConfig::new_from_str(&pg_cdc_to_kafka_config(
+            "with_field_defs=true\nmessage_format=json\njson_template=cloudcanal",
+        ))
+        .unwrap();
+        let SinkerConfig::Kafka {
+            message_format,
+            json_template,
+            ..
+        } = config.sinker
+        else {
+            panic!("expected Kafka sinker config");
+        };
+        assert_eq!(message_format, MessageFormat::Json);
+        let mut converter = JsonConverter::new_with_template(
+            None,
+            message_format.json_template(json_template),
+            Some("data_demo".to_string()),
+        );
+        let row_data = RowData::new(
+            "data_demo".to_string(),
+            "public".to_string(),
+            "cdc_sample".to_string(),
+            0,
+            RowType::Insert,
+            None,
+            Some(HashMap::from([
+                ("id".to_string(), ColValue::Long(7)),
+                ("nullable_value".to_string(), ColValue::None),
+                (
+                    "payload".to_string(),
+                    ColValue::Json3(serde_json::json!({"ok": true})),
+                ),
+                ("binary_value".to_string(), ColValue::Blob(vec![0, 255])),
+            ])),
+        );
+        let payload = converter.row_data_to_json_value(&row_data).await.unwrap();
+        let message: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(message["action"], "INSERT");
+        assert_eq!(message["db"], "data_demo");
+        assert_eq!(message["schema"], "public");
+        assert_eq!(message["table"], "cdc_sample");
+        assert_eq!(message["data"][0]["id"], 7);
+        assert!(message["data"][0]["nullable_value"].is_null());
+        assert_eq!(
+            message["data"][0]["payload"],
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(message["data"][0]["binary_value"], "AP8=");
+        assert!(message.get("before").is_none());
+    }
+
+    #[tokio::test]
+    async fn pg_kafka_without_encoding_options_keeps_avro_round_trip() {
+        use crate::{
+            config::{json_template_type::JsonTemplateType, message_format::MessageFormat},
+            meta::{
+                avro::avro_converter::AvroConverter, col_value::ColValue, dt_data::DtData,
+                row_data::RowData, row_type::RowType,
+            },
+        };
+
+        let config = TaskConfig::new_from_str(&pg_cdc_to_kafka_config("")).unwrap();
+        let SinkerConfig::Kafka {
+            message_format,
+            json_template,
+            with_field_defs,
+            ..
+        } = config.sinker
+        else {
+            panic!("expected Kafka sinker config");
+        };
+        assert_eq!(message_format, MessageFormat::Avro);
+        assert_eq!(json_template, JsonTemplateType::Standard);
+        assert!(with_field_defs);
+        let mut converter = AvroConverter::new(None, with_field_defs).unwrap();
+        let row_data = RowData::new(
+            "data_demo".to_string(),
+            "public".to_string(),
+            "cdc_sample".to_string(),
+            0,
+            RowType::Insert,
+            None,
+            Some(std::collections::HashMap::from([
+                ("name".to_string(), ColValue::String("sample".to_string())),
+                ("nullable_value".to_string(), ColValue::None),
+            ])),
+        );
+        let encoded = converter.row_data_to_avro_value(&row_data).await.unwrap();
+        let DtData::Dml { row_data: decoded } = converter.avro_value_to_dt_data(encoded).unwrap()
+        else {
+            panic!("expected decoded DML row");
+        };
+        assert_eq!(decoded, row_data);
+    }
+
+    #[test]
+    fn pg_kafka_rejects_unknown_encoding_options_before_startup() {
+        for option in [
+            "message_format=unsupported",
+            "message_format=json\njson_template=unsupported",
+        ] {
+            let error = TaskConfig::new_from_str(&pg_cdc_to_kafka_config(option))
+                .err()
+                .expect("unsupported encoding must fail instead of silently sending Avro");
+            assert_eq!(
+                ErrorReport::from_anyhow(&error).code,
+                ErrorCode::InvalidConfig
+            );
+        }
     }
 
     #[test]

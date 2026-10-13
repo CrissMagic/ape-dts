@@ -2,7 +2,9 @@ use super::config_enums::{ConflictPolicyEnum, DbType};
 use crate::config::{
     config_enums::{RdbTransactionIsolation, SinkType},
     connection_auth_config::ConnectionAuthConfig,
+    json_template_type::JsonTemplateType,
     limiter_config::RateLimiterConfig,
+    message_format::MessageFormat,
     task_config::APE_DTS,
 };
 
@@ -72,6 +74,8 @@ pub enum SinkerConfig {
         ack_timeout_secs: u64,
         required_acks: String,
         with_field_defs: bool,
+        message_format: MessageFormat,
+        json_template: JsonTemplateType,
         skip_confirmed_noop_updates: bool,
     },
 

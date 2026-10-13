@@ -9,11 +9,12 @@ use tokio::time::{Duration, Instant};
 
 use crate::{call_batch_fn, rdb_router::RdbRouter, sinker::base_sinker::BaseSinker, Sinker};
 use dt_common::{
-    config::config_enums::DbType,
+    config::{config_enums::DbType, message_format::MessageFormat},
     meta::{
         avro::avro_converter::AvroConverter,
         ddl_meta::ddl_data::DdlData,
         dt_data::{DtData, DtItem},
+        json::json_converter::JsonConverter,
         kafka::kafka_message::KafkaMessage,
         row_data::RowData,
         row_type::RowType,
@@ -28,6 +29,8 @@ pub struct KafkaSinker {
     pub raw_producer: FutureProducer,
     pub raw_queue_timeout_secs: u64,
     pub avro_converter: AvroConverter,
+    pub json_converter: JsonConverter,
+    pub message_format: MessageFormat,
     pub source_db_type: DbType,
     pub skip_confirmed_noop_updates: bool,
     pub base_sinker: BaseSinker,
@@ -53,7 +56,7 @@ impl Sinker for KafkaSinker {
             return Ok(());
         }
 
-        call_batch_fn!(self, data, Self::send_avro);
+        call_batch_fn!(self, data, Self::send_rows);
         Ok(())
     }
 
@@ -61,7 +64,14 @@ impl Sinker for KafkaSinker {
         let mut messages = Vec::new();
         for ddl_data in data {
             let target_topics = self.get_ddl_target_topics(&ddl_data.default_schema);
-            let payload = self.avro_converter.ddl_data_to_avro_value(ddl_data).await?;
+            let payload = match self.message_format {
+                MessageFormat::Avro => self.avro_converter.ddl_data_to_avro_value(ddl_data).await?,
+                MessageFormat::Json | MessageFormat::JsonTemplate(_) => self
+                    .json_converter
+                    .ddl_data_to_json_value(ddl_data)
+                    .await?
+                    .into_bytes(),
+            };
             for topic in target_topics {
                 messages.push(KafkaSinkMessage {
                     key: String::new(),
@@ -104,6 +114,7 @@ impl Sinker for KafkaSinker {
 
     async fn refresh_meta(&mut self, data: Vec<DdlData>) -> anyhow::Result<()> {
         self.avro_converter.refresh_meta(&data);
+        self.json_converter.refresh_meta(&data);
         Ok(())
     }
 }
@@ -143,7 +154,7 @@ impl KafkaSinker {
         true
     }
 
-    async fn send_avro(
+    async fn send_rows(
         &mut self,
         data: &mut [RowData],
         sinked_count: usize,
@@ -160,8 +171,19 @@ impl KafkaSinker {
             data_size += row_data.get_data_size();
             row_data.convert_raw_string();
             let target_topics = self.get_row_target_topics(&row_data.schema, &row_data.tb);
-            let key = self.avro_converter.row_data_to_avro_key(row_data).await?;
-            let payload = self.avro_converter.row_data_to_avro_value(row_data).await?;
+            let (key, payload) = match self.message_format {
+                MessageFormat::Avro => (
+                    self.avro_converter.row_data_to_avro_key(row_data).await?,
+                    self.avro_converter.row_data_to_avro_value(row_data).await?,
+                ),
+                MessageFormat::Json | MessageFormat::JsonTemplate(_) => (
+                    self.json_converter.row_data_to_json_key(row_data).await?,
+                    self.json_converter
+                        .row_data_to_json_value(row_data)
+                        .await?
+                        .into_bytes(),
+                ),
+            };
             for topic in target_topics {
                 messages.push(KafkaSinkMessage {
                     key: key.clone(),
