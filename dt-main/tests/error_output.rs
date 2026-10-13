@@ -10,11 +10,18 @@ fn run(args: &[&str]) -> Output {
 }
 
 #[test]
-fn missing_config_panics_before_logger_initialization() {
+fn missing_config_is_argument_error_before_logger_initialization() {
     let output = run(&[]);
-    assert_eq!(output.status.code(), Some(101));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("task config path is required"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "--config-path, --config, or positional CONFIG is required when --config-source=local"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!stderr.contains("__APE_DTS_ERROR_CONTEXT__"), "{stderr}");
     assert!(!stderr.contains("DIAGNOSTIC"), "{stderr}");
 }
