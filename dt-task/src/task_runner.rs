@@ -83,6 +83,7 @@ pub struct TaskRunner {
     task_monitor: Arc<TaskMonitor>,
     #[cfg(feature = "metrics")]
     prometheus_metrics: Arc<PrometheusMetrics>,
+    shutdown: CancellationToken,
 }
 
 fn init_task_check_summary() -> CheckSummaryLog {
@@ -128,7 +129,13 @@ impl TaskRunner {
             #[cfg(feature = "metrics")]
             prometheus_metrics,
             task_type,
+            shutdown: CancellationToken::new(),
         })
+    }
+
+    pub fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     pub async fn start_task(&self, is_init: bool) -> anyhow::Result<()> {
@@ -197,7 +204,7 @@ impl TaskRunner {
             .as_ref()
             .is_some_and(|task_type| matches!(task_type.kind, TaskKind::Snapshot))
             && task_info.no_snapshot_data;
-        if !should_skip_task {
+        if !should_skip_task && !self.shutdown.is_cancelled() {
             self.clone()
                 .create_task(
                     task_info.extractor_config,
@@ -215,6 +222,12 @@ impl TaskRunner {
         // close connections
         extractor_client.close().await?;
         sinker_client.close().await?;
+
+        if self.shutdown.is_cancelled() {
+            log_info!("task stopped gracefully");
+            log::logger().flush();
+            return Ok(());
+        }
 
         if let Some(check_summary) = check_summary.as_ref() {
             if self.config.checker.is_none()
@@ -576,8 +589,13 @@ impl TaskRunner {
             Ok(())
         });
 
-        let worker_result =
-            Self::run_task_workers(extractor.clone(), pipeline.clone(), shut_down.clone()).await;
+        let worker_result = Self::run_task_workers(
+            extractor.clone(),
+            pipeline.clone(),
+            shut_down.clone(),
+            self.shutdown.clone(),
+        )
+        .await;
 
         monitor_shutdown.cancel();
         let monitor_result = monitor_task
@@ -600,11 +618,12 @@ impl TaskRunner {
         extractor: Arc<Mutex<Box<dyn Extractor + Send>>>,
         pipeline: Arc<Mutex<Box<dyn Pipeline + Send>>>,
         shut_down: Arc<AtomicBool>,
+        shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut join_set = JoinSet::new();
 
         let extractor_worker = extractor.clone();
-        join_set.spawn(runtime_trace::trace_task_future(
+        let extractor_abort = join_set.spawn(runtime_trace::trace_task_future(
             "task.extractor_worker",
             async move {
                 (
@@ -627,14 +646,24 @@ impl TaskRunner {
         let mut extractor_done = false;
         let mut pipeline_done = false;
         let mut failure = None;
-        let mut mark_done = |kind| match kind {
-            SingleTaskWorker::Extractor => extractor_done = true,
-            SingleTaskWorker::Pipeline => pipeline_done = true,
+        let mark_done = |kind, extractor_done: &mut bool, pipeline_done: &mut bool| match kind {
+            SingleTaskWorker::Extractor => *extractor_done = true,
+            SingleTaskWorker::Pipeline => *pipeline_done = true,
         };
 
-        while let Some(result) = join_set.join_next().await {
+        let mut graceful_shutdown = false;
+        loop {
+            let result = tokio::select! {
+                biased;
+                result = join_set.join_next() => result,
+                _ = shutdown.cancelled() => {
+                    graceful_shutdown = true;
+                    break;
+                }
+            };
+            let Some(result) = result else { break };
             match result {
-                Ok((kind, Ok(()))) => mark_done(kind),
+                Ok((kind, Ok(()))) => mark_done(kind, &mut extractor_done, &mut pipeline_done),
                 Ok((kind, Err(err))) => {
                     failure = Some((Some(kind), err));
                     break;
@@ -646,13 +675,84 @@ impl TaskRunner {
             }
         }
 
+        if graceful_shutdown && failure.is_none() {
+            let extractor_id = extractor_abort.id();
+            let mut close_extractor = false;
+            if !extractor_done {
+                extractor_abort.abort();
+                while !extractor_done {
+                    let Some(result) = join_set.join_next_with_id().await else {
+                        break;
+                    };
+                    match result {
+                        Ok((_, (kind, Ok(())))) => {
+                            mark_done(kind, &mut extractor_done, &mut pipeline_done)
+                        }
+                        Ok((_, (kind, Err(err)))) => {
+                            mark_done(kind, &mut extractor_done, &mut pipeline_done);
+                            failure = Some((Some(kind), err));
+                            break;
+                        }
+                        Err(join_err)
+                            if join_err.id() == extractor_id && join_err.is_cancelled() =>
+                        {
+                            extractor_done = true;
+                            close_extractor = true;
+                        }
+                        Err(join_err) => {
+                            failure = Some((None, join_err.into()));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let close_error = if close_extractor {
+                Self::close_extractor_after_abort(extractor.clone())
+                    .await
+                    .err()
+            } else {
+                None
+            };
+
+            // Only signal the pipeline after the extractor can no longer enqueue data.
+            shut_down.store(true, Ordering::Release);
+            while failure.is_none() {
+                let Some(result) = join_set.join_next().await else {
+                    break;
+                };
+                match result {
+                    Ok((kind, Ok(()))) => mark_done(kind, &mut extractor_done, &mut pipeline_done),
+                    Ok((kind, Err(err))) => {
+                        mark_done(kind, &mut extractor_done, &mut pipeline_done);
+                        failure = Some((Some(kind), err));
+                    }
+                    Err(join_err) if join_err.is_cancelled() => {}
+                    Err(join_err) => failure = Some((None, join_err.into())),
+                }
+            }
+
+            if failure.is_none() {
+                return match close_error {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                };
+            }
+            if let Some(close_err) = close_error {
+                log_error!(
+                    "extractor close also failed during graceful shutdown: {:#}",
+                    close_err
+                );
+            }
+        }
+
         if let Some((failed_worker, err)) = failure {
             shut_down.store(true, Ordering::Release);
             join_set.abort_all();
 
             while let Some(result) = join_set.join_next().await {
                 match result {
-                    Ok((kind, Ok(()))) => mark_done(kind),
+                    Ok((kind, Ok(()))) => mark_done(kind, &mut extractor_done, &mut pipeline_done),
                     Ok((kind, Err(shutdown_err))) => {
                         log_error!(
                             "single task worker [{}] also failed during shutdown, error: {:#}",
@@ -1558,11 +1658,144 @@ impl TaskRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::SystemTime};
+    use std::{
+        fs,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex as StdMutex,
+        },
+        time::{Duration, SystemTime},
+    };
 
+    use async_trait::async_trait;
+    use dt_connector::Extractor;
+    use dt_pipeline::Pipeline;
     use opendal::{services::Memory, Operator};
+    use tokio::sync::{Mutex, Notify};
+    use tokio_util::sync::CancellationToken;
 
     use super::TaskRunner;
+
+    struct CancelGuard(Arc<StdMutex<Vec<&'static str>>>);
+
+    impl Drop for CancelGuard {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("extractor_cancelled");
+        }
+    }
+
+    struct PendingExtractor {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        started: Arc<Notify>,
+        fail_close: bool,
+    }
+
+    #[async_trait]
+    impl Extractor for PendingExtractor {
+        async fn extract(&mut self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("extractor_started");
+            let _guard = CancelGuard(self.events.clone());
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("extractor_closed");
+            if self.fail_close {
+                anyhow::bail!("close failed");
+            }
+            Ok(())
+        }
+    }
+
+    struct DrainingPipeline {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        shut_down: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Pipeline for DrainingPipeline {
+        async fn start(&mut self) -> anyhow::Result<()> {
+            while !self.shut_down.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            self.events.lock().unwrap().push("pipeline_drained");
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("pipeline_stopped");
+            Ok(())
+        }
+    }
+
+    async fn run_graceful_shutdown_test(
+        fail_close: bool,
+    ) -> (anyhow::Result<()>, Vec<&'static str>) {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let started = Arc::new(Notify::new());
+        let shut_down = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let extractor: Arc<Mutex<Box<dyn Extractor + Send>>> =
+            Arc::new(Mutex::new(Box::new(PendingExtractor {
+                events: events.clone(),
+                started: started.clone(),
+                fail_close,
+            })));
+        let pipeline: Arc<Mutex<Box<dyn Pipeline + Send>>> =
+            Arc::new(Mutex::new(Box::new(DrainingPipeline {
+                events: events.clone(),
+                shut_down: shut_down.clone(),
+            })));
+
+        let worker = tokio::spawn(TaskRunner::run_task_workers(
+            extractor,
+            pipeline,
+            shut_down,
+            shutdown.clone(),
+        ));
+        started.notified().await;
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("graceful shutdown timed out")
+            .expect("worker task panicked");
+        let recorded = events.lock().unwrap().clone();
+        (result, recorded)
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_closes_extractor_before_draining_pipeline() {
+        let (result, events) = run_graceful_shutdown_test(false).await;
+        result.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                "extractor_started",
+                "extractor_cancelled",
+                "extractor_closed",
+                "pipeline_drained",
+                "pipeline_stopped"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_pipeline_when_extractor_close_fails() {
+        let (result, events) = run_graceful_shutdown_test(true).await;
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("close failed"));
+        assert_eq!(
+            events,
+            vec![
+                "extractor_started",
+                "extractor_cancelled",
+                "extractor_closed",
+                "pipeline_drained",
+                "pipeline_stopped"
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn upload_local_check_logs_to_s3_deletes_empty_optional_logs() {

@@ -97,7 +97,8 @@ impl Pipeline for BasePipeline {
             let shutting_down = self.shut_down.load(Ordering::Acquire);
             let buffer_empty = self.buffer.is_empty();
             let pending_finish_empty = self.pending_snapshot_finished.is_empty();
-            let has_pending_work = !buffer_empty || !pending_finish_empty;
+            let has_pending_work =
+                !buffer_empty || !pending_finish_empty || self.parallelizer.has_pending_data();
 
             if shutting_down && !has_pending_work {
                 break;
@@ -134,7 +135,8 @@ impl Pipeline for BasePipeline {
             }
 
             // some sinkers need to accumulate data to a big batch and sink
-            let data = if last_sink_time.elapsed().as_secs() < self.batch_sink_interval_secs
+            let data = if !shutting_down
+                && last_sink_time.elapsed().as_secs() < self.batch_sink_interval_secs
                 && !self.buffer.is_full()
             {
                 Vec::new()
@@ -612,46 +614,64 @@ impl BasePipeline {
             log_position!("checkpoint_position | {}", position.to_string());
         }
 
+        // A CDC row position inside an open transaction is only a receive watermark. Advancing
+        // the durable checkpoint to it could skip the rest of that transaction after restart.
+        // Snapshot positions remain resumable chunk watermarks, while raw streams add their
+        // independently committable positions to commit_positions in fetch_raw.
+        let fallback_position = (!matches!(
+            last_received_position,
+            Position::MysqlCdc { .. } | Position::PgCdc { .. }
+        ))
+        .then_some(last_received_position);
         let checker_position = commit_positions
             .last()
             .map(|(_, position)| *position)
-            .unwrap_or(last_received_position);
+            .or(fallback_position);
 
-        if self.propagate_checkpoint_to_sinker && !matches!(checker_position, Position::None) {
+        if self.propagate_checkpoint_to_sinker
+            && checker_position.is_some_and(|position| !matches!(position, Position::None))
+        {
             // Lifecycle-aware decorators are attached to the last sinker so their close hook
             // runs after every regular sinker has closed.
             if let Some(sinker) = self.sinkers.last() {
                 if let Err(err) = sinker
                     .lock()
                     .await
-                    .record_checkpoint(checker_position)
+                    .record_checkpoint(checker_position.expect("checked above"))
                     .await
                 {
+                    if last_checkpoint_time.is_none() {
+                        return Err(err);
+                    }
                     log_warn!("sinker checkpoint hook failed: {}", err);
                 }
             }
         }
         if let Some(handler) = &self.recorder {
             if commit_positions.is_empty() {
-                if let Err(e) = handler.record_position(last_received_position).await {
-                    log_error!(
-                        "failed to record position: {}, err: {:#}",
-                        last_received_position,
-                        e
-                    );
+                if let Some(position) = fallback_position {
+                    if let Err(e) = handler.record_position(position).await {
+                        if last_checkpoint_time.is_none() {
+                            return Err(e);
+                        }
+                        log_error!("failed to record position: {}, err: {:#}", position, e);
+                    }
                 }
             } else {
                 for (_, position) in commit_positions.iter() {
                     if let Err(e) = handler.record_position(position).await {
+                        if last_checkpoint_time.is_none() {
+                            return Err(e);
+                        }
                         log_error!("failed to record position: {}, err: {:#}", position, e);
                     }
                 }
             }
         }
 
-        if !matches!(checker_position, Position::None) {
+        if let Some(checker_position) = checker_position.filter(|p| !matches!(p, Position::None)) {
             let mut syncer = self.syncer.lock().await;
-            syncer.committed_position = checker_position.to_owned();
+            syncer.committed_position = checker_position.clone();
             if !last_commit_positions.is_empty() {
                 syncer.committed_positions = last_commit_positions.clone();
             }
@@ -669,17 +689,166 @@ impl BasePipeline {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use dt_common::meta::{
-        dt_data::{DtData, DtItem},
-        kafka::kafka_message::KafkaMessage,
-        position::Position,
-        redis::redis_entry::RedisEntry,
+    use std::{
+        collections::HashMap,
+        sync::{atomic::AtomicBool, Arc, Mutex as StdMutex},
+        time::Duration,
     };
-    use dt_connector::extractor::resumer::utils::ResumerUtil;
 
-    use super::BasePipeline;
+    use async_trait::async_trait;
+    use dt_common::{
+        config::sinker_config::SinkerConfig,
+        meta::{
+            dt_data::{DtData, DtItem},
+            dt_queue::DtQueue,
+            kafka::kafka_message::KafkaMessage,
+            position::Position,
+            redis::redis_entry::RedisEntry,
+            row_data::RowData,
+            row_type::RowType,
+            syncer::Syncer,
+        },
+        monitor::{task_monitor::MonitorType, task_monitor_handle::TaskMonitorHandle},
+    };
+    use dt_connector::{extractor::resumer::utils::ResumerUtil, Sinker};
+    use dt_parallelizer::{
+        base_parallelizer::BaseParallelizer, serial_parallelizer::SerialParallelizer,
+    };
+    use tokio::sync::Mutex;
+
+    use super::{BasePipeline, Pipeline};
+
+    #[derive(Default)]
+    struct RecordingState {
+        sunk_items: usize,
+        checkpoints: Vec<Position>,
+        controls: Vec<Position>,
+        fail_checkpoint: bool,
+        closed_positions: Vec<Option<Position>>,
+    }
+
+    struct RecordingSinker(Arc<StdMutex<RecordingState>>);
+
+    #[async_trait]
+    impl Sinker for RecordingSinker {
+        async fn sink_dml(&mut self, data: Vec<RowData>, _batch: bool) -> anyhow::Result<()> {
+            self.0.lock().unwrap().sunk_items += data.len();
+            Ok(())
+        }
+
+        async fn sink_raw(&mut self, data: Vec<DtItem>, _batch: bool) -> anyhow::Result<()> {
+            self.0.lock().unwrap().sunk_items += data.len();
+            Ok(())
+        }
+
+        async fn record_checkpoint(&mut self, position: &Position) -> anyhow::Result<()> {
+            if self.0.lock().unwrap().fail_checkpoint {
+                anyhow::bail!("checkpoint unavailable");
+            }
+            self.0.lock().unwrap().checkpoints.push(position.clone());
+            Ok(())
+        }
+
+        async fn close_with_position(&mut self, position: Option<&Position>) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .closed_positions
+                .push(position.cloned());
+            Ok(())
+        }
+
+        async fn handle_control_item(&mut self, item: &DtItem) -> anyhow::Result<()> {
+            self.0.lock().unwrap().controls.push(item.position.clone());
+            Ok(())
+        }
+    }
+
+    fn mysql_position(next_event_position: u32) -> Position {
+        Position::MysqlCdc {
+            server_id: "1".to_string(),
+            binlog_filename: "mysql-bin.000001".to_string(),
+            next_event_position,
+            gtid_set: String::new(),
+            timestamp: String::new(),
+        }
+    }
+
+    fn dml_item(position: Position) -> DtItem {
+        DtItem {
+            dt_data: DtData::Dml {
+                row_data: RowData {
+                    db: String::new(),
+                    schema: "public".to_string(),
+                    tb: "events".to_string(),
+                    chunk_id: 0,
+                    row_type: RowType::Insert,
+                    before: None,
+                    after: Some(HashMap::new()),
+                    data_size: 1,
+                    is_not_origin: false,
+                },
+            },
+            position,
+            data_origin_node: String::new(),
+        }
+    }
+
+    async fn make_shutdown_pipeline(
+        queued: Vec<DtItem>,
+        staged: Vec<DtItem>,
+        batch_sink_interval_secs: u64,
+    ) -> (
+        BasePipeline,
+        Arc<Mutex<Syncer>>,
+        Arc<StdMutex<RecordingState>>,
+    ) {
+        let buffer = Arc::new(DtQueue::new(8, 0, None, None));
+        for item in queued {
+            buffer.push(item).await.unwrap();
+        }
+        assert!(!buffer.is_full());
+
+        let mut base_parallelizer = BaseParallelizer::default();
+        base_parallelizer.popped_data.extend(staged);
+        let state = Arc::new(StdMutex::new(RecordingState::default()));
+        let syncer = Arc::new(Mutex::new(Syncer::default()));
+        let pipeline = BasePipeline {
+            buffer,
+            parallelizer: Box::new(SerialParallelizer { base_parallelizer }),
+            sinker_config: SinkerConfig::Dummy,
+            sinkers: vec![Arc::new(async_mutex::Mutex::new(Box::new(
+                RecordingSinker(state.clone()),
+            )))],
+            shut_down: Arc::new(AtomicBool::new(true)),
+            checkpoint_interval_secs: 60,
+            batch_sink_interval_secs,
+            syncer: syncer.clone(),
+            monitor: TaskMonitorHandle::noop(MonitorType::Pipeline),
+            pending_snapshot_finished: HashMap::new(),
+            data_marker: None,
+            lua_processor: None,
+            recorder: None,
+            propagate_checkpoint_to_sinker: true,
+        };
+
+        (pipeline, syncer, state)
+    }
+
+    async fn shutdown_pipeline(
+        queued: Vec<DtItem>,
+        staged: Vec<DtItem>,
+        batch_sink_interval_secs: u64,
+    ) -> (Arc<Mutex<Syncer>>, Arc<StdMutex<RecordingState>>) {
+        let (mut pipeline, syncer, state) =
+            make_shutdown_pipeline(queued, staged, batch_sink_interval_secs).await;
+        tokio::time::timeout(Duration::from_secs(1), pipeline.start())
+            .await
+            .expect("shutdown drain must not wait for batch interval")
+            .unwrap();
+        pipeline.stop().await.unwrap();
+        (syncer, state)
+    }
 
     fn redis_node_position(node_id: &str, repl_offset: u64) -> Position {
         Position::Redis {
@@ -761,5 +930,90 @@ mod tests {
         assert_eq!(data_count, 1);
         assert_eq!(last_received_position, Some(position.clone()));
         assert_eq!(commit_positions, vec![position]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_bypasses_batch_interval_and_drains_staged_data() {
+        let queued_position = Position::Kafka {
+            topic: "source.topic".to_string(),
+            partition: 0,
+            offset: 42,
+        };
+        let staged_position = Position::Kafka {
+            topic: "source.topic".to_string(),
+            partition: 1,
+            offset: 84,
+        };
+
+        let (syncer, state) = shutdown_pipeline(
+            vec![kafka_raw_item(queued_position.clone())],
+            vec![kafka_raw_item(staged_position.clone())],
+            60,
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.sunk_items, 2);
+        assert_eq!(state.checkpoints, vec![staged_position.clone()]);
+        assert_eq!(state.closed_positions, vec![Some(staged_position)]);
+        drop(state);
+        let syncer = syncer.lock().await;
+        assert_eq!(syncer.committed_positions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_checkpoint_partial_cdc_transaction() {
+        let row_position = mysql_position(120);
+
+        let (syncer, state) =
+            shutdown_pipeline(vec![dml_item(row_position.clone())], Vec::new(), 15).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.sunk_items, 1);
+        assert!(state.checkpoints.is_empty());
+        drop(state);
+        let syncer = syncer.lock().await;
+        assert_eq!(syncer.received_position, row_position);
+        assert_eq!(syncer.committed_position, Position::None);
+        assert!(syncer.committed_positions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_checkpoint_failure_is_not_successful_shutdown() {
+        let position = Position::Kafka {
+            topic: "source.topic".into(),
+            partition: 0,
+            offset: 42,
+        };
+        let (mut pipeline, syncer, state) =
+            make_shutdown_pipeline(vec![kafka_raw_item(position)], Vec::new(), 60).await;
+        state.lock().unwrap().fail_checkpoint = true;
+        let error = tokio::time::timeout(Duration::from_secs(1), pipeline.start())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("checkpoint unavailable"));
+        assert_eq!(syncer.lock().await.committed_position, Position::None);
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_snapshot_finished_does_not_complete_snapshot() {
+        let row_position = Position::RdbSnapshot {
+            db_type: "mysql".to_string(),
+            db: String::new(),
+            schema: "public".to_string(),
+            tb: "events".to_string(),
+            order_key: None,
+        };
+
+        let (syncer, state) =
+            shutdown_pipeline(vec![dml_item(row_position.clone())], Vec::new(), 60).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.sunk_items, 1);
+        assert!(state.controls.is_empty());
+        assert_eq!(state.checkpoints, vec![row_position.clone()]);
+        drop(state);
+        assert_eq!(syncer.lock().await.committed_position, row_position);
     }
 }

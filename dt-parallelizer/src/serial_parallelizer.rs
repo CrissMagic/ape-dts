@@ -16,6 +16,10 @@ pub struct SerialParallelizer {
 
 #[async_trait]
 impl Parallelizer for SerialParallelizer {
+    fn has_pending_data(&self) -> bool {
+        self.base_parallelizer.has_pending_data()
+    }
+
     fn get_name(&self) -> String {
         "SerialParallelizer".to_string()
     }

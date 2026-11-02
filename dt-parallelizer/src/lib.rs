@@ -24,6 +24,8 @@ use merge_parallelizer::TbMergedData;
 pub trait Parallelizer {
     fn get_name(&self) -> String;
 
+    fn has_pending_data(&self) -> bool;
+
     async fn drain(&mut self, _buffer: &DtQueue) -> anyhow::Result<Vec<DtItem>> {
         Ok(Vec::new())
     }

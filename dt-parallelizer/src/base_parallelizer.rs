@@ -28,6 +28,10 @@ pub struct BaseParallelizer {
 }
 
 impl BaseParallelizer {
+    pub fn has_pending_data(&self) -> bool {
+        !self.popped_data.is_empty()
+    }
+
     pub async fn drain(&mut self, buffer: &DtQueue) -> anyhow::Result<Vec<DtItem>> {
         let mut data = Vec::new();
         while let Some(item) = self.popped_data.pop_front() {
@@ -296,7 +300,14 @@ mod tests {
     use std::sync::Arc;
 
     use async_mutex::Mutex;
-    use dt_common::{meta::dt_queue::DtQueue, monitor::counter::Counter};
+    use dt_common::{
+        meta::{
+            dt_data::{DtData, DtItem},
+            dt_queue::DtQueue,
+            position::Position,
+        },
+        monitor::counter::Counter,
+    };
     use dt_connector::{sinker::dummy_sinker::DummySinker, Sinker};
 
     use super::BaseParallelizer;
@@ -310,6 +321,27 @@ mod tests {
         let item = parallelizer.pop(&queue, &mut counter).await.unwrap();
 
         assert!(item.is_none());
+    }
+
+    #[tokio::test]
+    async fn drain_returns_staged_data_after_source_queue_is_empty() {
+        let mut parallelizer = BaseParallelizer::default();
+        parallelizer.popped_data.push_back(DtItem {
+            dt_data: DtData::Commit {
+                xid: "pending-transaction".to_string(),
+            },
+            position: Position::None,
+            data_origin_node: String::new(),
+        });
+        let queue = DtQueue::new(1, 0, None, None);
+
+        assert!(queue.is_empty());
+        assert!(parallelizer.has_pending_data());
+
+        let drained = parallelizer.drain(&queue).await.unwrap();
+
+        assert_eq!(drained.len(), 1);
+        assert!(!parallelizer.has_pending_data());
     }
 
     #[tokio::test]

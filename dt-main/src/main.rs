@@ -10,12 +10,13 @@ use config_source::{ConfigSourceKind, NacosConfig};
 use dt_common::{
     config::{ini_loader::IniLoader, task_config::TaskConfig},
     error::{DtError, DtResultExt, ErrorReport, Stage},
-    log_error, log_error_report,
+    log_error, log_error_report, log_info,
     logger::TaskLogger,
 };
 use dt_precheck::{config::task_config::PrecheckTaskConfig, do_precheck};
 use dt_task::task_runner::TaskRunner;
-use tokio::{signal::ctrl_c, spawn, time::sleep};
+use tokio::signal::ctrl_c;
+use tokio_util::sync::CancellationToken;
 
 mod config_source;
 
@@ -181,29 +182,68 @@ async fn run(
 ) -> anyhow::Result<()> {
     let task_id = task_config.global.task_id.clone();
 
-    spawn(async {
-        if ctrl_c().await.is_err() {
-            return;
-        }
-        sleep(Duration::from_secs(
-            env::var(ENV_SHUTDOWN_TIMEOUT_SECS)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3),
-        ))
-        .await;
-        exit(0);
-    });
+    let shutdown = CancellationToken::new();
+    let grace = Duration::from_secs(
+        env::var(ENV_SHUTDOWN_TIMEOUT_SECS)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3),
+    );
+    run_with_shutdown(
+        run_config(task_config, precheck_config, init, shutdown.clone()),
+        shutdown_signal(),
+        shutdown,
+        grace,
+    )
+    .await
+    .task_id(task_id)
+}
 
-    run_config(task_config, precheck_config, init)
-        .await
-        .task_id(task_id)
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c().await
+}
+
+async fn run_with_shutdown(
+    run: impl std::future::Future<Output = anyhow::Result<()>>,
+    signal: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: CancellationToken,
+    grace: Duration,
+) -> anyhow::Result<()> {
+    tokio::pin!(run);
+    let signal_error = tokio::select! {
+        biased;
+        result = signal => result.err(),
+        result = &mut run => return result,
+    };
+    log_info!("shutdown requested; stopping extraction and draining pipeline");
+    shutdown.cancel();
+    tokio::time::timeout(grace, &mut run).await.map_err(|_| {
+        anyhow::anyhow!(
+            "graceful shutdown timed out after {} seconds",
+            grace.as_secs()
+        )
+    })??;
+    if let Some(error) = signal_error {
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 async fn run_config(
     task_config: TaskConfig,
     precheck_config: Option<PrecheckTaskConfig>,
     init: bool,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     match precheck_config {
         Some(precheck_config) => do_precheck(task_config, precheck_config)
@@ -212,6 +252,7 @@ async fn run_config(
         None => {
             TaskRunner::new(task_config)
                 .stage(Stage::Bootstrap)?
+                .with_shutdown(shutdown)
                 .start_task(init)
                 .await
                 .stage(Stage::Task)?;
@@ -236,6 +277,80 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_drain_and_propagates_failure() {
+        for fail in [false, true] {
+            let token = CancellationToken::new();
+            let worker_token = token.clone();
+            let result = run_with_shutdown(
+                async move {
+                    worker_token.cancelled().await;
+                    tokio::task::yield_now().await;
+                    if fail {
+                        anyhow::bail!("drain failed");
+                    }
+                    Ok(())
+                },
+                async { Ok(()) },
+                token,
+                Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(result.is_err(), fail);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_is_not_success() {
+        let result = run_with_shutdown(
+            std::future::pending(),
+            async { Ok(()) },
+            CancellationToken::new(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("graceful shutdown timed out"));
+    }
+
+    #[tokio::test]
+    async fn signal_error_still_requests_drain_and_returns_failure() {
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let result = run_with_shutdown(
+            async move {
+                worker_token.cancelled().await;
+                Ok(())
+            },
+            async { Err(std::io::Error::other("signal registration failed")) },
+            token.clone(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(token.is_cancelled());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("signal registration failed"));
+    }
+
+    #[tokio::test]
+    async fn ready_signal_error_is_not_hidden_by_ready_success() {
+        let result = run_with_shutdown(
+            async { Ok(()) },
+            async { Err(std::io::Error::other("signal registration failed")) },
+            CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("signal registration failed"));
+    }
 
     #[test]
     fn accepts_config_flag() {

@@ -1772,6 +1772,7 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.11.22",
  "tokio",
+ "tokio-util 0.7.15",
 ]
 
 [[package]]

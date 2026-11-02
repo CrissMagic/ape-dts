@@ -17,6 +17,7 @@ dt-precheck = {path = "../dt-precheck", version = "0.1.0"}
 clap = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 configparser = { workspace = true }
 percent-encoding = { workspace = true }
