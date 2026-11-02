@@ -758,14 +758,55 @@ impl RdbTopicRouterInner {
     ) -> anyhow::Result<HashMap<DbSchemaTb, String>> {
         // topic_map=*.*:test,test_db_1.*:test2,test_db_1.no_pk_one_uk:test3
         let mut topic_map = HashMap::new();
-        let tokens = RdbRouterInner::parse_config(config_str, db_type)?;
+        let tokens = ConfigTokenParser::parse_config_with_delimiters(
+            config_str,
+            db_type,
+            &[',', '.', ':'],
+            None,
+        )?;
+        let unescape = |value: &str| {
+            let mut value = value.to_string();
+            for pair in SqlUtil::get_escape_pairs(db_type) {
+                value = SqlUtil::unescape(&value, &pair);
+            }
+            value
+        };
         let mut i = 0;
         while i < tokens.len() {
-            topic_map.insert(
-                RdbRouterInner::table_key(EMPTY_DB, &tokens[i], &tokens[i + 1]),
-                tokens[i + 2].to_string(),
-            );
-            i += 3;
+            if tokens.get(i + 1).map(String::as_str) != Some(".")
+                || tokens.get(i + 3).map(String::as_str) != Some(":")
+                || tokens.get(i + 4).is_none()
+            {
+                bail!(DtError::invalid_config(
+                    "invalid topic_map: expected schema.table:topic"
+                ));
+            }
+            let schema = unescape(&tokens[i]);
+            let table = unescape(&tokens[i + 2]);
+            let mut topic = unescape(&tokens[i + 4]);
+            i += 5;
+            while tokens.get(i).map(String::as_str) == Some(".") {
+                let part = tokens.get(i + 1).ok_or_else(|| {
+                    DtError::invalid_config("invalid topic_map: missing topic component")
+                })?;
+                topic.push('.');
+                topic.push_str(&unescape(part));
+                i += 2;
+            }
+            if schema.is_empty() || table.is_empty() || topic.is_empty() {
+                bail!(DtError::invalid_config(
+                    "invalid topic_map: empty source or target"
+                ));
+            }
+            topic_map.insert(RdbRouterInner::table_key(EMPTY_DB, &schema, &table), topic);
+            if i < tokens.len() {
+                if tokens[i] != "," || i + 1 == tokens.len() {
+                    bail!(DtError::invalid_config(
+                        "invalid topic_map: expected another comma-separated mapping"
+                    ));
+                }
+                i += 1;
+            }
         }
         Ok(topic_map)
     }
@@ -1078,6 +1119,52 @@ mod tests {
             + r#"{"db":"src_db:3,","tb":"src_tb:3,","col_map":{"src_col:1,":"dst_col:1,","src_col:2,":"dst_col:2,"}}]"#;
         let tb_col_map = RdbRouter::parse_col_map(&config_str, &DbType::Mysql).unwrap();
         check_results(&tb_col_map);
+    }
+
+    #[test]
+    fn test_topic_map_preserves_dots_and_escaped_sources() {
+        let mappings = super::RdbTopicRouterInner::parse_topic_map(
+            r#"*.*:default.topic,"public.dot"."table,name":phase0.pg.snapshot,public.events:"quoted.topic""#,
+            &DbType::Pg,
+        ).unwrap();
+        assert_eq!(
+            mappings
+                .get(&(String::new(), "*".into(), "*".into()))
+                .unwrap(),
+            "default.topic"
+        );
+        assert_eq!(
+            mappings
+                .get(&(String::new(), "public.dot".into(), "table,name".into()))
+                .unwrap(),
+            "phase0.pg.snapshot"
+        );
+        assert_eq!(
+            mappings
+                .get(&(String::new(), "public".into(), "events".into()))
+                .unwrap(),
+            "quoted.topic"
+        );
+    }
+
+    #[test]
+    fn test_topic_map_rejects_malformed_entries_without_panicking() {
+        for mapping in [
+            "public",
+            "public.events",
+            "public.events:",
+            "public.events:topic,",
+            "public.events:topic:other",
+            "public.events.topic",
+        ] {
+            assert!(
+                super::RdbTopicRouterInner::parse_topic_map(mapping, &DbType::Pg).is_err(),
+                "{mapping}"
+            );
+        }
+        assert!(super::RdbTopicRouterInner::parse_topic_map("", &DbType::Pg)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
