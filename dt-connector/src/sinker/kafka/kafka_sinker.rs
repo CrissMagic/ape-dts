@@ -1,6 +1,9 @@
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use kafka::producer::{Producer, Record};
+use kafka::{
+    client::ProduceConfirm,
+    producer::{Producer, Record},
+};
 use rdkafka::{
     message::{Header, OwnedHeaders},
     producer::{FutureProducer, FutureRecord},
@@ -223,7 +226,24 @@ impl KafkaSinker {
                 partition: -1,
             })
             .collect();
-        self.producer.send_all(&records)?;
+        Self::validate_confirmations(self.producer.send_all(&records)?)
+    }
+
+    fn validate_confirmations(confirmations: Vec<ProduceConfirm>) -> anyhow::Result<()> {
+        // acks=none returns no confirmations and provides no delivery guarantee.
+        for confirmation in confirmations {
+            for partition in confirmation.partition_confirms {
+                partition
+                    .offset
+                    .map_err(kafka::error::Error::Kafka)
+                    .with_context(|| {
+                        format!(
+                            "Kafka rejected batch for topic '{}' partition {}",
+                            confirmation.topic, partition.partition
+                        )
+                    })?;
+            }
+        }
         Ok(())
     }
 
@@ -292,6 +312,7 @@ impl KafkaSinker {
 
 #[cfg(test)]
 mod tests {
+    use kafka::{client::ProducePartitionConfirm, error::KafkaCode};
     use std::collections::HashMap;
 
     use dt_common::{
@@ -300,6 +321,75 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn rejected_partition_is_not_a_successful_batch() {
+        for error in [
+            KafkaCode::MessageSizeTooLarge,
+            KafkaCode::NotEnoughReplicas,
+            KafkaCode::TopicAuthorizationFailed,
+        ] {
+            let result = KafkaSinker::validate_confirmations(vec![ProduceConfirm {
+                topic: "rejected".to_string(),
+                partition_confirms: vec![ProducePartitionConfirm {
+                    partition: 0,
+                    offset: Err(error),
+                }],
+            }]);
+            let error = result.expect_err("a rejected partition must fail the sink batch");
+            assert!(error.to_string().contains("rejected"));
+        }
+    }
+
+    #[test]
+    fn fanout_is_failed_when_a_later_topic_partition_is_rejected() {
+        let result = KafkaSinker::validate_confirmations(vec![
+            ProduceConfirm {
+                topic: "primary".to_string(),
+                partition_confirms: vec![ProducePartitionConfirm {
+                    partition: 0,
+                    offset: Ok(0),
+                }],
+            },
+            ProduceConfirm {
+                topic: "archive".to_string(),
+                partition_confirms: vec![
+                    ProducePartitionConfirm {
+                        partition: 0,
+                        offset: Ok(15),
+                    },
+                    ProducePartitionConfirm {
+                        partition: 1,
+                        offset: Err(KafkaCode::NotEnoughReplicasAfterAppend),
+                    },
+                ],
+            },
+        ]);
+        let error = result.expect_err("partial fanout must not advance the checkpoint");
+        assert!(error.to_string().contains("archive"));
+        assert!(error.to_string().contains("partition 1"));
+    }
+
+    #[test]
+    fn all_acknowledged_topic_partitions_complete_the_batch() {
+        let confirmations = ["primary", "archive"]
+            .into_iter()
+            .map(|topic| ProduceConfirm {
+                topic: topic.to_string(),
+                partition_confirms: vec![
+                    ProducePartitionConfirm {
+                        partition: 0,
+                        offset: Ok(0),
+                    },
+                    ProducePartitionConfirm {
+                        partition: 1,
+                        offset: Ok(15),
+                    },
+                ],
+            })
+            .collect();
+        KafkaSinker::validate_confirmations(confirmations).unwrap();
+    }
 
     #[test]
     fn confirmed_unchanged_toast_update_is_not_sent() {
